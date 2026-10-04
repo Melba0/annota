@@ -1,0 +1,119 @@
+-[ system.ant : 系统接口导览 ]-
+-[ 底层只有一小组 _sys_* 原语（见 docs/reference.md），上面这些都在 lib/*.mod 里用 Annota 实现： ]-
+-[   time / os / thread / net ]-
+
+use std
+
+Test.suite("系统接口")
+
+-- ---------------------------------------------------------------- 时间
+new t0 = _sys_time()
+Test.eq(typeof(t0), "int", "原语 _sys_time() 返回毫秒时间戳")
+Test.eq(_sys_clock() >= 0, true, "原语 _sys_clock() 是单调毫秒")
+
+Test.eq(time.millis() > 0, true, "原生 time.millis()")
+Test.eq(time.now() > 0, true, "原生 time.now() 返回秒")
+Test.eq(time.clock() >= 0, true, "原生 time.clock() 单调毫秒")
+
+new parts = Time.parts()
+Test.eq(len(parts), 7, "Time.parts() 返回 7 个分量")
+Test.eq(parts[0] >= 2020, true, "年份合理")
+
+new stamp = Time.make(2024, 3, 1, 12, 30, 45)
+Test.eq(Time.year(stamp), 2024, "Time.make / Time.year")
+Test.eq(Time.month(stamp), 3, "月份从 1 开始")
+Test.eq(Time.hour(stamp), 12, "小时")
+Test.eq(Time.format("%Y/%m/%d %H:%M:%S", stamp), "2024/03/01 12:30:45", "自定义格式")
+Test.eq(Time.iso(stamp).starts_with("2024-03-01"), true, "ISO 格式")
+Test.eq(Time.leap(2024), true, "闰年")
+Test.eq(Time.leap(2023), false, "平年")
+Test.eq(Time.days_in_month(2024, 2), 29, "闰年二月")
+Test.eq(Time.day_of_year(stamp), 61, "2024-03-01 是第 61 天")
+
+-- ---------------------------------------------------------------- 计时
+new sw = Stopwatch()
+_sys_sleep(40)
+new elapsed = sw.elapsed()
+Test.eq(elapsed >= 30, true, "Stopwatch 计入 40ms 休眠（" + str(elapsed) + "ms）")
+Test.eq(Time.describe_ms(1234), "1.234 s", "可读耗时")
+Test.eq(Time.describe_ms(12), "12 ms", "毫秒级耗时")
+
+-- ---------------------------------------------------------------- 平台与环境
+Test.eq(Os.platform() == "windows" || Os.platform() == "linux" || Os.platform() == "macos",
+        true, "平台名")
+Test.eq(Os.cpus() >= 1, true, "CPU 数")
+Test.eq(Os.pid() > 0, true, "进程号")
+Test.eq(len(Os.temp()) > 0, true, "临时目录")
+Test.eq(Os.env("PATH") != null, true, "环境变量 PATH")
+Test.eq(Os.env("ANNOTA_NO_SUCH_VAR", "兜底"), "兜底", "env 的默认值")
+Test.eq(len(Os.env_all()) > 0, true, "环境变量列表")
+
+new out = Os.run("echo system-ok")
+Test.eq(out.trim(), "system-ok", "执行外部命令并取回输出")
+Test.eq(Os.ok("echo ok"), true, "命令退出码")
+Test.eq(Os.ok("exit 3"), false, "非零退出码不抛异常，只是 ok() 为假")
+new failed = Os.exec("exit 3")
+Test.eq(failed[0] != 0, true, "拿到非零退出码")
+
+-- ---------------------------------------------------------------- 线程
+Test.eq(Thread.hardware() >= 1, true, "硬件线程数")
+
+double_it(n) = n * 2
+
+new task = Thread.spawn(double_it, [21])
+Test.eq(task.wait(), 42, "spawn / wait")
+Test.eq(Thread.run(double_it, [5]), 10, "run = spawn + wait")
+
+new squares = Thread.parallel_map(double_it, [1, 2, 3, 4])
+Test.eq(squares, [2, 4, 6, 8], "parallel_map 保序")
+Test.eq(len(Thread.parallel_map(double_it, [], 4)), 0, "空输入")
+Test.eq(Thread.parallel_map(double_it, [7]), [14], "单元素")
+
+new pool = Thread.pool(2)
+new i = 0
+while i < 4(
+    pool.submit(double_it, [i])
+    i = i + 1
+)
+Test.eq(len(pool.drain()), 4, "线程池 drain")
+
+-- ---------------------------------------------------------------- 网络（本机回环，不依赖外网）
+new port = 34567
+new server = Tcp.listen("127.0.0.1", port)
+Test.eq(server.handle > 0, true, "监听本机端口")
+
+echo_server(srv)(
+    new conn = srv.accept()
+    new line = conn.recv(256)
+    conn.send("echo:" + line)
+    conn.close()
+    =line
+)
+
+new serving = Thread.spawn(echo_server, [server])
+new client = Tcp.connect("127.0.0.1", port)
+client.send("ping")
+new reply = client.recv(256)
+client.close()
+Test.eq(reply, "echo:ping", "本机 TCP 往返")
+Test.eq(serving.wait(), "ping", "服务端线程拿到请求")
+server.close()
+
+Test.eq(Net.parse_http("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").status, 200, "解析状态行")
+new parsed = Net.parse_http("HTTP/1.1 404 Not Found\r\nX-Test: a\r\n\r\nnope")
+Test.eq(parsed.status, 404, "解析 404")
+Test.eq(parsed.header("x-test"), "a", "响应头大小写无关")
+Test.eq(parsed.body, "nope", "响应体")
+Test.eq(parsed.ok(), false, "ok() 判断")
+Test.eq(Url.encode("a b&c"), "a%20b%26c", "URL 编码")
+Test.eq(Url.decode("a%20b%26c"), "a b&c", "URL 解码")
+Test.eq(Url.parse("http://example.com:8080/x?y=1"), ["http", "example.com", 8080, "/x?y=1"], "解析 URL")
+
+-- ---------------------------------------------------------------- system 门面
+Test.eq(system.has("clock"), true, "system.has")
+Test.eq(system.clock() > 0, true, "system.clock()")
+Test.eq(system.call("clock") > 0, true, "system.call 动态分发")
+Test.eq(len(system.primitives()) >= 10, true, "原语清单")
+Test.eq(system.help().find("_sys_socket") >= 0 || system.help().find("socket") >= 0, true, "帮助文本")
+
+Test.check()

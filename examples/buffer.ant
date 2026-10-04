@@ -1,0 +1,101 @@
+-[ 缓冲区处理：综合演示（文档第 17 章） ]-
+
+use slice
+
+[[module: buffer]]
+[[version: 1.0]]
+[[author: "annotateam"]]
+[[analyzer: polyspace]]
+
+state running:bool = false
+state error:String = null
+state results:List = []
+
+man(name, age)=(
+    name:String
+    age:int
+    __str__() = "man(" + name + ", " + age + ")"
+)
+
+[[expose: copy, running, error, results]]
+[[require: len > 0]]
+[[require: data != null]]
+[[ensure: result.size == len]]
+[[modifies: buf]]
+[[backend: dafny]]
+copy(data, len)(
+    [[ignore: overflow, "len 已校验", severity=low]]
+    new buf = alloc(len)
+
+    [[unsafe: "FFI 边界", severity=high]]
+    raw_copy(buf, data, len)
+
+    [[invariant: i <= len]]
+    [[decrease: len - i]]
+    for i in 0 to len - 1(
+        buf[i] = data[i]
+    )
+
+    =Ok(buf)
+)
+
+categorize(a)={
+    a == 1: "one"
+    a == 2: "two"
+    a == 3: "three"
+    else: "other"
+}
+
+view Main(title="Buffer", width=600, height=400)(
+    Column(pad=16, gap=12)(
+        Text("Buffer Processor", size=24, color=#1a1a2e)()
+        Row(gap=8)(
+            Button("Run", click=run, disabled=running)()
+            Button("Clear", click=clear)()
+        )
+        if error != null(
+            Text(error, size=12, color=#ff0000)()
+        )
+        for item in results(
+            Text(item, size=14)()
+        )
+    )
+)
+
+run()(
+    running = true
+    (
+        new data = [1, 2, 3, 4, 5]
+        new out = copy(data, len(data))
+        results = out
+        except msg(
+            error = msg
+        )
+    )
+    running = false
+)
+
+clear()(
+    results = []
+    error = null
+)
+
+(
+    new m = man("Alice", 30)
+    print m
+    print categorize(2)
+
+    for i in 1 to 5 step 2(
+        print i
+    )
+
+    print 1, 2, 3
+    print 1, 2, 3, sep="-"
+
+    run()
+    print "running = " + running
+    print "results = " + results
+    print "error   = " + error
+    clear()
+    print "cleared = " + results
+)

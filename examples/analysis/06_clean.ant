@@ -1,0 +1,31 @@
+-[ expect: none ]-
+-[ 干净示例：全部检查通过，不产生任何诊断 ]-
+
+[[module: clean]]
+[[version: 1.0]]
+[[analyzer: polyspace]]
+
+[[require: divisor != 0]]
+[[ensure: result * divisor == dividend]]
+safe_div(dividend, divisor) = dividend / divisor
+
+[[require: n > 0 && n < 100]]
+[[ensure: result > n]]
+increment(n) = n + 1
+
+count_to(limit)(
+    new i = 0
+    [[invariant: i >= 0]]
+    [[decrease: limit - i]]
+    while i < limit(
+        i = i + 1
+    )
+    =i
+)
+
+main_use()(
+    new value = safe_div(10, 2)
+    print value
+    print increment(5)
+    print count_to(10)
+)

@@ -1,0 +1,210 @@
+-[ 自检：把语言特性写成断言，任何一条失败都会打印出来 ]-
+-[ 用 `annota examples/selfcheck.ant` 即可回归验证解释器 ]-
+
+use std
+use slice
+
+add(a, b) = a + b
+opt(a, b = 10) = a + b
+vsum(...nums)(
+    new s = 0
+    for n in nums( s = s + n )
+    =s
+)
+classify(a) = {
+    a < 0: "negative"
+    a == 0: "zero"
+    else: "positive"
+}
+
+macro twice($x)(
+    (($x) + ($x))
+)
+
+Vec(x, y)=(
+    x:int
+    y:int
+    __add__(o) = Vec(x + o.x, y + o.y)
+    __eq__(o) = x == o.x && y == o.y
+    __str__() = "Vec(" + x + ", " + y + ")"
+    __len__() = 2
+    __get__(i)(
+        if i == 0( =x )
+        if i == 1( =y )
+        throw "index out of range"
+    )
+)
+
+Base(n)=(
+    n:int
+    who() = "base"
+    describe() = who() + ":" + n
+)
+Derived(n)=(
+    :Base(n)
+    who() = "derived"
+    describe() = super.describe()
+)
+
+make_adder(n)(
+    =(x)( =x + n )
+)
+
+counter()(
+    new n = 0
+    =()(
+        n = n + 1
+        =n
+    )
+)
+
+boom()(
+    throw "boom"
+)
+returns_one() = 1
+
+new arr = [1, 2, 3, 4, 5]
+
+Test.suite("字面量、运算符、类型转换")
+
+Test.eq(0xFF, 255, "hex")
+Test.eq(0b1010, 10, "binary")
+Test.eq(0o17, 15, "octal")
+Test.eq(1.5e-3, 0.0015, "float exponent")
+Test.eq((int)3.7, 3, "cast prefix")
+Test.eq(int(3.7), 3, "cast call")
+Test.eq((int)(3.7), 3, "cast paren")
+Test.eq((String)42 + "!", "42!", "string cast and concat")
+Test.eq(7 / 2, 3.5, "true division")
+Test.eq(8 / 2, 4, "exact division stays int")
+Test.eq(2 ** 10, 1024, "power")
+Test.eq(7 % 3, 1, "modulo")
+Test.eq(0b1010 & 0b0110, 0b0010, "bit and")
+Test.eq(1 << 4, 16, "shift left")
+Test.eq(~0, -1, "bit not")
+Test.eq(true && false, false, "logical and")
+Test.eq(!false, true, "logical not")
+Test.eq((1,), (1,), "single tuple")
+Test.eq([1, 2, 3], [1, 2, 3], "list equality")
+Test.eq(len("hello"), 5, "len on string")
+Test.eq(len((1, 2, 3)), 3, "len on tuple")
+
+Test.suite("变量与深拷贝")
+
+new a = [1, 2, 3]
+new b = a
+b[0] = 99
+Test.eq(a[0], 1, "assignment deep copies")
+new (x, y) = (1, 2)
+Test.eq(x + y, 3, "destructuring")
+new (m1, m2, m3) = [4, 5, 6]
+Test.eq(m1 * m2 * m3, 120, "destructuring from a list")
+new counter_a = counter()
+counter_a()
+counter_a()
+Test.eq(counter_a(), 3, "closure shares captured cell")
+new other = counter()
+Test.eq(other(), 1, "each closure has its own cell")
+
+Test.suite("函数")
+
+Test.eq(add(1, 2), 3, "single line function")
+Test.eq(opt(1), 11, "default parameter")
+Test.eq(opt(1, 2), 3, "explicit parameter")
+Test.eq(opt(b = 5, a = 1), 6, "named arguments")
+Test.eq(vsum(1, 2, 3, 4), 10, "varargs")
+Test.eq(vsum(), 0, "empty varargs")
+new nums = [1, 2, 3]
+Test.eq(vsum(...nums), 6, "spread call")
+new pair = [4, 5]
+Test.eq(add(...pair), 9, "spread into fixed parameters")
+Test.eq(classify(-1), "negative", "piecewise 1")
+Test.eq(classify(0), "zero", "piecewise 2")
+Test.eq(classify(7), "positive", "piecewise else")
+Test.eq(make_adder(5)(3), 8, "closure factory")
+
+Test.suite("控制流")
+
+new total = 0
+for i in 1 to 5( total = total + i )
+Test.eq(total, 15, "inclusive range")
+new down = ""
+for i in 3 to 1 step -1( down = down + i )
+Test.eq(down, "321", "descending range")
+Test.eq(len(Seq.take([1, 2], 5)), 2, "range clamps")
+new evens = 0
+for i in 1 to 10(
+    if i % 2 == 1( continue )
+    if i > 8( break )
+    evens = evens + 1
+)
+Test.eq(evens, 4, "break and continue")
+new w = 0
+while w < 3( w = w + 1 )
+Test.eq(w, 3, "while")
+new scoped = 1
+(
+    new scoped = 2
+    Test.eq(scoped, 2, "inner scope shadows")
+)
+Test.eq(scoped, 1, "outer scope is untouched")
+
+Test.suite("类、继承与魔法函数")
+
+new v1 = Vec(1, 2)
+new v2 = Vec(3, 4)
+Test.eq(v1 + v2, Vec(4, 6), "operator overloading")
+Test.eq(v1 == Vec(1, 2), true, "__eq__")
+Test.eq(len(v1), 2, "__len__")
+Test.eq(v1[1], 2, "__get__")
+Test.eq(String(v1), "Vec(1, 2)", "__str__")
+new d = Derived(7)
+Test.eq(d.who(), "derived", "method override")
+Test.eq(d.describe(), "derived:7", "super call inside override")
+Test.eq(d.n, 7, "inherited field")
+
+Test.suite("宏与模块")
+
+Test.eq(twice(3), 6, "user macro")
+Test.eq(twice(1 + 2), 6, "macro argument is parenthesised by the macro")
+Test.eq(Seq.sum_of(arr[1:3].to_list()), 5, "slice macro with std loaded")
+Test.eq(arr[0], 1, "slice does not modify the source")
+
+Test.suite("运行期错误")
+
+Test.raises(boom, "throw is catchable")
+Test.raises(()(
+    new list = [1, 2]
+    =list[5]
+), "index out of range")
+Test.raises(()(
+    =add(1)
+), "missing argument")
+Test.raises(()(
+    =1 / 0
+), "division by zero")
+Test.raises(()(
+    new n = 1
+    =n()
+), "value is not callable")
+Test.raises(()(
+    =undefined_name
+), "undefined variable")
+Test.raises(()(
+    =[1] + 1
+), "unsupported operand types")
+
+Test.suite("标准库")
+
+Test.eq(Seq.map([1, 2], (v)( =v * 10 )), [10, 20], "Seq.map")
+Test.eq(Seq.sort([3, 1, 2]), [1, 2, 3], "Seq.sort")
+Test.eq(Str.format("{}+{}", 1, 2), "1+2", "Str.format")
+Test.eq(Mathx.factorial(5), 120, "Mathx.factorial")
+Test.eq(Mathx.is_prime(97), true, "Mathx.is_prime")
+new dict_ = Dict()
+dict_.set("k", 1)
+Test.eq(dict_.get("k"), 1, "Dict.get")
+Test.eq(len(dict_), 1, "Dict __len__")
+Test.eq(arr[2:4].size(), 2, "SliceView.size")
+
+Test.check()

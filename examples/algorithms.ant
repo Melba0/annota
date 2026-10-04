@@ -1,0 +1,227 @@
+-[ 算法示例：用标准库和语言本身实现一些经典算法 ]-
+
+use std
+
+—分段 排序
+
+quicksort(xs)(
+    if len(xs) <= 1( =xs )
+    new pivot = xs[0]
+    new smaller = []
+    new larger = []
+    for i in 1 to len(xs) - 1(
+        if xs[i] < pivot(
+            smaller.push(xs[i])
+        ) else (
+            larger.push(xs[i])
+        )
+    )
+    =quicksort(smaller) + [pivot] + quicksort(larger)
+)
+
+merge_sorted(a, b)(
+    new out = []
+    new i = 0
+    new j = 0
+    while i < len(a) && j < len(b)(
+        if a[i] <= b[j](
+            out.push(a[i])
+            i = i + 1
+        ) else (
+            out.push(b[j])
+            j = j + 1
+        )
+    )
+    while i < len(a)(
+        out.push(a[i])
+        i = i + 1
+    )
+    while j < len(b)(
+        out.push(b[j])
+        j = j + 1
+    )
+    =out
+)
+
+bubble_sort(xs)(
+    new out = []
+    for x in xs( out.push(x) )
+    for i in 0 to len(out) - 2(
+        for j in 0 to len(out) - 2 - i(
+            if out[j] > out[j + 1](
+                new t = out[j]
+                out[j] = out[j + 1]
+                out[j + 1] = t
+            )
+        )
+    )
+    =out
+)
+
+binary_search(xs, target)(
+    new lo = 0
+    new hi = len(xs) - 1
+    while lo <= hi(
+        new mid = math.floor((lo + hi) / 2)
+        if xs[mid] == target( =mid )
+        if xs[mid] < target(
+            lo = mid + 1
+        ) else (
+            hi = mid - 1
+        )
+    )
+    =-1
+)
+
+—分段 数列与动态规划
+
+fib_memo()(
+    new memo = Dict()
+    fib(n)(
+        if n < 2( =n )
+        new key = "f" + n
+        if memo.has(key)( =memo.get(key) )
+        new v = fib(n - 1) + fib(n - 2)
+        memo.set(key, v)
+        =v
+    )
+    =fib
+)
+
+lcs(a, b)(
+    new n = len(a)
+    new m = len(b)
+    new table = []
+    for i in 0 to n(
+        new row = []
+        for j in 0 to m( row.push(0) )
+        table.push(row)
+    )
+    for i in 1 to n(
+        for j in 1 to m(
+            if a[i - 1] == b[j - 1](
+                table[i][j] = table[i - 1][j - 1] + 1
+            ) else (
+                table[i][j] = math.max(table[i - 1][j], table[i][j - 1])
+            )
+        )
+    )
+    =table[n][m]
+)
+
+edit_distance(a, b)(
+    new n = len(a)
+    new m = len(b)
+    new d = []
+    for i in 0 to n(
+        new row = []
+        for j in 0 to m( row.push(0) )
+        d.push(row)
+    )
+    for i in 0 to n( d[i][0] = i )
+    for j in 0 to m( d[0][j] = j )
+    for i in 1 to n(
+        for j in 1 to m(
+            new cost = 1
+            if a[i - 1] == b[j - 1]( cost = 0 )
+            d[i][j] = math.min(d[i - 1][j] + 1, math.min(d[i][j - 1] + 1, d[i - 1][j - 1] + cost))
+        )
+    )
+    =d[n][m]
+)
+
+—分段 数论
+
+sieve(limit)(
+    new flags = []
+    for i in 0 to limit( flags.push(true) )
+    new out = []
+    for n in 2 to limit(
+        if flags[n](
+            out.push(n)
+            new multiple = n * n
+            while multiple <= limit(
+                flags[multiple] = false
+                multiple = multiple + n
+            )
+        )
+    )
+    =out
+)
+
+—分段 矩阵
+
+identity(n)(
+    new m = []
+    for i in 1 to n(
+        new row = []
+        for j in 1 to n(
+            if i == j( row.push(1) ) else ( row.push(0) )
+        )
+        m.push(row)
+    )
+    =m
+)
+
+matmul(a, b)(
+    new n = len(a)
+    new p = len(b[0])
+    new inner = len(b)
+    new out = []
+    for i in 0 to n - 1(
+        new row = []
+        for j in 0 to p - 1(
+            new acc = 0
+            for k in 0 to inner - 1(
+                acc = acc + a[i][k] * b[k][j]
+            )
+            row.push(acc)
+        )
+        out.push(row)
+    )
+    =out
+)
+
+—分段 主程序
+
+print "-- 排序 --"
+new numbers = [38, 27, 43, 3, 9, 82, 10]
+print numbers
+print quicksort(numbers)
+print bubble_sort(numbers)
+print Seq.sort(numbers)
+print merge_sorted([1, 3, 5], [2, 4, 6])
+print "numbers untouched: " + numbers
+
+print "-- 查找 --"
+new sorted_numbers = Seq.sort(numbers)
+print binary_search(sorted_numbers, 43), binary_search(sorted_numbers, 100)
+
+print "-- 动态规划 --"
+new fib = fib_memo()
+print fib(10), fib(40), fib(70)
+print lcs("AGGTAB", "GXTXAYB")
+print edit_distance("kitten", "sitting")
+print edit_distance("flaw", "lawn")
+
+print "-- 数论 --"
+print sieve(50)
+print Seq.take(sieve(200), 15)
+
+print "-- 矩阵 --"
+new m = [[1, 2], [3, 4]]
+print matmul(m, m)
+print matmul(m, identity(2))
+
+print "-- 断言 --"
+Test.suite("algorithms")
+Test.eq(quicksort(numbers), [3, 9, 10, 27, 38, 43, 82], "quicksort")
+Test.eq(bubble_sort(numbers), Seq.sort(numbers), "bubble sort matches library sort")
+Test.eq(binary_search([1, 3, 5, 7], 5), 2, "binary search")
+Test.eq(binary_search([1, 3, 5, 7], 4), -1, "binary search miss")
+Test.eq(fib(30), 832040, "memoised fibonacci")
+Test.eq(lcs("AGGTAB", "GXTXAYB"), 4, "longest common subsequence")
+Test.eq(edit_distance("kitten", "sitting"), 3, "edit distance")
+Test.eq(len(sieve(100)), 25, "primes below 100")
+Test.eq(matmul(m, identity(2)), m, "matrix times identity")
+Test.check()

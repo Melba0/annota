@@ -1,0 +1,36 @@
+-[ expect: unknown-annotation, annotation-scope, annotation-conflict, annotation-argument, unknown-check, assert-violation ]-
+-[ 标注的语法与冲突检查（第 1 层） ]-
+
+[[not_a_real_annotation]]
+new a = 1
+
+[[invariant: i < 10]]
+new b = 2
+
+[[decrease: n - i]]
+new c = 3
+
+[[pure]]
+[[modifies: buf]]
+compute(x) = x + 1
+
+[[noreturn]]
+[[ensure: result > 0]]
+never_returns() = 1
+
+[[trusted]]
+[[require: x > 0]]
+trusted_and_required(x) = x
+
+[[private]]
+[[public]]
+new d = 4
+
+[[ignore: no_such_check]]
+new e = 5
+
+[[assert: 1 > 2]]
+new f = 6
+
+[[require]]
+guarded(x) = x

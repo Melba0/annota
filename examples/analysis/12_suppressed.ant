@@ -1,0 +1,11 @@
+-[ expect: none ]-
+-[ 抑制：[[ignore]] 关掉指定检查；未使用的抑制会在 ide suppressions 里标出 ]-
+
+suppressed()(
+    new zero = 0
+    [[ignore: division-by-zero, "此处除零是刻意的，已在上游保证"]]
+    print 10 / zero
+
+    [[ignore]]
+    new unused_value = 1
+)

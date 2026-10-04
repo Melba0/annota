@@ -1,0 +1,57 @@
+-[ expect: purity, taint, macro-side-effect, overflow ]-
+-[ 第 3 层检查：纯函数、污点、宏副作用、整数溢出 ]-
+
+new counter = 0
+
+[[pure]]
+bump()(
+    counter = counter + 1
+)
+
+[[taint: user_input]]
+new raw_input = read_line()
+
+[[unsafe: "FFI 边界"]]
+write_out(buffer, data)(
+    print data
+)
+
+conversions()(
+    new text = "12"
+    =int(text)
+)
+
+use_tainted()(
+    write_out([], raw_input)
+    print "done " + raw_input
+)
+
+[[pure]]
+pure_sum(a, b)(
+    print a
+    =a + b
+)
+
+macro twice($x)(
+    (($x) + ($x))
+)
+
+side_effects(n)(
+    =twice(compute(n))
+)
+
+compute(n) = n + 1
+
+[[require: n > 0 && n < 1000]]
+bounded(n)(
+    new product = n * n
+    print product
+)
+
+overflow_demo()(
+    new big = 2147483647
+    new small = 1000
+    new product = small * small * small * small
+    print product
+    =big + 1
+)

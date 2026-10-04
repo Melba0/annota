@@ -1,0 +1,61 @@
+-[ GUI 完整示例（对应文档 15.12，补上了文档中未定义的 dec） ]-
+
+state count:int = 0
+state items:List = []
+state error:String = null
+
+inc()(
+    count = count + 1
+)
+
+dec()(
+    if count > 0(
+        count = count - 1
+    )
+)
+
+add_item()(
+    items = items + ["item " + (count + 1)]
+)
+
+Card(title:String, pad:int = 16)=(
+    Column(pad=pad, gap=8)(
+        Text(title, size=18, weight=bold)()
+        children()
+    )
+)
+
+StyleBtn=(
+    color=#ffffff
+    size=14
+    pad=8
+)
+
+view Main(title="Counter", width=400, height=300)(
+    Column(pad=16, gap=12)(
+        Card("Counter")(
+            Text("Count: " + count, size=24, color=#1a1a2e)()
+            Row(gap=8)(
+                Button("+1", click=inc, style=StyleBtn)()
+                Button("-1", click=dec, disabled=count <= 0)()
+                Button("add", click=add_item)()
+            )
+        )
+        if error != null(
+            Text(error, size=12, color=#ff0000)()
+        ) else (
+            Text("no errors", size=12, color=#666666)()
+        )
+        for (i, item) in items(
+            Text(i + ": " + item, size=14)()
+        )
+    )
+)
+
+(
+    inc()
+    inc()
+    add_item()
+    print "count = " + count
+    print "items = " + items
+)

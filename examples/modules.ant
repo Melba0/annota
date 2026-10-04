@@ -1,0 +1,61 @@
+-[ 自定义模块、可调用对象、下标协议 ]-
+
+use "./shapes.mod"
+
+new r = Rect(3, 4)
+print r
+print r.area()
+print r.describe()
+print r.name, r.w, r.h
+
+new c = Circle(2.0)
+print c.describe()
+
+[[bounds: r.area() == 12]]
+print "bounds ok"
+
+-- __call__ / __get__ / __set__
+adder(n)=(
+    n:int
+    __call__(x) = x + n
+    __get__(i) = i * n
+    __set__(i, v)(
+        print "set", i, v
+    )
+    __contains__(x) = x == n
+)
+
+new add7 = adder(7)
+print add7(3)
+print add7[6]
+add7[1] = 100
+
+-- 遍历自定义对象（__iter__）
+countdown(n)=(
+    n:int
+    __iter__()(
+        new out = []
+        for i in n to 1 step -1(
+            out.push(i)
+        )
+        =out
+    )
+    __len__() = n
+)
+new cd = countdown(3)
+for v in cd(
+    print v
+)
+print len(cd)
+
+-- 类型转换魔法函数
+money(cents)=(
+    cents:int
+    __int__() = cents
+    __float__() = cents / 100.0
+    __bool__() = cents > 0
+    __str__() = "$" + (cents / 100.0)
+)
+new m = money(1234)
+print (int)m, (float)m, (bool)m, (String)m
+print m

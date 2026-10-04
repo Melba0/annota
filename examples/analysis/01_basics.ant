@@ -1,0 +1,24 @@
+-[ expect: division-by-zero, out-of-bounds, null-dereference, unused-variable, contract-violation ]-
+-[ 基础检查：除零、越界、空引用、未使用、契约 ]-
+
+[[require: b != 0]]
+divide(a, b) = a / b
+
+[[require: len > 0]]
+first_of(xs, len) = xs[0]
+
+check(n)(
+    new zero = 0
+    print 10 / zero
+
+    new arr = [1, 2, 3]
+    print arr[5]
+
+    new nothing = null
+    print nothing.field
+
+    new never_used = 42
+
+    divide(1, 0)
+    first_of([1, 2, 3], 0)
+)

@@ -1,0 +1,44 @@
+-[ expect: none ]-
+-[ 正例：契约与断言让分析器证明这些操作是安全的 ]-
+
+[[require: divisor != 0]]
+[[ensure: result * divisor == dividend]]
+safe_div(dividend, divisor) = dividend / divisor
+
+[[require: items != null]]
+[[require: count > 0]]
+first_of(items, count) = items[0]
+
+check_target(node)(
+    if node != null(
+        print node.value
+    )
+)
+
+guarded()(
+    new divisor = 7
+    print safe_div(21, divisor)
+
+    new items = [3, 1, 4]
+    print first_of(items, 3)
+
+    new arr = [1, 2, 3]
+    [[assert: arr.size() > 0]]
+    print arr[0]
+    print arr[arr.size() - 1]
+
+    new i = 0
+    [[invariant: i >= 0]]
+    [[decrease: 3 - i]]
+    while i < 3(
+        i = i + 1
+    )
+    print i
+
+    new xs = [10, 20, 30]
+    new sum = 0
+    for k in 0 to len(xs) - 1(
+        sum = sum + xs[k]
+    )
+    print sum
+)

@@ -1,0 +1,96 @@
+-[ files.ant : 文件与目录 API 导览 ]-
+-[ 底层是 _file_* / _dir_* / _path_* 原语，上层是 lib/file.mod 的 File / Dir / Path / Text ]-
+
+use std
+
+Test.suite("文件与目录")
+
+new sandbox = Path.join("build", "files-demo")
+
+Dir.remove(sandbox, true)
+Dir.make(sandbox)
+
+-- ---------- 写与读
+new notes = Path.join(sandbox, "notes.txt")
+File.write(notes, "第一行\n第二行\n")
+File.append_line(notes, "第三行")
+
+Test.eq(File.lines(notes), ["第一行", "第二行", "第三行"], "lines 去掉结尾空行")
+Test.eq(File.line(notes, 1), "第二行", "按行号读取")
+Test.eq(File.size(notes), 30, "字节数")
+Test.eq(File.exists(notes), true, "exists")
+Test.eq(File.is_file(notes), true, "is_file")
+Test.eq(File.read_or("no-such-file", "兜底"), "兜底", "read_or 的默认值")
+
+-- ---------- Result 风格：不抛异常
+new missing = File.try_read("no-such-file")
+Test.eq(missing.is_err(), true, "try_read 失败返回 Err")
+Test.eq(missing.unwrap_or("x"), "x", "Err 上的 unwrap_or")
+
+new ok = File.try_read(notes)
+Test.eq(ok.is_ok(), true, "try_read 成功返回 Ok")
+Test.eq(len(ok.unwrap()) > 0, true, "Ok 上的 unwrap")
+
+-- ---------- JSON 与 CSV
+new data = Path.join(sandbox, "data.json")
+File.write(data, "{\"name\": \"annota\", \"version\": 2, \"tags\": [\"lang\", \"ide\"]}")
+new parsed = File.json(data)
+Test.eq(parsed["name"], "annota", "读取 JSON")
+Test.eq(parsed["tags"][1], "ide", "JSON 里的列表")
+
+new table = Path.join(sandbox, "table.csv")
+File.write(table, "a, b, c\n1, 2, 3\n4, 5, 6\n")
+new rows = File.csv(table)
+Test.eq(len(rows), 3, "CSV 行数")
+Test.eq(rows[2][1], "5", "CSV 单元格")
+
+-- ---------- 目录
+Dir.make(Path.join(sandbox, "inner"))
+File.write(Path.join(sandbox, "inner", "deep.txt"), "deep")
+Test.eq(Dir.list(sandbox).contains("inner"), true, "list 包含子目录")
+Test.eq(Dir.files(sandbox).contains("table.csv"), true, "files 只列文件")
+Test.eq(Dir.dirs(sandbox).contains("inner"), true, "dirs 只列目录")
+Test.eq(len(Dir.find(sandbox, ".txt")), 2, "find 递归找后缀")
+Test.eq(Dir.count(sandbox), 4, "count 顶层条目数")
+Test.eq(Dir.size_of(sandbox) > 0, true, "递归字节数")
+
+-- ---------- 拷贝、移动、删除
+new backup = Path.join(sandbox, "notes.bak")
+File.copy(notes, backup)
+Test.eq(File.read(backup), File.read(notes), "copy 内容一致")
+
+new moved = Path.join(sandbox, "inner", "moved.txt")
+File.move(backup, moved)
+Test.eq(File.exists(backup), false, "move 之后原文件消失")
+Test.eq(File.exists(moved), true, "move 之后新文件存在")
+
+File.remove(moved)
+Test.eq(File.exists(moved), false, "remove")
+
+-- ---------- 路径工具
+Test.eq(Path.ext("a/b/c.txt"), ".txt", "ext")
+Test.eq(Path.stem("a/b/c.txt"), "c", "stem")
+Test.eq(Path.basename("a/b/c.txt"), "c.txt", "basename")
+Test.eq(Path.dirname("a/b/c.txt"), "a/b", "dirname")
+Test.eq(Path.with_ext("a/b/c.txt", ".md"), "a/b/c.md", "with_ext")
+Test.eq(Path.is_abs("a/b"), false, "相对路径")
+Test.eq(len(Path.parts("a/b/c")) , 3, "parts")
+
+-- ---------- 文本工具
+Test.eq(Text.to_lines("a\nb\n\n"), ["a", "b"], "to_lines")
+Test.eq(Text.from_lines(["a", "b"]), "a\nb\n", "from_lines")
+Test.eq(Text.count_lines("a\nb"), 2, "count_lines")
+
+-- ---------- 原语直接可用（下划线前缀 = 底层）
+new raw = Path.join(sandbox, "raw.txt")
+_file_write(raw, "raw")
+Test.eq(_file_read(raw), "raw", "底层 _file_read / _file_write")
+Test.eq(_file_exists(raw), true, "底层 _file_exists")
+Test.eq(_path_basename(raw), "raw.txt", "底层 _path_basename")
+Test.eq(len(_dir_list(sandbox)) > 0, true, "底层 _dir_list")
+
+-- ---------- 清理
+Dir.remove(sandbox, true)
+Test.eq(File.exists(sandbox), false, "清空沙箱")
+
+Test.check()

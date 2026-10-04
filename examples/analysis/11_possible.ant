@@ -1,0 +1,29 @@
+-[ expect: contract-possible, division-by-zero, out-of-bounds, overflow, assert-unproven, duplicate-annotation ]-
+-[ 边界：分析器只能说“可能”的情况（? 级报告） ]-
+
+[[require: divisor != 0]]
+unknown_divide(a, divisor) = a / divisor
+
+[[pure]]
+[[pure]]
+idempotent(x) = x
+
+possible(n)(
+    unknown_divide(1, n)
+
+    new d = 0
+    if n > 0( d = 4 )
+    print 10 / d
+
+    new xs = [1, 2]
+    new i = 0
+    if n > 0( i = 5 )
+    print xs[i]
+
+    new m = 0
+    if n > 0( m = 1500000000 )
+    print m + m
+
+    [[assert: n > 100]]
+    print n
+)

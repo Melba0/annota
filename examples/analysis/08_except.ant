@@ -1,0 +1,7 @@
+-[ expect: except-placement ]-
+-[ except 只能紧跟在块的最后，不能作为独立语句出现 ]-
+
+new a = 1
+except err(
+    print err
+)

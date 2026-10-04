@@ -1,0 +1,6 @@
+-[ expect: bracket-mismatch ]-
+-[ 括号不匹配：块没有闭合 ]-
+
+check()(
+    new a = 1
+    print a

@@ -1,0 +1,59 @@
+-[ smoke test ]-
+
+use slice
+
+man(name, age)=(
+    name:String
+    age:int
+    sum(x, y) = x + y
+    __str__() = "man(" + name + ", " + age + ")"
+)
+
+macro add($b, $c)(
+    (($b)+($c))
+)
+
+categorize(a)={
+    a == 1: "one"
+    a == 2: "two"
+    else: "other"
+}
+
+[[module: smoke]]
+[[version: 1.0]]
+[[require: len > 0]]
+
+copy(data, len)(
+    new buf = alloc(len)
+    for i in 0 to len(
+        buf[i] = data[i]
+    )
+    =buf
+)
+
+state count:int = 0
+
+view Main(title="Smoke", width=400)(
+    Column(pad=16, gap=12)(
+        Text("Count: " + count, size=24)()
+        Button("+1", click=inc, disabled=count <= 0)()
+    )
+)
+
+inc()(
+    count = count + 1
+)
+
+(
+    new m = man("Alice", 30)
+    print m
+    print categorize(2)
+    print add(1, 2)
+    new arr = [1, 2, 3, 4, 5, 6]
+    new s = arr[1:4]
+    print s.size()
+    for i in 1 to 5 step 2(
+        print i
+    )
+    print 1, 2, 3, sep="-"
+)

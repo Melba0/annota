@@ -1,0 +1,20 @@
+-[ input.ant : 读取一行输入 ]-
+-[ 控制台运行时从 stdin 读；在 --gui 窗口或 IDE（F5/F7）里运行时弹出输入对话框。 ]-
+-[ 没有输入时会读到空字符串（stdin 结束或对话框被取消），程序应当能处理这种情况。 ]-
+
+use std
+
+Test.suite("input")
+
+new name = ""
+input name
+Test.eq(typeof(name), "String", "input 读到的是一行字符串")
+Test.eq(len(name) >= 0, true, "读到的内容可以正常使用")
+
+if name == ""(
+    print "(没有读到内容：stdin 已结束，或对话框被取消)"
+) else (
+    print "你好，" + name + "（长度 " + str(len(name)) + "）"
+)
+
+Test.check()

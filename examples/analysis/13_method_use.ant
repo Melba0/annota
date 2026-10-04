@@ -1,0 +1,31 @@
+-[ expect: none ]-
+-[ 回归：方法调用的接收者算作"被使用"（以前会误报 unused-variable） ]-
+
+Box()=(
+    v = 0
+
+    get() = v
+
+    put(x)(
+        v = x
+        =true
+    )
+)
+
+-- 参数只通过方法调用使用：不应报"参数从未被使用"
+consume(b)(
+    new got = b.get()
+    b.put(got + 1)
+    =got
+)
+
+-- 局部变量只通过方法调用使用：不应报"声明后从未被读取"
+round_trip(b)(
+    new box = b
+    new ignored = box.get()
+    =ignored
+)
+
+new seed = Box()
+print consume(seed)
+print round_trip(seed)

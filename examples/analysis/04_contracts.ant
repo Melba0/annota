@@ -1,0 +1,38 @@
+-[ expect: ensure-violation, invariant-violation, termination, contract-possible ]-
+-[ 契约检查：require / ensure / invariant / decrease ]-
+
+[[require: divisor != 0]]
+safe_divide(a, divisor) = a / divisor
+
+[[ensure: result > 0]]
+always_negative() = 0 - 5
+
+[[ensure: result >= 0]]
+square(x) = x * x
+
+[[require: n > 0 && n < 100]]
+[[ensure: result > n]]
+grow(n) = n + 1
+
+loop_checks()(
+    new i = 0
+    [[invariant: i == 0]]
+    [[decrease: 1]]
+    while i < 10(
+        i = i + 1
+    )
+)
+
+[[require: items != null]]
+[[require: count > 0]]
+first_item(items, count) = items[0]
+
+call_sites()(
+    new n = 5
+    safe_divide(10, n)
+
+    new unknown = read_from_somewhere()
+    safe_divide(10, unknown)
+    first_item([1, 2, 3], unknown)
+    grow(unknown)
+)

@@ -1,0 +1,72 @@
+# Build and verify Annota on Windows (MinGW + Qt 6) and Linux (no Qt).
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows / MinGW / Qt 6
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          cache: true
+
+      - name: Make Qt's MinGW available
+        shell: pwsh
+        run: |
+          # install-qt-action also installs the matching MinGW toolchain next to Qt
+          $mingw = Join-Path $env:RUNNER_WORKSPACE "Qt" "Tools"
+          if (Test-Path $mingw) { Get-ChildItem $mingw -Directory | ForEach-Object {
+            $bin = Join-Path $_.FullName "bin"
+            if (Test-Path $bin) { Add-Content $env:GITHUB_PATH $bin } } }
+
+      - name: Build and verify
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File build.ps1 -QtRoot "$env:QT_ROOT_DIR" -Verify
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ide-screenshot
+          path: build/ide-verify.png
+          if-no-files-found: ignore
+
+  linux:
+    name: Linux / g++ (no Qt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a compiler
+        run: sudo apt-get update && sudo apt-get install -y g++
+
+      - name: Build
+        run: g++ -std=c++17 -O2 -Isrc src/*.cpp -o annota
+
+      - name: Language self-check
+        run: |
+          ./annota examples/selfcheck.ant
+          ./annota examples/stdlib.ant
+          ./annota examples/algorithms.ant
+          ./annota examples/files.ant
+          ./annota examples/smoke.ant
+          ./annota examples/buffer.ant
+
+      - name: Analyzer fixtures and benchmark
+        run: |
+          ./annota analyze-suite examples/analysis
+          ./annota bench

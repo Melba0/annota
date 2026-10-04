@@ -1,0 +1,60 @@
+name: bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please fill in as much as you can — especially the exact command
+        and the output. `build\annota.exe --features` tells us what your binary can do.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: The exact command, the expected result and the actual result.
+      placeholder: |
+        build\annota.exe analyze my.ant
+        expected: no diagnostics
+        actual: reports out-of-bounds at line 12
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest Annota file (or REPL session) that shows the problem.
+      render: annota
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Output of `annota --features`
+      placeholder: contracts annotations files gui ide
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: v1.0.0 or the commit hash
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and compiler
+      placeholder: Windows 11, MinGW-w64 g++ 13.1, Qt 6.10.1
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build flavour
+      options:
+        - build.ps1 (with Qt)
+        - build.ps1 -NoQt
+        - CMake
+        - other
+    validations:
+      required: true

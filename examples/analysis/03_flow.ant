@@ -1,0 +1,38 @@
+-[ expect: uninitialized, dead-store, unreachable, infinite-loop, scope, type-mismatch, iterator-misuse, redundant-condition ]-
+-[ 过程内数据流：未初始化、死存储、不可达、无限循环、作用域、类型、迭代器、冗余条件 ]-
+
+flow_checks()(
+    new unset
+    print unset
+
+    new overwritten = 1
+    overwritten = 2
+    print overwritten
+
+    new typed:int = "not an int"
+
+    new iter_value = 1 to 10
+    print iter_value
+
+    new limit = 5
+    if limit > 0(
+        if limit > 0(
+            print "always true here"
+        )
+    )
+
+    while true(
+        print "no exit path"
+    )
+
+    =0
+    print "after return"
+)
+
+scope_checks()(
+    (
+        new inner = 1
+        print inner
+    )
+    print inner
+)
