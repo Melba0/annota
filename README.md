@@ -127,6 +127,95 @@ magic methods (`__len__`, `__str__`, `__call__`, `__iter__`, …), declarative `
 reactive `state`, compile-time macros, `Ok`/`Err`, slicing (`xs[1:4]`), optional/named/variadic
 parameters, piecewise expressions, `guard`-free error handling with `except`.
 
+### Syntax details
+
+**Constructors.** The class parameter list holds the constructor parameters; `__init__` takes
+**empty parentheses**, runs at construction time, and sees those parameters as locals. Declared
+field defaults are applied first, so `__init__` can override them.
+
+```annota
+Point(x, y)=(
+    X:int              -- declared field, default 0
+    Y:int
+    __init__()(
+        X = x          -- `x`, `y` are the class parameters, visible here
+        Y = y
+    )
+    norm2() = X * X + Y * Y
+)
+new p = Point(3, 4)
+print p.norm2()        -- 25
+```
+
+**Several statements per line.** Declarations, assignments and deletions accept comma lists, and a
+comma also separates statements when a line holds more than one:
+
+```annota
+new a, b                   -- two declarations
+new x = 1, y = 2, z = 3    -- each with its own value
+a = 1, b = 2               -- two assignments on one line
+del a, b                   -- delete both
+d + "y"                    -- a bare expression statement is fine
+```
+
+**Line continuation.** A line ending in a binary operator continues on the next line, and `\` joins
+explicitly, so long arithmetic can be laid out naturally:
+
+```annota
+new total = 1 +
+            2 +
+            3                      -- 6
+new joined = "a" + \
+             "b"                   -- "ab"
+```
+
+**Variadic parameters.** `*args` (Python style) and `...args` are equivalent; the collected value is
+an ordinary `List`. `**kwargs` is **not** supported — pass a `Dict` instead.
+
+```annota
+total(*nums)(
+    new s = 0
+    for n in nums( s = s + n )
+    =s
+)
+print total(), total(1), total(1, 2, 3)     -- 0 1 6
+
+join_with(sep, *parts)( ... )               -- fixed parameters first, then the variadic tail
+```
+
+**Slicing** (`use slice`) keeps the type: a list or tuple slice is a read-only `SliceView`
+(`.to_list()`, `len`, iteration), a **string slice is a string**.
+
+```annota
+new arr = [10, 20, 30, 40, 50]
+print arr[1:3].to_list()   -- [20, 30]
+print arr[2:]              -- SliceView(30, 40, 50)
+new text = "abcdefg"
+print text[2:5]            -- "cde"   (a String, not a view)
+```
+
+**Two formatting rules that bite.** An `else` must sit on the same line as the `)` that closes the
+`if` body — the formatter relies on that to tell a statement from an expression:
+
+```annota
+if n > 0( print "positive" ) else ( print "not positive" )     -- ✓
+if n > 0(
+    print "positive"
+) else (                                                        -- ✓ `) else (` on one line
+    print "not positive"
+)
+```
+
+and a statement cannot be broken across lines unless the line ends with an operator, a comma inside
+brackets, or a `\`:
+
+```annota
+new s = "a" +
+        "b"          -- ✓ continuation
+new t = "a"
+        + "b"        -- ✗ `+ "b"` is parsed as a new statement
+```
+
 ## Command line
 
 ```

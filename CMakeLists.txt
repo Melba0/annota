@@ -15,6 +15,11 @@ if(WIN32)
   target_link_libraries(annota PRIVATE ws2_32)
 endif()
 
+# std::thread / std::mutex need the platform thread library (libpthread on Linux)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(annota PRIVATE Threads::Threads)
+
 if(MSVC)
   target_compile_options(annota PRIVATE /utf-8 /W3 /wd4100 /wd4244 /wd4267)
 else()

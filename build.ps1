@@ -82,8 +82,12 @@ if ($gpp) {
         foreach ($f in $copies) { if (Test-Path $f) { Copy-Item $f $outDir -Force } else { Write-Host "[build] missing $f" } }
         $platDst = Join-Path $outDir "platforms"
         New-Item -ItemType Directory -Force -Path $platDst | Out-Null
-        $platSrc = Join-Path $QtRoot "plugins\platforms\qwindows.dll"
-        if (Test-Path $platSrc) { Copy-Item $platSrc $platDst -Force } else { Write-Host "[build] missing $platSrc" }
+        # qwindows for normal runs, qoffscreen for head-less CI (QT_QPA_PLATFORM=offscreen)
+        foreach ($plat in @("qwindows.dll", "qoffscreen.dll", "qminimal.dll")) {
+            $platSrc = Join-Path $QtRoot "plugins\platforms\$plat"
+            if (Test-Path $platSrc) { Copy-Item $platSrc $platDst -Force }
+            elseif ($plat -eq "qwindows.dll") { Write-Host "[build] missing $platSrc" }
+        }
         $styleDst = Join-Path $outDir "styles"
         New-Item -ItemType Directory -Force -Path $styleDst | Out-Null
         Get-ChildItem (Join-Path $QtRoot "plugins\styles\*.dll") -ErrorAction SilentlyContinue |
@@ -145,15 +149,26 @@ if ($Verify) {
     & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\doc_links.ps1") -Root $root
     if ($LASTEXITCODE -ne 0) { $failed++ }
     Write-Host "[verify] IDE (annota studio) renders headlessly"
+    # CI runners have no interactive desktop: render through Qt's offscreen platform.
+    # Qt prints font/plugin diagnostics on stderr, which PowerShell would turn into a
+    # terminating error under -ErrorActionPreference Stop, so relax it for these calls.
+    $savedQpa = $env:QT_QPA_PLATFORM
+    $savedEap = $ErrorActionPreference
+    $env:QT_QPA_PLATFORM = "offscreen"
+    $ErrorActionPreference = "Continue"
         $shot = Join-Path $outDir "ide-verify.png"
-        & $exe studio (Join-Path $root "examples\analysis\01_basics.ant") --run --shot $shot | Out-Null
+        # Qt warnings go to stderr; keep them out of the capture so PowerShell does not treat
+        # them as a command failure
+        & $exe studio (Join-Path $root "examples\analysis\01_basics.ant") --run --shot $shot 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $shot)) { Write-Host "  FAIL studio --shot"; $failed++ }
         else { Write-Host "  ok   studio --shot ($([int]((Get-Item $shot).Length / 1024)) KB)" }
         # the IDE must be able to open a program's own `view` window (F7)
         $preview = & $exe studio (Join-Path $root "examples\gui_counter.ant") --preview `
-                                 --shot (Join-Path $outDir "ide-preview.png") 2>&1 | Out-String
+                                 --shot (Join-Path $outDir "ide-preview.png") 2>$null | Out-String
         if ($preview -notmatch "Counter") { Write-Host "  FAIL studio --preview (no view window)"; $failed++ }
         else { Write-Host "  ok   studio --preview (view window opened)" }
+        if ($savedQpa) { $env:QT_QPA_PLATFORM = $savedQpa } else { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue }
+        $ErrorActionPreference = $savedEap
     } else {
         Write-Host "[verify] IDE skipped (no Qt in this build)" -ForegroundColor Yellow
     }

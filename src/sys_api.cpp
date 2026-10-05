@@ -25,6 +25,9 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #else
+// Declared at global scope on purpose: inside `namespace annota` this would resolve to
+// `annota::environ`, which is a different (undefined) symbol at link time.
+extern "C" char** environ;
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -486,8 +489,7 @@ void registerSysPrimitives(VM& vm) {
             FreeEnvironmentStringsA(block);
         }
 #else
-        extern char** environ;
-        for (char** p = environ; p && *p; p++) {
+        for (char** p = ::environ; p && *p; p++) {
             std::string entry = *p;
             size_t eq = entry.find('=');
             if (eq == std::string::npos) continue;

@@ -51,6 +51,21 @@ the IDE are all part of the tree. Please keep it that way.
 powershell -ExecutionPolicy Bypass -File build.ps1 -Verify     # everything
 ```
 
+CI runs the same script on Windows (with Qt 6) and a no-Qt Linux build. Two environment notes:
+
+* A CI runner has **no interactive desktop**, so the IDE checks need Qt's offscreen platform.
+  `build.ps1` deploys `platforms/qoffscreen.dll` next to the executable and sets
+  `QT_QPA_PLATFORM=offscreen` around `annota studio` by itself; set it
+  manually if you drive `studio` from another script:
+  ```powershell
+  $env:QT_QPA_PLATFORM = "offscreen"
+  build\annota.exe studio examples\files.ant --run --shot out.png
+  ```
+* Headless runs of a program that calls `input` need `ANNOTA_INPUT=<text>` (see the README FAQ).
+
+On Linux, build with CMake (`cmake -S . -B build && cmake --build build`); the runtime links
+`ws2_32` on Windows and plain POSIX sockets elsewhere, and no other dependency is allowed.
+
 Individual pieces while iterating:
 
 ```powershell

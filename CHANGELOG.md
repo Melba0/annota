@@ -32,6 +32,31 @@ major change, and a new check is a minor one.
   screenshots and a documentation link check (`tools/doc_links.ps1`) wired into
   `build.ps1 -Verify`.
 
+### Changed
+
+* **Syntax: less rigid, closer to what Python users expect.** `new a, b` declares several
+  variables at once (`new x = 1, y = 2`), a comma also separates statements on one line
+  (`a = 1, b = 2`), `del a, b` deletes several names, a line ending in a binary operator
+  continues on the next line (`1 +` then `2`) and `\` joins explicitly.
+* **`__init__` is the constructor body.** It takes empty parentheses, runs during construction and
+  sees the class parameters as locals; declared field defaults are applied first so that `__init__`
+  can override them. Giving `__init__` parameters is a compile error with a hint.
+* **Variadic parameters** accept Python style `*args` as well as `...args`; both collect a `List`.
+  `**kwargs` now reports a clear error instead of a confusing syntax error.
+* **Slicing keeps the type**: a string slice returns a `String` (it used to return a character
+  `SliceView`), while list and tuple slices stay read-only `SliceView`s.
+
+### Fixed
+
+* Linux: `_sys_env_all()` referenced `annota::environ` (the declaration sat inside the namespace)
+  rather than the global C `environ`, so linking failed with `undefined reference to
+  'annota::environ'`. Every POSIX build was affected.
+* CI: the headless IDE checks now run with `QT_QPA_PLATFORM=offscreen`, since a CI runner has no
+  interactive desktop and `annota studio` could not create a window there (`--shot`, `--preview`
+  and the GUI input check all failed).
+* Analyzer: a method call (`x.method()`) did not count as a use of `x`, so receivers and class
+  parameters used only through method calls were reported as unused.
+* `examples/syntax.ant`: 31 assertions over the syntax above, wired into `build.ps1 -Verify`.
 ## [1.0.0] - 2026-10-04
 
 First public release: the language, the standard library, the analysis layer and the tooling

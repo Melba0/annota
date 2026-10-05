@@ -131,6 +131,91 @@ main()(
 `__iter__` …）、声明式 `view` 组件与响应式 `state`、编译期宏、`Ok`/`Err`、切片（`xs[1:4]`）、
 可选参数 / 具名参数 / 可变参数、分段表达式、`except` 错误处理。
 
+### 语法细节
+
+**构造函数。** 类名后的括号是构造参数；`__init__` **括号为空**，在构造时执行，并且能直接读到那些
+构造参数（它们是局部变量）。字段默认值先应用，因此 `__init__` 可以覆盖它们。
+
+```annota
+Point(x, y)=(
+    X:int              -- 声明字段，默认 0
+    Y:int
+    __init__()(
+        X = x          -- x、y 就是类名括号里的构造参数
+        Y = y
+    )
+    norm2() = X * X + Y * Y
+)
+new p = Point(3, 4)
+print p.norm2()        -- 25
+```
+
+**一行多条语句。** 声明、赋值、删除都接受逗号列表；一行里的逗号也充当语句分隔符：
+
+```annota
+new a, b                   -- 一次声明两个
+new x = 1, y = 2, z = 3    -- 各自带初值
+a = 1, b = 2               -- 同行两条赋值
+del a, b                   -- 一次删除多个
+d + "y"                    -- 裸表达式语句也可以
+```
+
+**续行。** 行尾是二元运算符时自动续到下一行，也可以用 `\` 显式续行，长算式因此可以自然排版：
+
+```annota
+new total = 1 +
+            2 +
+            3                      -- 6
+new joined = "a" + \
+             "b"                   -- "ab"
+```
+
+**可变参数。** `*args`（Python 风格）与 `...args` 等价，收集到的是普通 `List`。
+`**kwargs` **不支持**，请直接传 `Dict`。
+
+```annota
+total(*nums)(
+    new s = 0
+    for n in nums( s = s + n )
+    =s
+)
+print total(), total(1), total(1, 2, 3)     -- 0 1 6
+
+join_with(sep, *parts)( ... )               -- 定长参数在前，变长参数收尾
+```
+
+**切片**（`use slice`）保持类型：列表/元组切片是只读的 `SliceView`（可用 `.to_list()`、`len`、
+遍历），而**字符串切片返回字符串**。
+
+```annota
+new arr = [10, 20, 30, 40, 50]
+print arr[1:3].to_list()   -- [20, 30]
+print arr[2:]              -- SliceView(30, 40, 50)
+new text = "abcdefg"
+print text[2:5]            -- "cde"（是字符串，不是视图）
+```
+
+**两条容易踩的格式规则。** `else` 必须与 `if` 体结尾的 `)` **同一行**——解析器靠这一点区分语句
+与表达式：
+
+```annota
+if n > 0( print "positive" ) else ( print "not positive" )     -- ✓
+if n > 0(
+    print "positive"
+) else (                                                        -- ✓ `) else (` 要在一行
+    print "not positive"
+)
+```
+
+语句不能跨行断开，除非行尾是运算符、括号内的逗号，或显式写了 `\`：
+
+```annota
+new s = "a" +
+        "b"          -- ✓ 续行
+new t = "a"
+        + "b"        -- ✗ `+ "b"` 会被当成新语句
+```
+
 ## 命令行
 
 ```
