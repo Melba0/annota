@@ -91,6 +91,9 @@ build\annota.exe --features
 
 ## The language in 30 lines
 
+There is no `main`: a file is a script, and its top-level statements run in order. Declare things
+above where you use them.
+
 ```annota
 -[ annotations are the specification ]-
 [[module: demo]]
@@ -106,21 +109,26 @@ count_to(limit)(
     =i
 )
 
-main()(
-    new xs = [3, 1, 4, 1, 5]
-    for x in sorted(xs)( print x )
+-- top level code: this *is* the entry point
+new xs = [3, 1, 4, 1, 5]
+for x in sorted(xs)( print x )
 
-    new text = "hello"
-    print text.upper(), len(text)
+new text = "hello"
+print text.upper(), len(text)
 
-    new d = Dict()
-    d.set("k", 42)
-    print d.get("k")
+new d = Dict()
+d.set("k", 42)
+print d.get("k")
 
-    try_it()          -- raises, caught below
-    except e( print "caught: " + e )
-)
+print divide(10, 2)        -- 5
+print count_to(4)          -- 4
+
+try_it()                   -- raises, caught below
+except e( print "caught: " + e )
 ```
+
+Wrapping everything in a `main()` function is *not* required and only changes when the code runs
+(the function body is skipped until you call it) — see [docs/style.md](docs/style.md).
 
 Features: deep-copy value semantics, closures with shared captures, classes with inheritance and
 magic methods (`__len__`, `__str__`, `__call__`, `__iter__`, …), declarative `view` components with
@@ -215,6 +223,11 @@ new s = "a" +
 new t = "a"
         + "b"        -- ✗ `+ "b"` is parsed as a new statement
 ```
+
+📘 **[Syntax reference](docs/syntax.md)** — every statement, operator and literal, plus the
+exact rules for line continuation and `else` placement.
+📘 **[Coding style](docs/style.md)** — how to lay out a file, name things and use annotations.
+*(Both guides are currently written in Chinese.)*
 
 ## Command line
 

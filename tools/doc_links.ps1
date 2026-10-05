@@ -19,8 +19,10 @@ $broken = @()
 $pendingHits = @()
 foreach ($f in $files) {
     $text = Get-Content $f.FullName -Raw -Encoding UTF8
-    $matches = [regex]::Matches($text, '!?\[[^\]]*\]\(([^)]+)\)') +
-               [regex]::Matches($text, '<img[^>]+src="([^"]+)"')
+    # the patterns are deliberately line-bound: a cross-line match would swallow prose (and
+    # markdown emphasis) into the captured path and produce nonsense "illegal path" errors
+    $matches = [regex]::Matches($text, '!?\[[^\]\r\n]*\]\(([^)\r\n]+)\)') +
+               [regex]::Matches($text, '<img[^>]+src="([^"\r\n]+)"')
     foreach ($m in $matches) {
         $target = $m.Groups[1].Value.Trim()
         if ($target -match '^(https?:|mailto:|#)') { continue }
@@ -28,7 +30,10 @@ foreach ($f in $files) {
         if (-not $path) { continue }
         $rel = $path.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
         if ($Pending -contains $rel) { $pendingHits += "$($f.Name) -> $rel"; continue }
-        $full = Join-Path $Root $rel
+        # a relative link is resolved against the file that contains it (GitHub behaviour),
+        # with the repository root accepted as a fallback
+        $full = Join-Path $f.DirectoryName $rel
+        if (-not (Test-Path $full)) { $full = Join-Path $Root $rel }
         if (-not (Test-Path $full)) {
             $broken += "$($f.Name): $target"
         }

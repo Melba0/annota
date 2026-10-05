@@ -96,6 +96,8 @@ build\annota.exe --features
 
 ## 30 行看懂这门语言
 
+**没有 `main` 函数**：一个文件就是一个脚本，顶层语句按顺序执行；声明要写在使用之前。
+
 ```annota
 -[ 标注就是规范 ]-
 [[module: demo]]
@@ -111,21 +113,26 @@ count_to(limit)(
     =i
 )
 
-main()(
-    new xs = [3, 1, 4, 1, 5]
-    for x in sorted(xs)( print x )
+-- 顶层代码就是入口
+new xs = [3, 1, 4, 1, 5]
+for x in sorted(xs)( print x )
 
-    new text = "hello"
-    print text.upper(), len(text)
+new text = "hello"
+print text.upper(), len(text)
 
-    new d = Dict()
-    d.set("k", 42)
-    print d.get("k")
+new d = Dict()
+d.set("k", 42)
+print d.get("k")
 
-    try_it()          -- 会抛异常，下面接住
-    except e( print "caught: " + e )
-)
+print divide(10, 2)        -- 5
+print count_to(4)          -- 4
+
+try_it()                   -- 会抛异常，下面接住
+except e( print "caught: " + e )
 ```
+
+把代码包进 `main()` **不是必需的**，只会改变执行时机（函数体在调用前不执行）——
+见 [docs/style.md](docs/style.md)。
 
 语言特性：深拷贝值语义、闭包共享捕获、类与继承、魔法函数（`__len__` / `__str__` / `__call__` /
 `__iter__` …）、声明式 `view` 组件与响应式 `state`、编译期宏、`Ok`/`Err`、切片（`xs[1:4]`）、
@@ -215,6 +222,9 @@ new s = "a" +
 new t = "a"
         + "b"        -- ✗ `+ "b"` 会被当成新语句
 ```
+
+📘 **[语法规范](docs/syntax.md)**——词法、语句、表达式、运算符优先级，以及续行与 `else` 的确切规则。
+📘 **[代码规范](docs/style.md)**——文件怎么写、怎么命名、标注怎么用、提交前检查清单。
 
 ## 命令行
 

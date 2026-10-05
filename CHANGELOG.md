@@ -11,6 +11,11 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* `docs/syntax.md` (语法规范) and `docs/style.md` (代码规范): a full grammar reference — literals,
+  operators with precedence, every statement form, classes, views, annotations, modules and macros —
+  and a style guide covering file layout, naming, annotation use, error handling, the standard
+  library, testing and a pre-commit checklist.
+
 * **System primitives, and a standard library built on them.** C++ now exposes only `_sys_*`
   thunks — clock, broken-down time, environment, shell, worker threads, sockets — while the
   feature surface lives in `lib/` as Annota modules: `lib/time.mod` (`Time`, `Stopwatch`),
