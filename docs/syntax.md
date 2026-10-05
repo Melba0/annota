@@ -215,7 +215,7 @@ input name                   -- 读一行到 name（GUI 里弹对话框，见 RE
 
 ```annota
 f(1, 2)
-f(1, key: 2)                 -- 具名参数
+f(1, key = 2)                -- 具名参数用 `=`（组件属性同理：Text(text = "...")）
 obj.method(1)
 obj.field
 xs[0], xs[i + 1]
