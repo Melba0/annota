@@ -30,6 +30,19 @@ the analyzer reads, so "what the tool tells you" and "what the program does" can
 * 🧩 **One language, four front ends** — CLI runner, REPL, graphical IDE (`annota studio`), LSP server for editor plugins. All four share the same toolchain: no second implementation to keep in sync.
 * 🔍 **Three-layer static analysis** — keystroke (<50 ms), save (<500 ms) and background (<5 s) budgets, 32 diagnostic codes, abstract interpretation over a CFG, contract checking at call sites.
 * 🖥️ **Real Qt 6 GUI** — both for programs written in Annota (`view` components) and for the IDE that you write them in. Both degrade gracefully: a `-NoQt` build still gets `--gui-tree`, the REPL and the whole analyzer.
+* 🔢 **C style numeric widths** — `int8..int64` / `uint8..uint64` / `float32` / `float64` plus the
+  boxed `longlong` (128-bit) and `longdouble` (80-bit); declared widths wrap and round like C, and
+  integer division truncates toward zero.
+* 🧱 **Fixed size typed arrays** — `int[5]`, `int[3][4]`, `int[]` with contiguous storage, auto
+  padding, O(1) row views, static bounds proofs and a `[[unsafe]]` opt-out from the runtime check.
+* ⚡ **`[[jit]]` marker** — the one annotation that asks for load-time optimisation (constant folding
+  + superinstruction fusion) of a function; measured on the loop benchmark.
+* 🧭 **Case analysis and `elif`**: `if` / `elif` / `else` chains, where each path learns its own
+  facts (`if i < 1 ( i = 1 )` then proves `i >= 1`), a branch that returns does not pollute the
+  join, and every diagnostic says which branch it came from.
+* 🧠 **The IDE knows the types**: hovering `int` / `long` / `longlong` / `double` ... reports the
+  type (width, signedness, how to declare and convert), completion offers them as `type` items and
+  the editor highlights them - all from one registry the parser, analyzer and highlighter share.
 * 📁 **Batteries included, in the language itself** — C++ only exposes _-prefixed primitives (clock, env, threads, sockets, files); Seq / Str / Dict / Mathx / File / Path / Time / Os / Thread / Net / Test are .mod files written in Annota. New capabilities are new modules, not rebuilds.
 * ✅ **Self-checking** — `build.ps1 -Verify` runs 8 example programs, 12 analyzer fixtures, a performance benchmark, an LSP end-to-end test and a headless IDE render.
 
@@ -371,6 +384,11 @@ The **32 diagnostic codes** are stable identifiers (`severity`: `error` = provab
 > tooling should key on `code`. The full list lives in [docs/reference.md](docs/reference.md)
 > (generated from the analyzer's registries by `annota ide docs`).
 
+**A small CAS backs the checks.** Conditions are normalised to integer linear forms
+(`sum(k_i * v_i) + c`), so `assert(i + 1 > i)`, `assert(2 * k == k + k)` or `assert(n - 1 < n)`
+are *proved* rather than reported as unprovable, `[[assume: x == 5]]` becomes a substitution
+that makes `assert(x * 2 == 10)` provable, and `if a + 1 > a` is flagged as redundant.
+
 **Annotations as specifications.** `[[assume]]` narrows the abstract state, `[[assert]]` must be
 proved, `[[require]]` is assumed at the entry and *checked at every call site*, `[[ensure]]` is
 checked at every return with `result` bound, `[[invariant]]` is checked at the loop entry and at
@@ -408,26 +426,43 @@ small `time` clock module and the `system` facade over the primitives.
 
 Script modules in `lib/`, loaded with `use <name>` or all at once with `use std`:
 
+Script modules in `lib/`, loaded with `use <name>` (or `use sub/name` for a module in a
+subdirectory) or all at once with `use std`.  A missing module is an error that lists where we
+looked, what exists and the closest name.  Full API reference: **[docs/stdlib.md](docs/stdlib.md)**.
+
 | Module | Object | Content |
 |---|---|---|
-| `slice` | `SliceView` | `arr[1:4]`, `arr[2:]`, `arr[:3]`, `arr[:]` |
-| `seq` | `Seq` | `map` `filter` `reject` `reduce` `fold` `any` `all` `count` `find` `index_where` `reverse` `unique` `flatten` `take` `drop` `slice_of` `chunk` `sort` `min_of` `max_of` `first` `last` `zip_with` `join` `sum_of` |
+| `seq` | `Seq` `Heap` | `map` `filter` `reduce` `scan` `zip_with` `chunk` `window` `rotate` `flatten` `transpose`; **algorithms**: `merge_sort` `sort_by` `heap_sort` `insertion_sort` `kth` `median` `quantile` `lower_bound` `upper_bound` `bsearch` `merge_sorted` `insert_sorted`; **sets**: `dedup` `union` `intersect` `difference` `is_subset`; **stats**: `mean` `variance` `stddev` `frequencies` `mode` `min_max`; `Heap.from_list(...).drain()` |
+| `dict` | `Dict` `Set` `Counter` | hash table with open addressing (FNV-1a, resize at 0.75, shrink at 0.125): `set` `get` `get_or` `has` `remove` `items_sorted` `map_values` `filter` `invert` `merge` `copy` `d[k]` `len(d)`; `Set` union/intersect/difference; `Counter` `most_common` `total` |
+| `text` | `Text` | KMP `find_all`/`find_kmp` `split_by` `replace_all` `words` `wrap` `snake_case` `camel_case` `levenshtein` `similarity` `lcs` `lcs_length` `is_palindrome` `is_anagram` `caesar` `rot13` `csv_parse` `csv_format` `base64_encode` `hex_dump` `ngrams` `char_freq` `word_freq` |
+| `numeric` | `Num` | `sieve` `is_prime` `nth_prime` `prime_sum` `prime_factors` `divisors` `divisor_count` `divisor_sum` `totient` `goldbach` `mod_pow` `mod_inverse` `gcd_ext` `fib` (fast doubling) `collatz_*` `binomial` `pascal_row` `catalan` `integer_sqrt` `digits` `base_str` `parse_base` `binary_search_monotone` `hanoi` |
+| `matrix` | `Matrix` | flat row-major storage, `mul` (i-k-j), `pow` (fast exponentiation), `det` (Gaussian elimination), `transpose` `trace` `add` `scale` `mul_list` `from_lists` `to_lists` `identity` |
+| `stats` | `Stats` | `mean` `weighted_mean` `median` `mode` `variance` `stddev` `percentile` `iqr` `skewness` `kurtosis` `covariance` `correlation` `rank` `zscores` `normalize` `histogram` `moving_average` `summary` |
+| `graph` | `Graph` `DSU` | `bfs` `dfs` `distances` `shortest_path` (Dijkstra + binary heap) `all_pairs` (Floyd–Warshall) `topological_sort` (Kahn) `has_cycle` `connected_components` `is_bipartite` `kruskal`; `DSU` with path compression + union by rank |
+| `geometry` | `Geo` | `dist` `dist2` `cross` `orientation` `segments_intersect` `polygon_area` (shoelace) `point_in_polygon` (ray casting) `convex_hull` (Andrew monotone chain, O(n log n)) `closest_pair` (divide and conquer) `bounding_box` `centroid` |
+| `slice` | `Slice` `SliceView` | `arr[1:4]`, `arr[2:]`, `arr[:3]`, `arr[:]` |
 | `str` | `Str` | `repeat` `pad_left` `pad_right` `center` `reverse` `capitalize` `title` `count` `blank` `is_digit` `lines` `join` `hex` `format` |
-| `dict` | `Dict` | `set` `get` `has` `remove` `size` `is_empty` `key_list` `value_list` `items` `clear` `merge` `copy` `keys_sorted` |
 | `mathx` | `Mathx` | `gcd` `lcm` `factorial` `fib` `fib_iter` `is_prime` `primes` `clamp` `lerp` `round_to` `mean` `median` `variance` `stddev` `is_even` `is_odd` `digit_sum` |
-| `file` | `File` `Dir` `Path` `Text` `Result` | see below |
-| `time` | `Time` `Stopwatch` | `millis` `clock` `parts` `year`…`weekday` `make` `format` (strftime-style, implemented in Annota) `iso` `date` `stamp_text` `leap` `days_in_month` `day_of_year` `diff_ms` `describe_ms` |
+| `file` | `File` `Dir` `Path` `FileText` `Result` | see below |
+| `time` | `Time` `Stopwatch` | `millis` `clock` `parts` `make` `format` (strftime-style, implemented in Annota) `iso` `date` `stamp_text` `leap` `days_in_month` `diff_ms` `describe_ms` |
 | `os` | `Os` | `platform` `arch` `cpus` `pid` `home` `temp` `cwd` `env` `set_env` `env_all` `exec` `run` `ok` `which` |
 | `thread` | `Thread` `Task` `Pool` | `hardware` `spawn` `run` `parallel_map` `parallel_each` `pool` |
-| `net` | `Net` `Tcp` `Url` `Response` | `tcp` `server` `get` `post` `request` `parse_http` `resolve`, `Tcp` send/recv/recv_until/recv_all/close, `Url.encode/decode/parse` |
+| `net` | `Net` `Tcp` `Url` `Response` | `tcp` `server` `get` `post` `request` `parse_http` `resolve`, `Url.encode/decode/parse` |
 | `test` | `Test` | `suite` `ok` `eq` `ne` `near` `raises` `report` `check` |
 
 ```powershell
-build\annota.exe examples\stdlib.ant      # tour of the standard library
-build\annota.exe examples\algorithms.ant  # classic algorithms built on it
-build\annota.exe examples\files.ant       # file API, 39 assertions
-build\annota.exe examples\system.ant      # clock, threads, sockets, HTTP parsing (53 assertions)
+build\annota.exe examples\stdlib.ant       # tour of the standard library (69 assertions)
+build\annota.exe examples\algorithms.ant   # sorting / DP / graphs / number theory / geometry (82)
+build\annota.exe examples\perf.ant         # performance benchmark: 12 workloads + timings
+build\annota.exe examples\collections.ant  # hash containers, hash vs linear scan
+build\annota.exe examples\strings.ant      # string algorithms
+build\annota.exe examples\graphs.ant       # BFS / Dijkstra / topological sort / MST / maze
+build\annota.exe examples\numerics.ant     # number theory workbook
+build\annota.exe examples\geometry.ant     # convex hull / areas / closest pair
+build\annota.exe examples\files.ant        # file API, 39 assertions
+build\annota.exe examples\system.ant       # clock, threads, sockets, HTTP parsing (53 assertions)
 ```
+
 
 ## Primitives
 

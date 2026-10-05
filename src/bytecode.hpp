@@ -61,6 +61,14 @@ enum Op : uint8_t {
     OP_CLASS,             // u16 class-template const
     OP_INIT_CLASS,        // run the static initialiser of the class on top of the stack
     OP_DEEPCOPY,
+    OP_CONVERT,           // u8 NumKind : numeric width conversion
+    OP_NEW_ARRAY,         // u8 ndims, u8 info (bit0 init list, bit1 eltIsStr, bit2 dynamic,
+                          //            bits 3..7 eltKind+1) : build T[n] / T[] arrays
+    OP_GET_INDEX_FAST,    // like OP_GET_INDEX but without the bounds check (proved by the
+                          // compiler: literal index in range, or the statement is [[unsafe]])
+    OP_LOCAL_ADD_IMM,     // u8 slot, i8 imm   : slot = slot + imm        (fused under [[jit]])
+    OP_LOCAL_SUB_IMM,     // u8 slot, i8 imm   : slot = slot - imm
+    OP_LOCAL_ADD_LOCAL,   // u8 slot, u8 src   : slot = slot + src
     OP_LAST
 };
 

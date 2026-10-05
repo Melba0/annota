@@ -15,6 +15,12 @@ struct Collector {
     };
     std::vector<Active> active;
     std::string file;
+    // when set, every diagnostic is annotated with the branch being analysed, so a
+    // report says *which* path may be wrong (case analysis of if/while/for)
+    std::string branchNote;
+    // > 0 while analysing statements that came from a `use`d module: they must still be
+    // *analysed* (their globals have to be declared), but their own diagnostics stay hidden
+    int muteDepth = 0;
 
     void pushIgnore(const Annotation& a, int from, int to) { active.push_back({from, to, &a}); }
     void popTo(size_t n) { active.resize(n); }
@@ -41,8 +47,12 @@ struct Collector {
     }
 
     void add(const Diagnostic& d) {
+        if (muteDepth > 0) return;
         Diagnostic diag = d;
         diag.file = file.empty() ? res->file : file;
+        if (!branchNote.empty()) {
+            diag.detail = diag.detail.empty() ? branchNote : diag.detail + "\n" + branchNote;
+        }
         Suppression* which = nullptr;
         if (suppressedBy(diag.code, diag.line, &which)) {
             diag.suppressed = true;

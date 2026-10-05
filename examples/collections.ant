@@ -1,0 +1,124 @@
+-[ collections.ant : 哈希容器三件套（Dict / Set / Counter）与性能对比 ]-
+-[ 哈希表是开放寻址 + 线性探测，查找平均 O(1)；文件后半段和线性扫描做对比。 ]-
+
+use test
+use seq
+use dict
+use time
+
+Test.suite("Dict")
+
+-- ---------------------------------------------------------------- 建表与查询
+new phone = Dict()
+phone.set("ann", "010-1111")
+phone.set("bob", "010-2222")
+phone.set("cy", "010-3333")
+Test.eq(phone.get("bob"), "010-2222", "查询")
+Test.eq(phone.has("dave"), false, "不存在的键")
+Test.eq(phone.size(), 3, "元素个数")
+
+-- 索引语法（__get__ / __set__）
+phone["dave"] = "010-4444"
+Test.eq(phone["dave"], "010-4444", "下标写入与读取")
+
+-- 更新、删除、默认值
+phone.set("ann", "010-9999")
+Test.eq(phone.get("ann"), "010-9999", "覆盖写")
+phone.remove("cy")
+Test.eq(phone.has("cy"), false, "删除键")
+Test.eq(phone.get_or("eve", ()( ="010-5555" )), "010-5555", "缺省时生成")
+Test.eq(phone.get("eve"), "010-5555", "生成后已写入")
+
+-- ---------------------------------------------------------------- 遍历与变换
+Test.eq(phone.keys_sorted(), ["ann", "bob", "dave", "eve"], "键有序")
+new upper = phone.map_values((v)( =v.substr(0, 3) ))
+Test.eq(upper.get("bob"), "010", "映射值")
+new short = phone.filter((k, v)( =len(k) == 3 ))
+Test.eq(short.keys_sorted(), ["ann", "bob", "eve"], "按条件筛选")
+new reversed_ = phone.invert()
+Test.eq(reversed_.get("010-2222"), "bob", "键值互换")
+Test.eq(phone.items_sorted()[0][0], "ann", "有序键值对")
+Test.eq(str(Dict([("b", 2), ("a", 1)])), "{a: 1, b: 2}", "字符串化按 key 排序")
+
+-- ---------------------------------------------------------------- 分组/聚合
+-- 按首字母分组（哈希表当桶用）
+group_by(xs, key)(
+    new out = Dict()
+    for x in xs(
+        new k = key(x)
+        new bucket = out.get_or(k, ()( =[] ))     -- 不存在就建一个桶
+        bucket.push(x)
+    )
+    =out
+)
+new grouped = group_by(["apple", "avocado", "banana", "blueberry", "cherry"], (s)( =s[0]))
+Test.eq(grouped.keys_sorted(), ["a", "b", "c"], "分组键")
+Test.eq(grouped.get("b"), ["banana", "blueberry"], "分组内容")
+
+-- 词频：Counter 是最顺手的工具
+new freq = Counter(["red", "blue", "red", "green", "red", "blue"])
+Test.eq(freq.most_common(2), [("red", 3), ("blue", 2)], "最高频两项")
+Test.eq(freq.distinct(), 3, "不同元素个数")
+Test.eq(freq.count("green"), 1, "单个计数")
+freq.add("green", 4)
+Test.eq(freq.count("green"), 5, "累加计数")
+freq.subtract(Counter(["red"]))
+Test.eq(freq.count("red"), 2, "扣减计数")
+
+-- ---------------------------------------------------------------- Set 集合运算
+Test.suite("Set")
+new a = Set([1, 2, 3, 4])
+new b = Set([3, 4, 5])
+Test.eq(a.union(b).items(), [1, 2, 3, 4, 5], "并集")
+Test.eq(a.intersect(b).items(), [3, 4], "交集")
+Test.eq(a.difference(b).items(), [1, 2], "差集")
+Test.eq(a.symmetric_difference(b).items(), [1, 2, 5], "对称差")
+Test.eq(a.is_subset(Set([1, 2, 3, 4, 5])), true, "子集")
+Test.eq(a.equals(Set([4, 3, 2, 1])), true, "集合相等")
+
+-- 用集合去重并统计独立词数
+new words = "the quick brown fox jumps over the lazy dog the fox".split(" ")
+Test.eq(Set(words).size(), 8, "独立词数")
+
+-- ---------------------------------------------------------------- 性能：哈希 vs 线性扫描
+Test.suite("哈希性能")
+new n = 4000
+new keys = []
+for i in 0 to n - 1(
+    keys.push("key-" + str(i))
+)
+new table = Dict()
+new t0 = _sys_clock()
+for k in keys(
+    table.set(k, len(k))
+)
+new fill_ms = _sys_clock() - t0
+Test.eq(table.size(), n, "全部插入")
+Test.eq(table.get("key-3999"), 8, "最后一个可见")
+
+-- 线性扫描：每次查询都要走一遍列表
+new list_ = keys
+new hits = 0
+t0 = _sys_clock()
+for i in 0 to 199(
+    if Seq.contains(list_, "key-" + str(i * 10))(
+        hits = hits + 1
+    )
+)
+new linear_ms = _sys_clock() - t0
+
+new hits2 = 0
+t0 = _sys_clock()
+for i in 0 to 199(
+    if table.has("key-" + str(i * 10))(
+        hits2 = hits2 + 1
+    )
+)
+new hash_ms = _sys_clock() - t0
+
+Test.eq(hits, 200, "线性扫描都命中")
+Test.eq(hits2, 200, "哈希查询都命中")
+print "插入 " + str(n) + " 个键: " + str(fill_ms) + " ms"
+print "200 次查询 —— 线性扫描: " + str(linear_ms) + " ms，哈希: " + str(hash_ms) + " ms"
+
+Test.check()

@@ -107,7 +107,8 @@ if ($Verify) {
     $failed = 0
     $examples = @("selfcheck.ant", "stdlib.ant", "algorithms.ant", "smoke.ant",
                   "buffer.ant", "gui_counter.ant", "modules.ant", "files.ant", "system.ant",
-                  "syntax.ant")
+                  "syntax.ant", "arrays.ant", "perf.ant",
+                  "collections.ant", "strings.ant", "graphs.ant", "numerics.ant", "geometry.ant")
     Write-Host "[verify] running $($examples.Count) examples"
     foreach ($e in $examples) {
         $path = Join-Path $root "examples\$e"

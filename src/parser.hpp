@@ -5,10 +5,12 @@
 
 namespace annota {
 
-// resolves `use <name>` / `use "<path>"` to a token stream
+// resolves `use <name>` / `use <dir/name>` / `use "<path>"` to a token stream
 struct ModuleLoader {
     virtual ~ModuleLoader() = default;
     virtual bool loadModule(const std::string& spec, std::vector<Token>& toks, std::string& file) = 0;
+    // extra text for a "cannot find module" error: where we looked, what exists, a suggestion
+    virtual std::string searchHint(const std::string& spec) { (void)spec; return ""; }
 };
 
 struct MacroRegistry {
@@ -94,6 +96,7 @@ private:
     std::vector<Annotation> parseAnnotations(bool& any);
     BlockP parseBlock(Ctx ctx, bool ui = false);
     std::vector<Param> parseParams();
+    std::vector<ExprP> parseDims();
     StmtP parseFuncDef(Ctx ctx, const std::string& name, const std::vector<Param>& params, bool isMethod);
     StmtP parseClassDef(const std::string& name, const std::vector<Param>& params, bool isView, bool isStyle);
     StmtP parseNew();

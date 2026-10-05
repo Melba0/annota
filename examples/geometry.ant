@@ -1,0 +1,99 @@
+-[ geometry.ant : 平面几何（凸包、面积、点包含、最近点对、线段相交、包围盒） ]-
+
+use test
+use seq
+use math
+use geometry
+
+Test.suite("几何")
+
+-- ---------------------------------------------------------------- 基本量
+Test.eq(Geo.dist((0, 0), (3, 4)), 5.0, "欧氏距离")
+Test.eq(Geo.dist2((0, 0), (3, 4)), 25, "距离平方（避免开方）")
+Test.eq(Geo.manhattan((2, 3), (5, 7)), 7, "曼哈顿距离")
+Test.eq(Geo.dot((1, 2), (3, 4)), 11, "点积")
+Test.eq(Geo.cross((0, 0), (1, 0), (0, 1)), 1, "叉积符号表示左转")
+Test.eq(Geo.orientation((0, 0), (1, 1), (2, 2)), 0, "三点共线")
+
+-- ---------------------------------------------------------------- 多边形
+new square = [(0, 0), (4, 0), (4, 4), (0, 4)]
+Test.eq(Geo.polygon_area(square), 16.0, "正方形面积")
+Test.eq(Geo.polygon_perimeter(square), 16.0, "周长")
+Test.eq(Geo.centroid(square), (2.0, 2.0), "质心")
+
+new triangle = [(0, 0), (6, 0), (0, 8)]
+Test.eq(Geo.polygon_area(triangle), 24.0, "三角形面积（鞋带公式）")
+Test.eq(Geo.polygon_perimeter(triangle), 24.0, "3-4-5 的 6-8-10 三角形周长")
+
+-- 点包含判定（射线法，O(n)）
+Test.eq(Geo.point_in_polygon(square, (2, 2)), true, "内部点")
+Test.eq(Geo.point_in_polygon(square, (4, 2)), false, "边上判为外部（射线法约定）")
+Test.eq(Geo.point_in_polygon(square, (5, 5)), false, "外部点")
+
+-- 反向遍历顶点，面积取绝对值后不变
+Test.eq(Geo.polygon_area(Seq.reverse(square)), 16.0, "顶点方向无关")
+
+-- ---------------------------------------------------------------- 线段相交
+Test.eq(Geo.segments_intersect((0, 0), (4, 4), (0, 4), (4, 0)), true, "交叉相交")
+Test.eq(Geo.segments_intersect((0, 0), (1, 0), (2, 0), (3, 0)), false, "共线不重叠")
+Test.eq(Geo.segments_intersect((0, 0), (4, 0), (2, -2), (2, 2)), true, "T 形相交")
+Test.eq(Geo.segments_intersect((0, 0), (1, 1), (3, 3), (4, 4)), false, "同一直线不相交")
+Test.eq(Geo.on_segment((0, 0), (4, 4), (2, 2)), true, "点在线段上")
+
+-- ---------------------------------------------------------------- 凸包（Andrew 单调链 O(n log n)）
+new cloud = [
+    (0, 0), (1, 0), (2, 0), (3, 0),
+    (0, 1), (1, 1), (2, 1),
+    (0, 2), (1, 2),
+    (0, 3),
+    (5, 5)
+]
+new hull = Geo.convex_hull(cloud)
+Test.eq(hull, [(0, 0), (3, 0), (5, 5), (0, 3)], "凸包顶点（逆时针，去掉共线与内部点）")
+Test.eq(Geo.polygon_area(hull), 15.0, "凸包面积")
+Test.eq(Geo.hull_perimeter(hull) > 0, true, "凸包周长")
+Test.eq(Geo.hull_diameter(hull), Geo.dist((0, 0), (5, 5)), "凸包直径")
+
+-- 所有点都在凸包内或边界上
+new inside = true
+for p in cloud(
+    if !Geo.point_in_polygon(hull, p) && !Geo.on_segment(hull[0], hull[1], p)(
+        -- 边界点可能被判在外面，这里只检查严格内部点
+        if !Seq.contains(hull, p)( inside = false )
+    )
+)
+Test.eq(inside, true, "所有点都在凸包内")
+
+-- ---------------------------------------------------------------- 最近点对（分治 O(n log n)）
+new pts = [(0, 0), (10, 10), (3, 4), (3, 5), (20, 20)]
+Test.eq(Geo.closest_pair(pts), 1.0, "最近点对距离")
+Test.eq(Geo.closest_pair([(0, 0), (100, 100)]), math.sqrt(20000.0), "只有两个点")
+Test.eq(Geo.closest_pair([(5, 5)]), null, "一个点无解")
+
+-- ---------------------------------------------------------------- 包围盒与实用函数
+Test.eq(Geo.bounding_box(pts), (0, 0, 20, 20), "包围盒")
+Test.eq(Geo.bounding_box([]), null, "空点集")
+
+-- 判断点是否落在以中心为圆心、r 为半径的圆内
+in_circle(center, r, p)( =Geo.dist(center, p) <= float(r) )
+Test.eq(in_circle((0, 0), 5, (3, 4)), true, "圆内（边界）")
+Test.eq(in_circle((0, 0), 5, (4, 4)), false, "圆外")
+
+-- 用叉积判断多边形是否为凸多边形：所有非零叉积同号
+is_convex(poly)(
+    new n = len(poly)
+    if n < 3( =false )
+    new signs = []
+    [[ignore: overflow]]   -- i + 2 以多边形顶点数为界，不会溢出
+    for i in 0 to n - 1(
+        new c = Geo.cross(poly[i], poly[(i + 1) % n], poly[(i + 2) % n])
+        if c != 0(
+            signs.push(c > 0)
+        )
+    )
+    =Seq.all_equal(signs)
+)
+Test.eq(is_convex(hull), true, "凸包是凸多边形")
+Test.eq(is_convex([(0, 0), (4, 0), (2, 1), (4, 4), (0, 4)]), false, "凹多边形")
+
+Test.check()

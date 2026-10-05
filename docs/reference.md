@@ -24,6 +24,7 @@ describe (a statement, a function, a loop, or the file itself).
 | `[[trusted]]` | 安全与信任 | func \| any | 0..1 | 信任此函数并跳过函数体分析 |
 | `[[pure]]` | 安全与信任 | func \| any | 0 | 无副作用 |
 | `[[noreturn]]` | 安全与信任 | func \| any | 0 | 函数不会正常返回 |
+| `[[jit]]` | 性能 | func \| any | 0 | 加载期优化这个函数 |
 | `[[require]]` | 契约 | func | 1 | 前置条件 |
 | `[[ensure]]` | 契约 | func | 1 | 后置条件 |
 | `[[invariant]]` | 契约 | loop | 1 | 循环不变量 |
@@ -59,6 +60,7 @@ Details:
 * `[[trusted]]` - 信任此函数并跳过函数体分析 整段跳过函数体的数据流分析，require 只作为文档保留。
 * `[[pure]]` - 无副作用 禁止写全局、写字段、调用非纯函数。
 * `[[noreturn]]` - 函数不会正常返回 通常内部 throw 或无限循环；与 ensure: result... 冲突。
+* `[[jit]]` - 加载期优化这个函数 编译时对该函数做常量折叠与超指令融合（后续的机器码后端挂在同一个标记下）。
 * `[[require]]` - 前置条件 函数入口假定成立；在每个调用点检查实参是否满足。
 * `[[ensure]]` - 后置条件 函数出口检查；可用 result 引用返回值。
 * `[[invariant]]` - 循环不变量 在循环入口、每次迭代末尾检查；只作用于循环。

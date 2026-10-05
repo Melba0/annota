@@ -1,0 +1,150 @@
+-[ graphs.ant : 图算法实战（社交网络、任务调度、网络布线、网格寻路） ]-
+
+use test
+use seq
+use dict
+use graph
+
+-- ================================================================ 1. 社交网络：连通与层数
+Test.suite("社交网络")
+
+new friends = Graph()
+friends.add_edge("ann", "bob")
+friends.add_edge("ann", "cy")
+friends.add_edge("bob", "dave")
+friends.add_edge("cy", "dave")
+friends.add_edge("dave", "eve")
+friends.add_edge("frank", "grace")
+
+Test.eq(friends.vertex_count(), 7, "顶点数")
+Test.eq(friends.bfs("ann")[0], "ann", "BFS 从 ann 开始")
+Test.eq(friends.has_path("ann", "eve"), true, "ann 能到达 eve")
+Test.eq(friends.has_path("ann", "frank"), false, "两个圈子不相通")
+Test.eq(friends.connected_components().size(), 2, "两个连通分量")
+Test.eq(friends.neighbors("ann"), ["bob", "cy"], "ann 的邻居")
+
+-- 度数 = 朋友数量
+new popular = Seq.max_by(friends.vertices(), (v)( =friends.degree(v) ))
+Test.eq(popular, "dave", "朋友最多的人")
+
+-- ================================================================ 2. 加权图：最短路（Dijkstra）
+Test.suite("最短路")
+
+new roads = Graph(true)
+roads.add_edge("A", "B", 4)
+roads.add_edge("A", "C", 2)
+roads.add_edge("C", "B", 1)
+roads.add_edge("B", "D", 5)
+roads.add_edge("C", "D", 8)
+roads.add_edge("D", "E", 2)
+
+new dist = roads.distances("A")
+Test.eq(dist.get("A"), 0, "起点距离 0")
+Test.eq(dist.get("B"), 3, "A→C→B = 3")
+Test.eq(dist.get("D"), 8, "A→C→B→D = 8")
+Test.eq(dist.get("E"), 10, "A→C→B→D→E = 10")
+
+new path = roads.shortest_path("A", "E")
+Test.eq(path[0], 10, "路径长度")
+Test.eq(path[1], ["A", "C", "B", "D", "E"], "路径顶点")
+Test.eq(roads.shortest_path("E", "A"), null, "有向图反向不可达")
+
+-- Floyd–Warshall：一次算出所有点对
+new ap = roads.all_pairs()
+new names = ap[0]
+new matrix_ = ap[1]
+Test.eq(matrix_[Seq.index_of(names, "A")][Seq.index_of(names, "E")], 10, "多源最短路")
+
+-- ================================================================ 3. 任务调度：拓扑排序
+Test.suite("任务调度")
+
+new tasks = Graph(true)
+tasks.add_edge("编写", "测试")
+tasks.add_edge("测试", "发布")
+tasks.add_edge("编写", "文档")
+tasks.add_edge("文档", "发布")
+new order = tasks.topological_sort()
+Test.eq(order[0], "编写", "先编写")
+Test.eq(Seq.index_of(order, "发布"), len(order) - 1, "发布最后")
+Test.eq(tasks.has_cycle(), false, "调度无环")
+
+-- 反向时形成环 → 拓扑排序应给出 null
+tasks.add_edge("发布", "编写")
+Test.eq(tasks.has_cycle(), true, "加入回边后成环")
+Test.eq(tasks.topological_sort(), null, "有环时无法拓扑排序")
+
+-- ================================================================ 4. 网络布线：最小生成树
+Test.suite("最小生成树")
+
+new links = [(0, 1, 7), (0, 3, 5), (1, 2, 8), (1, 3, 9), (1, 4, 7), (2, 4, 5), (3, 4, 15), (3, 5, 6), (4, 5, 8)]
+new mst = Graph.kruskal(6, links)
+Test.eq(mst[0], 30, "MST 总成本")
+Test.eq(len(mst[1]), 5, "MST 边数")
+
+new dsu = DSU(6)
+for e in mst[1](
+    dsu.union(e[0], e[1])
+)
+Test.eq(dsu.count(), 1, "连成一棵生成树")
+
+-- ================================================================ 5. 网格寻路
+Test.suite("网格寻路")
+
+grid_graph(rows, cols, blocked)(
+    new g = Graph(true)
+    for r in 0 to rows - 1(
+        for c in 0 to cols - 1(
+            new name = str(r) + "," + str(c)
+            if blocked.has(name)( continue )
+            g.add_vertex(name)
+        )
+    )
+    for r in 0 to rows - 1(
+        for c in 0 to cols - 1(
+            new name = str(r) + "," + str(c)
+            if blocked.has(name)( continue )
+            if r + 1 < rows(
+                new down = str(r + 1) + "," + str(c)
+                if !blocked.has(down)( g.add_edge(name, down, 1) )
+            )
+            if c + 1 < cols(
+                new right = str(r) + "," + str(c + 1)
+                if !blocked.has(right)( g.add_edge(name, right, 1) )
+            )
+        )
+    )
+    =g
+)
+
+new walls = Set(["1,1", "1,2", "1,3", "2,3"])
+new maze = grid_graph(4, 5, walls)
+new route = maze.shortest_path("0,0", "3,4")
+Test.eq(route[0], 7, "最短步数")
+Test.eq(route[1][0], "0,0", "起点")
+Test.eq(route[1][len(route[1]) - 1], "3,4", "终点")
+
+-- 打印路径，直观看看
+print "网格 4x5，障碍 " + str(walls.items()) + "："
+print "  " + Seq.join(route[1], " -> ")
+
+-- 增删边之后仍然一致
+maze.add_edge("0,0", "1,0", 1)
+Test.eq(maze.has_edge("0,0", "1,0"), true, "补一条边")
+Test.eq(maze.edge_count() > 0, true, "边数非零")
+
+-- ================================================================ 6. 结构判定
+Test.suite("结构判定")
+new bipartite = Graph()
+bipartite.add_edge("a", "x")
+bipartite.add_edge("b", "x")
+bipartite.add_edge("b", "y")
+Test.eq(bipartite.is_bipartite(), true, "二分图")
+
+new odd_cycle = Graph()
+odd_cycle.add_edge(1, 2)
+odd_cycle.add_edge(2, 3)
+odd_cycle.add_edge(3, 1)
+Test.eq(odd_cycle.is_bipartite(), false, "奇环不是二分图")
+Test.eq(odd_cycle.has_cycle(), true, "奇环有环")
+
+Test.check()

@@ -10,6 +10,19 @@ new a, b
 a = 1, b = 2
 Test.eq(a + b, 3, "new a, b 一次声明两个，随后分别赋值")
 
+const C1 = 10, C2 = 20
+Test.eq(C1 + C2, 30, "const a, b 一次声明两个常量")
+
+-- 整数除法向零截断（与 C 对齐），浮点操作数才做浮点除法
+Test.eq(7 / 2, 3, "int / int 向零截断")
+Test.eq(0 - 7 / 2, 0 - 3, "负数同样向零截断")
+Test.eq(7 / 2.0, 3.5, "任一侧是 float 就是浮点除法")
+Test.eq(7 % 3, 1, "取余符号随被除数")
+Test.eq(0 - 7 % 3, 0 - 1, "负数取余")
+
+new (d1, d2) = (7, 8)
+Test.eq(d1 + d2, 15, "new (a, b) = 元组 解构")
+
 new x = 1, y = 2, z = 3
 Test.eq(x + y + z, 6, "new x = 1, y = 2, z = 3 同行多声明")
 
@@ -108,6 +121,14 @@ Counter(start = 0)=(
 new c = Counter(5)
 Test.eq(c.bump(), 6, "__init__ 覆盖字段默认值")
 Test.eq(c.bump(4), 10, "带默认参数的方法")
+
+-- ---------------------------------------------------------------- state 逗号列表（在 view 里）
+view Panel(title = "panel")(
+    state a = 0, b = 0
+    Column(pad = 4)(
+        Text(text = str(a + b))
+    )
+)
 
 -- ---------------------------------------------------------------- 切片
 use slice

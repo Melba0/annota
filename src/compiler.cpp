@@ -1,4 +1,6 @@
 // Annota - compiler.cpp : AST -> bytecode.
+#include <cstdio>
+#include <cstdlib>
 #include "compiler.hpp"
 #include <algorithm>
 
@@ -137,7 +139,25 @@ const Annotation* Compiler::findAnn(const std::vector<Annotation>& anns, const c
     return nullptr;
 }
 
+// remember `T[n][m]` on a local so that indexing can skip the bounds check when it is provable
+void Compiler::noteLocalShape(const std::string& name, const std::string& type,
+                              const std::vector<ExprP>& dims) {
+    if (!fs_ || dims.empty()) return;
+    std::vector<int64_t> fixed;
+    for (auto& d : dims) {
+        bool ok = false;
+        Value v = d ? constEval(d, ok) : Value::null();
+        if (!d || (ok && v.t == VT::Int)) fixed.push_back(d ? v.i : 0);
+        else return;                                  // a dynamic size: nothing to prove
+    }
+    for (auto it = fs_->locals.rbegin(); it != fs_->locals.rend(); ++it)
+        if (it->name == name) { it->type = type; it->fixedDims = fixed; return; }
+}
+
 Value Compiler::makeDefault(const std::string& type) {
+    NumKind k = numKindByName(type);
+    if (k != NumKind::None)
+        return numIsFloat(k) ? Value::typedReal(0.0, k) : Value::typedInt(0, k);
     if (type == "int") return Value::integer(0);
     if (type == "float") return Value::real(0.0);
     if (type == "bool") return Value::boolean(false);
@@ -150,7 +170,8 @@ Value Compiler::constEval(const ExprP& e, bool& ok) {
     ok = true;
     if (!e) { ok = false; return Value::null(); }
     switch (e->kind) {
-        case EK::Int:   return Value::integer(e->ival);
+        case EK::Int:   return e->wideLiteral ? Value::wide(parseWide(e->sval, false), false)
+                                                : Value::integer(e->ival);
         case EK::Float: return Value::real(e->fval);
         case EK::Str:   return Value::str(e->sval);
         case EK::Bool:  return Value::boolean(e->bval);
@@ -212,6 +233,7 @@ void Compiler::compileContracts(const std::vector<Annotation>& anns, const char*
 }
 
 void Compiler::stmt(const StmtP& s) {
+    stmtUnsafe_ = s && hasAnn(s->annotations, "unsafe");
     if (!s) return;
     switch (s->kind) {
         case SK::Annot: {
@@ -234,8 +256,22 @@ void Compiler::stmt(const StmtP& s) {
         case SK::New:
         case SK::Const: stmtNew(s); return;
         case SK::State: {
+            if (!s->typeDims.empty()) {
+                emitNewArray(s);
+                emit(OP_DEF_GLOBAL, s->line);
+                emitU16((uint16_t)addString(s->name), s->line);
+                res_.states.push_back(s->name);
+                return;
+            }
             if (s->initExpr) expr(s->initExpr);
             else emit(OP_NULL, s->line);
+            if (uint8_t bc = boxedConvertCode(s->type)) {
+                emit(OP_CONVERT, s->line);
+                emitByte(bc, s->line);
+            } else if (NumKind kk = numKindByName(s->type); kk != NumKind::None) {
+                emit(OP_CONVERT, s->line);
+                emitByte((uint8_t)kk, s->line);
+            }
             emit(OP_DEF_GLOBAL, s->line);
             emitU16((uint16_t)addString(s->name), s->line);
             res_.states.push_back(s->name);
@@ -306,6 +342,14 @@ void Compiler::stmt(const StmtP& s) {
         case SK::MacroDef: return;                       // compile-time only
         case SK::FieldDecl: {
             if (!fs_->cls) error("field declaration outside a class body", s->line);
+            if (!s->typeDims.empty()) {
+                emitNewArray(s);
+                emit(OP_GET_LOCAL, s->line);
+                emitByte(0, s->line);                    // this
+                emit(OP_SET_FIELD, s->line);
+                emitU16((uint16_t)addString(s->name), s->line);
+                return;
+            }
             emit(OP_GET_LOCAL, s->line);
             emitByte(0, s->line);                        // this
             int slot = resolveLocal(fs_, s->name);
@@ -511,11 +555,91 @@ void Compiler::storeTarget(const ExprP& target, bool isDecl, bool isConst) {
     emitU16((uint16_t)addString(name), target->line);
 }
 
+// Build `T[n]` / `T[]` / `T[m][n]` from the declared dimensions plus an optional element list.
+// [[jit]]: a deliberately small, safe pass over one chunk.  Fusions keep the instruction count
+// identical (the freed slots become OP_NOP) so that every jump target stays valid.
+void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
+    if (!ch) return;
+    auto& code = ch->code;
+    for (size_t i = 0; i + 3 < code.size(); i++) {
+        // GET_LOCAL s ; [GET_LOCAL s] ; INT1 k ; ADD|SUB ; SET_LOCAL s
+        size_t j = i;
+        if (code[j] != OP_GET_LOCAL) continue;
+        uint8_t s1 = code[j + 1];
+        j += 2;
+        if (j + 1 < code.size() && code[j] == OP_GET_LOCAL && code[j + 1] == s1) j += 2;
+        if (j + 1 >= code.size() || code[j] != OP_INT1) continue;
+        uint8_t imm = code[j + 1];
+        j += 2;
+        if (j >= code.size() || (code[j] != OP_ADD && code[j] != OP_SUB)) continue;
+        uint8_t arith = code[j];
+        j++;
+        if (j + 1 >= code.size() || code[j] != OP_SET_LOCAL || code[j + 1] != s1) continue;
+        j++;                                   // include the SET_LOCAL operand byte in the padding
+        code[i] = arith == OP_ADD ? OP_LOCAL_ADD_IMM : OP_LOCAL_SUB_IMM;
+        code[i + 1] = s1;
+        code[i + 2] = imm;
+        for (size_t k = i + 3; k <= j; k++) code[k] = OP_NOP;
+        i = j;
+    }
+    for (size_t i = 0; i + 6 < code.size(); i++) {
+        // GET_LOCAL s ; GET_LOCAL t ; ADD ; SET_LOCAL s
+        if (code[i] != OP_GET_LOCAL) continue;
+        uint8_t s1 = code[i + 1];
+        if (code[i + 2] != OP_GET_LOCAL) continue;
+        uint8_t t1 = code[i + 3];
+        if (code[i + 4] != OP_ADD) continue;
+        if (code[i + 5] != OP_SET_LOCAL || code[i + 6] != s1) continue;
+        code[i] = OP_LOCAL_ADD_LOCAL;
+        code[i + 1] = s1;
+        code[i + 2] = t1;
+        for (size_t k = i + 3; k <= i + 6; k++) code[k] = OP_NOP;
+        i += 6;
+    }
+}
+
+void Compiler::emitNewArray(const StmtP& s) {
+    size_t nd = s->typeDims.size();
+    bool dynamic = false;
+    for (auto& d : s->typeDims) {
+        if (d) { expr(d); }
+        else { emit(OP_INT1, s->line); emitByte(0, s->line); dynamic = true; }
+    }
+    bool hasInit = (bool)s->initExpr;
+    if (hasInit) expr(s->initExpr);
+    NumKind ek = numKindByName(s->type);
+    bool eltStr = (s->type == "String" || s->type == "str" || s->type == "string");
+    uint8_t info = (uint8_t)((hasInit ? 1 : 0) | (eltStr ? 2 : 0) | (dynamic ? 4 : 0) |
+                             ((ek == NumKind::None ? 0 : ((int)ek + 1)) << 3));
+    emit(OP_NEW_ARRAY, s->line);
+    emitByte((uint8_t)nd, s->line);
+    emitByte(info, s->line);
+}
+
 void Compiler::stmtNew(const StmtP& s) {
     bool isConst = (s->kind == SK::Const);
+    if (!s->typeDims.empty() && s->names.size() == 1) {
+        emitNewArray(s);
+        ExprP id = std::make_shared<Expr>(); id->kind = EK::Ident; id->name = s->names[0]; id->line = s->line;
+        storeTarget(id, true, isConst);
+        if (isConst) {
+            for (auto& l : fs_->locals) if (l.name == id->name) l.isConst = true;
+            if (isGlobalScope()) constGlobals_.insert(id->name);
+        }
+        noteLocalShape(id->name, s->type, s->typeDims);
+        return;
+    }
     if (s->names.size() == 1) {
         if (s->initExpr) expr(s->initExpr);
         else emit(OP_NULL, s->line);
+        // declared width: wrap/round the value into the declared numeric kind
+        if (uint8_t bc = boxedConvertCode(s->type)) {
+            emit(OP_CONVERT, s->line);
+            emitByte(bc, s->line);
+        } else if (NumKind kk = numKindByName(s->type); kk != NumKind::None) {
+            emit(OP_CONVERT, s->line);
+            emitByte((uint8_t)kk, s->line);
+        }
         ExprP id = std::make_shared<Expr>();
         id->kind = EK::Ident;
         id->name = s->names[0];
@@ -811,6 +935,22 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
         } else {
             fixed++;
         }
+        // a declared parameter width is enforced on entry (C style narrowing conversion)
+        if (uint8_t bc = boxedConvertCode(p.type)) {
+            emit(OP_GET_LOCAL, 0);
+            emitByte((uint8_t)slot, 0);
+            emit(OP_CONVERT, 0);
+            emitByte(bc, 0);
+            emit(OP_SET_LOCAL, 0);
+            emitByte((uint8_t)slot, 0);
+        } else if (NumKind pk = numKindByName(p.type); pk != NumKind::None) {
+            emit(OP_GET_LOCAL, 0);
+            emitByte((uint8_t)slot, 0);
+            emit(OP_CONVERT, 0);
+            emitByte((uint8_t)pk, 0);
+            emit(OP_SET_LOCAL, 0);
+            emitByte((uint8_t)slot, 0);
+        }
     }
     f->chunk->fixedCount = fixed;
 
@@ -882,6 +1022,7 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
     }
     std::shared_ptr<Chunk> ch = f->chunk;
     popState();
+    if (hasAnn(anns, "jit")) optimizeChunk(ch);
     return ch;
 }
 
@@ -953,6 +1094,11 @@ void Compiler::expr(const ExprP& e) {
         case EK::Null: emit(OP_NULL, e->line); return;
         case EK::Bool: emit(e->bval ? OP_TRUE : OP_FALSE, e->line); return;
         case EK::Int:
+            if (e->wideLiteral) {
+                emit(OP_CONST, e->line);
+                emitU16((uint16_t)addConst(Value::wide(parseWide(e->sval, false), false)), e->line);
+                return;
+            }
             if (e->ival >= -128 && e->ival <= 127) {
                 emit(OP_INT1, e->line);
                 emitByte((uint8_t)(int8_t)e->ival, e->line);
@@ -1081,9 +1227,19 @@ void Compiler::expr(const ExprP& e) {
         }
         case EK::Call: exprCall(e); return;
         case EK::Index: {
+            bool proved = stmtUnsafe_;                 // reuse the existing [[unsafe]] hint
+            if (!proved && e->a && e->a->kind == EK::Ident) {
+                int slot = resolveLocal(fs_, e->a->name);
+                if (slot >= 0 && slot < (int)fs_->locals.size() &&
+                    !fs_->locals[(size_t)slot].fixedDims.empty()) {
+                    int64_t n = fs_->locals[(size_t)slot].fixedDims[0];
+                    if (e->b && e->b->kind == EK::Int && e->b->ival >= 0 && e->b->ival < n)
+                        proved = true;                 // the compiler proved it by itself
+                }
+            }
             expr(e->a);
             expr(e->b);
-            emit(OP_GET_INDEX, e->line);
+            emit(proved ? OP_GET_INDEX_FAST : OP_GET_INDEX, e->line);
             return;
         }
         case EK::Field: {

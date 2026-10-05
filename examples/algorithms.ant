@@ -1,227 +1,271 @@
--[ 算法示例：用标准库和语言本身实现一些经典算法 ]-
+-[ algorithms.ant : 算法总览（排序 / 选择 / 动态规划 / 图 / 数论 / 字符串 / 几何 / 矩阵） ]-
+-[ 每个算法都用断言验证结果，可以直接当参考实现来读。 ]-
 
-use std
+use test
+use seq
+use dict
+use numeric
+use text
+use matrix
+use stats
+use graph
+use geometry
 
-—分段 排序
+-- ================================================================ 1. 排序
+Test.suite("排序")
 
-quicksort(xs)(
-    if len(xs) <= 1( =xs )
-    new pivot = xs[0]
-    new smaller = []
-    new larger = []
+new data = [38, 27, 43, 3, 9, 82, 10]
+
+Test.eq(Seq.merge_sort(data, (a, b)( =a < b)), [3, 9, 10, 27, 38, 43, 82], "归并排序（稳定）")
+Test.eq(Seq.heap_sort(data), [3, 9, 10, 27, 38, 43, 82], "堆排序")
+Test.eq(Seq.insertion_sort(data, (a, b)( =a < b)), [3, 9, 10, 27, 38, 43, 82], "插入排序")
+Test.eq(Seq.sort_native(data), [3, 9, 10, 27, 38, 43, 82], "原生排序")
+Test.eq(Seq.is_sorted(Seq.sort(data)), true, "有序判定")
+
+-- 归并排序是稳定的：相同键保持原来的先后顺序
+new pairs = [(2, "a"), (1, "b"), (2, "c"), (1, "d")]
+Test.eq(Seq.sort_by(pairs, (p)( =p[0])), [(1, "b"), (1, "d"), (2, "a"), (2, "c")], "稳定排序键")
+
+-- 多关键字排序：分数降序，同分按名字升序
+new people = [("bo", 90), ("al", 90), ("cy", 85)]
+new ranked = Seq.merge_sort(people, (p, q)(
+    if p[1] == q[1]( =p[0] < q[0] )
+    =p[1] > q[1]
+))
+Test.eq(ranked, [("al", 90), ("bo", 90), ("cy", 85)], "多关键字排序")
+
+-- 合并两个有序序列（归并排序的基石）
+Test.eq(Seq.merge_sorted([1, 4, 7], [2, 3, 9], (a, b)( =a < b)), [1, 2, 3, 4, 7, 9], "合并有序序列")
+
+-- ================================================================ 2. 查找与选择
+Test.suite("查找与选择")
+
+new sorted_data = Seq.sort([5, 3, 8, 1, 9, 2, 7])
+Test.eq(sorted_data, [1, 2, 3, 5, 7, 8, 9], "排序结果")
+Test.eq(Seq.bsearch(sorted_data, 7), 4, "二分查找命中")
+Test.eq(Seq.bsearch(sorted_data, 6), -1, "二分查找未命中")
+Test.eq(Seq.lower_bound([1, 2, 2, 2, 3], 2), 1, "lower_bound（第一个不小于）")
+Test.eq(Seq.upper_bound([1, 2, 2, 2, 3], 2), 4, "upper_bound（第一个大于）")
+Test.eq(Seq.bsearch_by([("a", 1), ("b", 5), ("c", 9)], 9, (p)( =p[1])), 2, "按键二分")
+
+-- 第 k 小 / 中位数：快速选择 O(n) 平均，不需要整体排序
+new nums = [7, 1, 5, 3, 9, 2, 8]
+Test.eq(Seq.kth(nums, 0), 1, "最小")
+Test.eq(Seq.kth(nums, 6), 9, "最大")
+Test.eq(Seq.kth(nums, 3), 5, "第 4 小")
+Test.eq(Seq.median(nums), 5, "中位数（奇数个）")
+Test.eq(Seq.median([1, 2, 3, 4]), 2.5, "中位数（偶数个取平均）")
+Test.eq(Seq.quantile([1, 2, 3, 4, 5], 0.25), 2, "四分位")
+
+Test.eq(Seq.insert_sorted([1, 3, 5, 7], 4), [1, 3, 4, 5, 7], "有序插入")
+
+-- 滑动窗口最大值（单调双端队列，O(n)）
+window_max(xs, k)(
+    new out = []
+    new deque = []
+    [[ignore: out-of-bounds]]   -- 循环条件已保证 deque 非空，下面按下标取队首/队尾
+    for i in 0 to len(xs) - 1(
+        while len(deque) > 0 && deque[0] <= i - k(
+            deque.remove(0)
+        )
+        while len(deque) > 0 && xs[deque[len(deque) - 1]] <= xs[i](
+            deque.pop()
+        )
+        deque.push(i)
+        if i >= k - 1(
+            out.push(xs[deque[0]])
+        )
+    )
+    =out
+)
+Test.eq(window_max([1, 3, -1, -3, 5, 3, 6, 7], 3), [3, 3, 5, 5, 6, 7], "滑动窗口最大值 O(n)")
+
+-- ================================================================ 3. 动态规划
+Test.suite("动态规划")
+
+-- 最长递增子序列：耐心排序 O(n log n)
+lis_length(xs)(
+    new tails = []
+    for x in xs(
+        new at = Seq.lower_bound(tails, x)
+        if at == len(tails)(
+            tails.push(x)
+        ) else (
+            tails[at] = x
+        )
+    )
+    =len(tails)
+)
+Test.eq(lis_length([10, 9, 2, 5, 3, 7, 101, 18]), 4, "最长递增子序列")
+Test.eq(lis_length([1, 2, 3, 4]), 4, "已递增序列")
+
+-- 0/1 背包：O(n * capacity)
+knapsack(weights, values, capacity)(
+    new dp = []
+    for c in 0 to capacity(
+        dp.push(0)
+    )
+    for i in 0 to len(weights) - 1(
+        new c = capacity
+        while c >= weights[i](
+            new take = dp[c - weights[i]] + values[i]
+            if take > dp[c](
+                dp[c] = take
+            )
+            c = c - 1
+        )
+    )
+    =dp[capacity]
+)
+Test.eq(knapsack([1, 3, 4, 5], [1, 4, 5, 7], 7), 9, "0/1 背包")
+
+Test.eq(Text.levenshtein("kitten", "sitting"), 3, "编辑距离")
+Test.eq(Text.lcs_length("AGGTAB", "GXTXAYB"), 4, "最长公共子序列长度")
+Test.eq(Text.lcs("AGGTAB", "GXTXAYB"), "GTAB", "最长公共子序列")
+
+-- 兑换零钱（完全背包）
+coin_change(coins, amount)(
+    new inf = amount + 1
+    new dp = []
+    for i in 0 to amount(
+        dp.push(inf)
+    )
+    dp[0] = 0
+    for c in 1 to amount(
+        for coin in coins(
+            if coin <= c && dp[c - coin] + 1 < dp[c](
+                dp[c] = dp[c - coin] + 1
+            )
+        )
+    )
+    if dp[amount] > amount( =-1 )
+    =dp[amount]
+)
+Test.eq(coin_change([1, 2, 5], 11), 3, "最少硬币数")
+Test.eq(coin_change([2], 3), -1, "无法兑换")
+
+-- 最大子段和（Kadane，O(n)）
+max_subarray(xs)(
+    new best = xs[0]
+    new cur = xs[0]
     for i in 1 to len(xs) - 1(
-        if xs[i] < pivot(
-            smaller.push(xs[i])
+        if cur + xs[i] > xs[i](
+            cur = cur + xs[i]
         ) else (
-            larger.push(xs[i])
+            cur = xs[i]
         )
+        if cur > best( best = cur )
     )
-    =quicksort(smaller) + [pivot] + quicksort(larger)
+    =best
 )
+Test.eq(max_subarray([-2, 1, -3, 4, -1, 2, 1, -5, 4]), 6, "最大子段和")
 
-merge_sorted(a, b)(
-    new out = []
-    new i = 0
-    new j = 0
-    while i < len(a) && j < len(b)(
-        if a[i] <= b[j](
-            out.push(a[i])
-            i = i + 1
-        ) else (
-            out.push(b[j])
-            j = j + 1
-        )
-    )
-    while i < len(a)(
-        out.push(a[i])
-        i = i + 1
-    )
-    while j < len(b)(
-        out.push(b[j])
-        j = j + 1
-    )
-    =out
+-- ================================================================ 4. 图算法
+Test.suite("图")
+
+new g = Graph()
+g.add_edge("a", "b")
+g.add_edge("a", "c")
+g.add_edge("b", "d")
+g.add_edge("c", "d")
+g.add_edge("d", "e")
+Test.eq(g.bfs("a"), ["a", "b", "c", "d", "e"], "BFS（层序）")
+Test.eq(g.dfs("a")[0], "a", "DFS 起点")
+Test.eq(g.has_path("a", "e"), true, "连通性")
+Test.eq(g.connected_components().size(), 1, "连通分量")
+Test.eq(g.is_bipartite(), true, "二分图判定")
+
+-- 有权图最短路（Dijkstra + 二叉堆）
+new w = Graph(true)
+w.add_edge("s", "a", 4)
+w.add_edge("s", "b", 1)
+w.add_edge("b", "a", 2)
+w.add_edge("a", "t", 5)
+w.add_edge("b", "t", 8)
+new sp = w.shortest_path("s", "t")
+Test.eq(sp[0], 8, "最短路径长度")
+Test.eq(sp[1], ["s", "b", "a", "t"], "最短路径")
+
+-- 拓扑排序（Kahn）与有向环检测
+new dag = Graph(true)
+dag.add_edge("shirt", "tie")
+dag.add_edge("tie", "jacket")
+dag.add_edge("shirt", "belt")
+dag.add_edge("belt", "jacket")
+new order = dag.topological_sort()
+Test.eq(order[0], "shirt", "拓扑排序起点")
+Test.eq(Seq.index_of(order, "tie") < Seq.index_of(order, "jacket"), true, "拓扑序满足依赖")
+Test.eq(dag.has_cycle(), false, "DAG 无环")
+
+-- 并查集 + 最小生成树（Kruskal）
+new edges = [(0, 1, 4), (0, 2, 3), (1, 2, 1), (1, 3, 2), (2, 3, 4), (3, 4, 2), (4, 5, 6)]
+new mst = Graph.kruskal(6, edges)
+Test.eq(mst[0], 14, "MST 总权重")
+Test.eq(len(mst[1]), 5, "MST 边数（顶点数 - 1）")
+
+new dsu = DSU(6)
+for e in mst[1](
+    dsu.union(e[0], e[1])
 )
+Test.eq(dsu.count(), 1, "MST 把所有顶点连成一棵树")
 
-bubble_sort(xs)(
-    new out = []
-    for x in xs( out.push(x) )
-    for i in 0 to len(out) - 2(
-        for j in 0 to len(out) - 2 - i(
-            if out[j] > out[j + 1](
-                new t = out[j]
-                out[j] = out[j + 1]
-                out[j + 1] = t
-            )
-        )
-    )
-    =out
-)
+-- Floyd–Warshall（多源最短路，O(V^3)）
+new ap = w.all_pairs()
+new names = ap[0]
+new dmatrix = ap[1]
+Test.eq(dmatrix[Seq.index_of(names, "s")][Seq.index_of(names, "t")], 8, "多源最短路")
 
-binary_search(xs, target)(
-    new lo = 0
-    new hi = len(xs) - 1
-    while lo <= hi(
-        new mid = math.floor((lo + hi) / 2)
-        if xs[mid] == target( =mid )
-        if xs[mid] < target(
-            lo = mid + 1
-        ) else (
-            hi = mid - 1
-        )
-    )
-    =-1
-)
+-- ================================================================ 5. 数论
+Test.suite("数论")
+Test.eq(Num.sieve(20), [2, 3, 5, 7, 11, 13, 17, 19], "埃拉托斯特尼筛")
+Test.eq(Num.prime_factors(60), [2, 2, 3, 5], "质因数分解")
+Test.eq(Num.divisors(36), [1, 2, 3, 4, 6, 9, 12, 18, 36], "约数枚举")
+Test.eq(Num.totient(36), 12, "欧拉函数")
+Test.eq(Num.gcd_of_list([24, 36, 60]), 12, "多值最大公约数")
+Test.eq(Num.lcm_of_list([2, 3, 4]), 12, "多值最小公倍数")
+Test.eq(Num.mod_pow(3, 100, 7), 4, "快速幂取模")
+Test.eq(Num.mod_inverse(3, 11), 4, "模逆（扩展欧几里得）")
+Test.eq(Num.fib(50), 12586269025, "快速倍增斐波那契")
+Test.eq(Num.binomial(20, 10), 184756, "二项式系数")
+Test.eq(Num.pascal_row(5), [1, 5, 10, 10, 5, 1], "帕斯卡三角行")
+Test.eq(Num.goldbach(100), (3, 97), "哥德巴赫拆分")
+Test.eq(Num.collatz_length(27), 111, "考拉兹序列长度")
+Test.eq(Num.base_str(255, 2), "11111111", "二进制表示")
+Test.eq(Num.integer_root(1000, 3), 10, "整数立方根")
 
-—分段 数列与动态规划
+-- ================================================================ 6. 字符串算法
+Test.suite("字符串")
+Test.eq(Text.find_all("aaaa", "aa"), [0, 1, 2], "KMP 找出所有出现（可重叠）")
+Test.eq(Text.replace_all("a-b-c", "-", "+"), "a+b+c", "全部替换")
+Test.eq(Text.is_palindrome("Was it a car or a cat I saw"), true, "回文判定")
+Test.eq(Text.is_anagram("Listen", "Silent"), true, "变位词")
+Test.eq(Text.longest_common_prefix(["interview", "internet", "internal"]), "inter", "最长公共前缀")
+Test.eq(Text.caesar("Attack at dawn", 3), "Dwwdfn dw gdzq", "凯撒密码")
+Test.eq(Text.base64_encode("Hello"), "SGVsbG8=", "Base64 编码")
+Test.eq(Text.csv_parse("a,\"b,c\",d"), ["a", "b,c", "d"], "CSV 解析")
+Test.eq(Text.wrap("the quick brown fox jumps", 10), ["the quick", "brown fox", "jumps"], "折行")
+Test.eq(Text.word_freq("a b a c a b").most_common(1), [("a", 3)], "词频统计")
 
-fib_memo()(
-    new memo = Dict()
-    fib(n)(
-        if n < 2( =n )
-        new key = "f" + n
-        if memo.has(key)( =memo.get(key) )
-        new v = fib(n - 1) + fib(n - 2)
-        memo.set(key, v)
-        =v
-    )
-    =fib
-)
+-- ================================================================ 7. 计算几何
+Test.suite("几何")
+Test.eq(Geo.dist((0, 0), (3, 4)), 5.0, "两点距离")
+new points = [(0, 0), (2, 0), (2, 2), (0, 2), (1, 1)]
+new hull = Geo.convex_hull(points)
+Test.eq(len(hull), 4, "凸包去掉内部点")
+Test.eq(Geo.polygon_area(hull), 4.0, "凸包面积（鞋带公式）")
+Test.eq(Geo.point_in_polygon(hull, (1, 1)), true, "点在多边形内")
+Test.eq(Geo.closest_pair([(0, 0), (3, 4), (0, 1), (7, 7)]), 1.0, "最近点对（分治）")
+Test.eq(Geo.segments_intersect((0, 0), (4, 4), (0, 4), (4, 0)), true, "线段相交")
+Test.eq(Geo.polygon_perimeter([(0, 0), (3, 0), (3, 4)]), 12.0, "多边形周长")
 
-lcs(a, b)(
-    new n = len(a)
-    new m = len(b)
-    new table = []
-    for i in 0 to n(
-        new row = []
-        for j in 0 to m( row.push(0) )
-        table.push(row)
-    )
-    for i in 1 to n(
-        for j in 1 to m(
-            if a[i - 1] == b[j - 1](
-                table[i][j] = table[i - 1][j - 1] + 1
-            ) else (
-                table[i][j] = math.max(table[i - 1][j], table[i][j - 1])
-            )
-        )
-    )
-    =table[n][m]
-)
+-- ================================================================ 8. 矩阵
+Test.suite("矩阵")
+new m1 = Matrix.from_lists([[1, 2], [3, 4]])
+new m2 = Matrix.from_lists([[0, 1], [1, 0]])
+Test.eq(m1.mul(m2).to_lists(), [[2, 1], [4, 3]], "矩阵乘法")
+Test.eq(m1.det(), -2.0, "行列式（高斯消元）")
+Test.eq(m1.pow(3).to_lists(), [[37, 54], [81, 118]], "矩阵快速幂")
+Test.eq(Matrix.identity(3).trace(), 3, "迹")
+Test.eq(m1.transpose().to_lists(), [[1, 3], [2, 4]], "转置")
 
-edit_distance(a, b)(
-    new n = len(a)
-    new m = len(b)
-    new d = []
-    for i in 0 to n(
-        new row = []
-        for j in 0 to m( row.push(0) )
-        d.push(row)
-    )
-    for i in 0 to n( d[i][0] = i )
-    for j in 0 to m( d[0][j] = j )
-    for i in 1 to n(
-        for j in 1 to m(
-            new cost = 1
-            if a[i - 1] == b[j - 1]( cost = 0 )
-            d[i][j] = math.min(d[i - 1][j] + 1, math.min(d[i][j - 1] + 1, d[i - 1][j - 1] + cost))
-        )
-    )
-    =d[n][m]
-)
-
-—分段 数论
-
-sieve(limit)(
-    new flags = []
-    for i in 0 to limit( flags.push(true) )
-    new out = []
-    for n in 2 to limit(
-        if flags[n](
-            out.push(n)
-            new multiple = n * n
-            while multiple <= limit(
-                flags[multiple] = false
-                multiple = multiple + n
-            )
-        )
-    )
-    =out
-)
-
-—分段 矩阵
-
-identity(n)(
-    new m = []
-    for i in 1 to n(
-        new row = []
-        for j in 1 to n(
-            if i == j( row.push(1) ) else ( row.push(0) )
-        )
-        m.push(row)
-    )
-    =m
-)
-
-matmul(a, b)(
-    new n = len(a)
-    new p = len(b[0])
-    new inner = len(b)
-    new out = []
-    for i in 0 to n - 1(
-        new row = []
-        for j in 0 to p - 1(
-            new acc = 0
-            for k in 0 to inner - 1(
-                acc = acc + a[i][k] * b[k][j]
-            )
-            row.push(acc)
-        )
-        out.push(row)
-    )
-    =out
-)
-
-—分段 主程序
-
-print "-- 排序 --"
-new numbers = [38, 27, 43, 3, 9, 82, 10]
-print numbers
-print quicksort(numbers)
-print bubble_sort(numbers)
-print Seq.sort(numbers)
-print merge_sorted([1, 3, 5], [2, 4, 6])
-print "numbers untouched: " + numbers
-
-print "-- 查找 --"
-new sorted_numbers = Seq.sort(numbers)
-print binary_search(sorted_numbers, 43), binary_search(sorted_numbers, 100)
-
-print "-- 动态规划 --"
-new fib = fib_memo()
-print fib(10), fib(40), fib(70)
-print lcs("AGGTAB", "GXTXAYB")
-print edit_distance("kitten", "sitting")
-print edit_distance("flaw", "lawn")
-
-print "-- 数论 --"
-print sieve(50)
-print Seq.take(sieve(200), 15)
-
-print "-- 矩阵 --"
-new m = [[1, 2], [3, 4]]
-print matmul(m, m)
-print matmul(m, identity(2))
-
-print "-- 断言 --"
-Test.suite("algorithms")
-Test.eq(quicksort(numbers), [3, 9, 10, 27, 38, 43, 82], "quicksort")
-Test.eq(bubble_sort(numbers), Seq.sort(numbers), "bubble sort matches library sort")
-Test.eq(binary_search([1, 3, 5, 7], 5), 2, "binary search")
-Test.eq(binary_search([1, 3, 5, 7], 4), -1, "binary search miss")
-Test.eq(fib(30), 832040, "memoised fibonacci")
-Test.eq(lcs("AGGTAB", "GXTXAYB"), 4, "longest common subsequence")
-Test.eq(edit_distance("kitten", "sitting"), 3, "edit distance")
-Test.eq(len(sieve(100)), 25, "primes below 100")
-Test.eq(matmul(m, identity(2)), m, "matrix times identity")
 Test.check()

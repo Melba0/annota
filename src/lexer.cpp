@@ -1,4 +1,6 @@
 // Annota - lexer.cpp
+#include <cctype>
+#include <cstring>
 #include "lexer.hpp"
 #include <unordered_map>
 
@@ -24,6 +26,7 @@ const char* tokenName(T t) {
         case T::Kw_state: return "'state'";
         case T::Kw_if: return "'if'";
         case T::Kw_else: return "'else'";
+        case T::Kw_elif: return "'elif'";
         case T::Kw_for: return "'for'";
         case T::Kw_while: return "'while'";
         case T::Kw_in: return "'in'";
@@ -94,7 +97,7 @@ const std::unordered_map<std::string, T>& keywords() {
     static const std::unordered_map<std::string, T> kw = {
         {"new", T::Kw_new}, {"del", T::Kw_del}, {"const", T::Kw_const},
         {"macro", T::Kw_macro}, {"use", T::Kw_use}, {"view", T::Kw_view},
-        {"state", T::Kw_state}, {"if", T::Kw_if}, {"else", T::Kw_else},
+        {"state", T::Kw_state}, {"if", T::Kw_if}, {"else", T::Kw_else}, {"elif", T::Kw_elif},
         {"for", T::Kw_for}, {"while", T::Kw_while}, {"in", T::Kw_in},
         {"break", T::Kw_break},
         {"continue", T::Kw_continue}, {"throw", T::Kw_throw}, {"except", T::Kw_except},
@@ -151,6 +154,19 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
     auto newline = [&]() {
         if (!out.empty() && out.back().type == T::Newline) return;   // collapse runs
         if (!out.empty() && continuesLine(out.back().type)) return;  // implicit continuation
+        // `) else` / `) elif` may start the next line: an if/elif chain reads better with one
+        // branch per line, and the block above already ended with its `)`
+        if (!out.empty() && out.back().type == T::RParen && p < n) {
+            size_t q = p;
+            while (q < n && (src[q] == '\n' || src[q] == '\r' || src[q] == ' ' || src[q] == '\t')) q++;
+            auto wordAt = [&](size_t at, const char* w) {
+                size_t len = std::strlen(w);
+                if (at + len > n || src.compare(at, len, w) != 0) return false;
+                char after = at + len < n ? src[at + len] : ' ';
+                return !(std::isalnum((unsigned char)after) || after == '_');
+            };
+            if (wordAt(q, "else") || wordAt(q, "elif")) return;
+        }
         push(T::Newline, line, col);
     };
 
@@ -230,8 +246,20 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
                 if (d == p) err("malformed hexadecimal literal");
                 size_t idx = push(T::Int, tl, tc);
                 int64_t v = 0;
-                for (size_t k = d; k < p; k++) if (src[k] != '_') v = v * 16 + hexVal(src[k]);
+                unsigned __int128 acc = 0;
+                bool big = false;
+                for (size_t k = d; k < p; k++) {
+                    if (src[k] == '_') continue;
+                    v = v * 16 + hexVal(src[k]);
+                    acc = acc * 16 + (unsigned)hexVal(src[k]);
+                    if (acc > (unsigned __int128)9223372036854775807ULL) big = true;
+                }
                 out[idx].ival = v;
+                if (big) {
+                    std::string digits = "0x";
+                    for (size_t k = d; k < p; k++) if (src[k] != '_' ) digits += src[k];
+                    out[idx].text = digits;
+                }
                 continue;
             }
             if (c == '0' && p + 1 < n && (src[p + 1] == 'b' || src[p + 1] == 'B')) {
@@ -243,7 +271,8 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
                     p++; col++;
                 }
                 if (d == p) err("malformed binary literal");
-                size_t idx = push(T::Int, tl, tc); out[idx].ival = v;
+                size_t idx = push(T::Int, tl, tc);
+                out[idx].ival = v;
                 continue;
             }
             if (c == '0' && p + 1 < n && (src[p + 1] == 'o' || src[p + 1] == 'O')) {
@@ -253,6 +282,11 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
                 while (p < n && src[p] >= '0' && src[p] <= '7') { v = v * 8 + (src[p] - '0'); p++; col++; }
                 if (d == p) err("malformed octal literal");
                 size_t idx = push(T::Int, tl, tc); out[idx].ival = v;
+                if (v < 0) {   // overflowed the signed range while accumulating in base 8
+                    std::string digits = "0o";
+                    for (size_t k = d; k < p; k++) if (src[k] != '_') digits += src[k];
+                    out[idx].text = digits;
+                }
                 continue;
             }
             bool isFloat = false;
@@ -276,7 +310,14 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
             for (char ch : num) if (ch != '_') clean += ch;
             size_t idx = push(isFloat ? T::Float : T::Int, tl, tc);
             if (isFloat) out[idx].fval = std::strtod(clean.c_str(), nullptr);
-            else out[idx].ival = (int64_t)std::strtoll(clean.c_str(), nullptr, 10);
+            else {
+                out[idx].ival = (int64_t)std::strtoll(clean.c_str(), nullptr, 10);
+                // longer than the 64 bit range: keep the digits, the parser makes it a 128 bit
+                // constant (`longlong`)
+                if (clean.size() > 19 ||
+                    (clean.size() == 19 && clean > std::string("9223372036854775807")))
+                    out[idx].text = clean;
+            }
             continue;
         }
         // ---- strings

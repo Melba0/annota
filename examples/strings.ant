@@ -1,0 +1,93 @@
+-[ strings.ant : 字符串与文本算法（KMP、编辑距离、LCS、CSV、Base64、词频、相似度排序） ]-
+
+use test
+use seq
+use dict
+use text
+
+Test.suite("字符串")
+
+-- ---------------------------------------------------------------- 查找与替换
+new log = "2024-01-01 INFO boot | 2024-01-01 WARN disk | 2024-01-02 ERROR io"
+Test.eq(len(Text.find_all(log, "2024-01-01")), 2, "KMP 找出所有日期")
+Test.eq(Text.find_kmp(log, "ERROR"), 57, "定位 ERROR")
+Test.eq(Text.count_sub("aaaaa", "aa"), 2, "不重叠计数")
+Test.eq(Text.replace_all("a,b,,c", ",,", ","), "a,b,c", "替换（一次扫描）")
+
+new fields = Text.split_by("a|b|c", "|")
+Test.eq(fields, ["a", "b", "c"], "按分隔符切分")
+Test.eq(Text.join_words(fields, " -> "), "a -> b -> c", "重新拼接")
+
+-- ---------------------------------------------------------------- 变形与排版
+Test.eq(Text.pad_left("42", 5, "0"), "00042", "左填充")
+Test.eq(Text.center("hi", 6, "-"), "--hi--", "居中")
+Test.eq(Text.repeat("=", 5), "=====", "重复")
+Test.eq(Text.collapse_spaces("  a   b  c "), "a b c", "压缩空白")
+Test.eq(Text.snake_case("HTTPServerConfig"), "h_t_t_p_server_config", "蛇形命名")
+Test.eq(Text.kebab_case("helloWorld"), "hello-world", "短横命名")
+Test.eq(Text.capitalize_words("hello   world"), "Hello World", "词首字母大写")
+Test.eq(Text.reverse("stressed"), "desserts", "反转")
+
+-- ---------------------------------------------------------------- 编辑距离与对齐
+Test.eq(Text.levenshtein("", "abc"), 3, "空串到 abc")
+Test.eq(Text.levenshtein("abc", "abc"), 0, "相同字符串")
+Test.eq(Text.levenshtein("sunday", "saturday"), 3, "sunday / saturday")
+Test.eq(Text.lcs_length("ABCBDAB", "BDCABA"), 4, "最长公共子序列")
+Test.eq(Text.lcs("ABCBDAB", "BDCABA"), "BCBA", "恢复公共子序列")
+Test.eq(Text.similarity("kitten", "kitten"), 1.0, "相似度 1.0")
+
+-- 用相似度给候选词排序（拼写建议）
+suggest(query, candidates)(
+    new scored = []
+    for c in candidates(
+        scored.push((c, Text.similarity(query, c)))
+    )
+    scored = Seq.merge_sort(scored, (p, q)( =p[1] > q[1] ))
+    new out = []
+    for p in scored(
+        out.push(p[0])
+    )
+    =out
+)
+-- 注意：裸莱文斯坦距离把换位算成 2 步，所以 relieve（1 次替换）比 receive（换位）更近
+Test.eq(suggest("recieve", ["receive", "relieve", "deceiver", "recipe"])[0], "relieve", "拼写建议第一名")
+
+-- ---------------------------------------------------------------- 编码与格式
+Test.eq(Text.hex_dump("A"), "41", "十六进制转储")
+Test.eq(Text.base64_encode("Man"), "TWFu", "Base64 无填充")
+Test.eq(Text.base64_encode("Ma"), "TWE=", "Base64 一个填充")
+Test.eq(Text.caesar("hello", 13), "uryyb", "凯撒 13 = rot13")
+Test.eq(Text.rot13("uryyb"), "hello", "rot13 往返")
+
+new row = Text.csv_parse("name,\"a, b\",42")
+Test.eq(len(row), 3, "CSV 字段数")
+Test.eq(row[1], "a, b", "引号内的逗号")
+Test.eq(Text.csv_format(["ann", "a, b"]), "ann,\"a, b\"", "CSV 生成转义")
+
+-- ---------------------------------------------------------------- 统计与切分
+new freq = Text.char_freq("mississippi")
+Test.eq(freq.count("s"), 4, "字符频次")
+Test.eq(freq.most_common(1), [("i", 4)], "最高频字符")
+
+new words = Text.words("to be or not to be that is the question")
+Test.eq(len(words), 10, "切词数量")
+Test.eq(Text.word_freq("to be or not to be to").most_common(1), [("to", 3)], "词频最高")
+Test.eq(Text.ngrams("hello", 3), ["hel", "ell", "llo"], "三元组")
+Test.eq(Text.wrap("one two three four five six", 13), ["one two three", "four five six"], "折行")
+Test.eq(len(Text.csv_parse(Text.csv_format(["x", "y", "z"]))), 3, "CSV 往返")
+
+-- ---------------------------------------------------------------- 经典判断
+Test.eq(Text.is_palindrome("A man, a plan, a canal: Panama"), true, "回文（忽略非字母）")
+Test.eq(Text.is_palindrome("hello"), false, "非回文")
+Test.eq(Text.is_anagram("the eyes", "they see"), true, "变位词（忽略空格）")
+Test.eq(Text.longest_common_prefix(["prefix", "preform", "prelude"]), "pre", "最长公共前缀")
+
+-- ---------------------------------------------------------------- 用哈希表做一次词频统计
+new counts = Dict()
+for w in Text.words("the cat sat on the mat the cat ran")(
+    counts.set(w, counts.get(w, 0) + 1)
+)
+Test.eq(counts.get("the"), 3, "the 出现 3 次")
+Test.eq(counts.keys_sorted(), ["cat", "mat", "on", "ran", "sat", "the"], "词表有序")
+
+Test.check()

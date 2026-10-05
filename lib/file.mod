@@ -40,7 +40,7 @@ Result()=(
     )
 )
 
-Text()=(
+FileText()=(
     -- 读写文本时反复要用到的处理
     [[static]]
     to_lines(text)(
@@ -68,7 +68,7 @@ Text()=(
     [[static]]
     count_lines(text)(
         if text == ""( =0 )
-        =len(Text.to_lines(text))
+        =len(FileText.to_lines(text))
     )
 )
 
@@ -171,10 +171,10 @@ File()=(
     try_bytes(path) = File.attempt(()( =_file_read_bytes(path) ))
 
     [[static]]
-    lines(path) = Text.to_lines(File.read(path))
+    lines(path) = FileText.to_lines(File.read(path))
 
     [[static]]
-    try_lines(path) = File.attempt(()( =Text.to_lines(File.read(path)) ))
+    try_lines(path) = File.attempt(()( =FileText.to_lines(File.read(path)) ))
 
     [[static]]
     line(path, n)(
@@ -225,7 +225,7 @@ File()=(
     append_line(path, text) = _file_append(path, text + "\n")
 
     [[static]]
-    write_lines(path, lines) = File.write(path, Text.from_lines(lines))
+    write_lines(path, lines) = File.write(path, FileText.from_lines(lines))
 
     [[static]]
     write_json(path, value) = File.write(path, json.stringify(value))

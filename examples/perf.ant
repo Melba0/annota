@@ -1,0 +1,300 @@
+-[ perf.ant : 性能基准。自己计时（_sys_clock 单调毫秒），打印表格， ]
+-[ 并对每个工作负载的结果做正确性断言——不写死时间阈值，避免在慢机器上误报。 ]-
+
+use test
+use time
+use text
+use seq
+use dict
+use numeric
+use matrix
+use graph
+
+Bench()=(
+    rows:List = []
+
+    run(name, n, f)(
+        new t0 = _sys_clock()
+        f()
+        new t1 = _sys_clock()
+        new ms = t1 - t0
+        if ms < 0( ms = 0 )
+        new nsPerOp = 0.0
+        if n > 0( nsPerOp = float(ms) * 1000000.0 / float(n) )
+        rows.push((name, n, ms, nsPerOp))
+        =ms
+    )
+
+    report()(
+        print Text.pad_right("工作负载", 26) + Text.pad_left("次数", 10) +
+              Text.pad_left("总耗时 ms", 12) + Text.pad_left("每次 ns", 12)
+        print Text.repeat("-", 60)
+        for r in rows(
+            print Text.pad_right(r[0], 26) + Text.pad_left(str(r[1]), 10) +
+                  Text.pad_left(str(r[2]), 12) + Text.pad_left(Text.pad_right(str(int(r[3])), 1), 12)
+        )
+        =len(rows)
+    )
+
+    total_ms()(
+        new total = 0
+        for r in rows(
+            total = total + r[2]
+        )
+        =total
+    )
+)
+
+-- ================================================================ 工作负载
+-- ① 解释器主循环：变量自增
+count_up(n)(
+    new i = 0
+    new acc = 0
+    while i < n(
+        acc = acc + i
+        i = i + 1
+    )
+    =acc
+)
+
+-- ② [[jit]] 标记：加载期把循环体融合成超指令
+[[jit]]
+count_up_jit(n)(
+    new i = 0
+    new acc = 0
+    while i < n(
+        acc = acc + i
+        i = i + 1
+    )
+    =acc
+)
+
+-- ③ 函数调用开销
+add_one(x) = x + 1
+
+call_loop(n)(
+    new acc = 0
+    for i in 0 to n - 1(
+        acc = add_one(acc)
+    )
+    =acc
+)
+
+-- ④ 定长数组 vs 动态列表
+array_fill(n)(
+    new a:int[n]
+    for i in 0 to n - 1(
+        a[i] = i * 2
+    )
+    new sum_ = 0
+    for i in 0 to n - 1(
+        sum_ = sum_ + a[i]
+    )
+    =sum_
+)
+
+list_fill(n)(
+    new xs = []
+    for i in 0 to n - 1(
+        xs.push(i * 2)
+    )
+    new sum_ = 0
+    for x in xs(
+        sum_ = sum_ + x
+    )
+    =sum_
+)
+
+-- ⑤ 排序算法对比（归并 / 堆 / 原生）
+make_data(n)(
+    new xs = []
+    new rng = 7
+    [[ignore: overflow]]      -- 线性同余发生器就是要让 32 位整数回绕
+    for i in 0 to n - 1(
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        xs.push(rng % 100000)
+    )
+    =xs
+)
+
+-- ⑥ 查找：有序二分 vs 哈希表 vs 线性扫描
+build_sorted(n)( =Seq.sort(make_data(n)) )
+
+-- ⑦ 选择：快速选择中位数 vs 先排序再取中位
+median_quickselect(xs)( =Seq.median(xs) )
+median_by_sort(xs)(
+    new s = Seq.sort(xs)
+    =Seq.median_sorted(s)
+)
+
+-- ⑧ 数论：筛法 vs 逐个试除
+prime_count_sieve(limit)( =len(Num.sieve(limit)) )
+prime_count_trial(limit)(
+    new c = 0
+    for i in 2 to limit(
+        if Num.is_prime(i)( c = c + 1 )
+    )
+    =c
+)
+
+-- ⑨ 文本：KMP 搜索
+haystack(n)(
+    new s = ""
+    for i in 0 to n - 1(
+        s = s + chr(97 + i % 26)
+    )
+    =s
+)
+
+kmp_all(s, pat)( =len(Text.find_all(s, pat)) )
+
+-- ⑩ 编辑距离（100x100 的 DP）
+lev_all(a, b, times)(
+    new last = 0
+    for i in 0 to times - 1(
+        last = Text.levenshtein(a, b)
+    )
+    =last
+)
+
+-- ⑪ 矩阵乘法（40x40）
+mat_mul(n, times)(
+    new m = Matrix.identity(n)
+    new k = Matrix.identity(n)
+    for t in 0 to times - 1(
+        m = m.mul(k)
+    )
+    =m.trace()
+)
+
+-- ⑫ 图：网格上的 Dijkstra
+grid_graph(side)(
+    new g = Graph(true)
+    for r in 0 to side - 1(
+        for c in 0 to side - 1(
+            new name = str(r) + "," + str(c)
+            g.add_vertex(name)
+            if r + 1 < side(
+                g.add_edge(name, str(r + 1) + "," + str(c), 1 + (r * 7 + c) % 5)
+            )
+            if c + 1 < side(
+                g.add_edge(name, str(r) + "," + str(c + 1), 1 + (r * 3 + c) % 5)
+            )
+        )
+    )
+    =g
+)
+
+dijkstra_once(g)( =g.distances("0,0").size() )
+
+-- ================================================================ 跑起来
+Test.suite("perf")
+new bench = Bench()
+print "== Annota 性能基准 =="
+print "解释器版本：" + str(_sys_clock() >= 0)
+
+-- ① 主循环
+new loop_n = 400000
+Test.eq(count_up(1000), 499500, "count_up 结果正确")
+bench.run("int 循环 (while)", loop_n, ()( count_up(loop_n) ))
+
+-- ② [[jit]]
+new jit_n = 400000
+Test.eq(count_up_jit(1000), 499500, "[[jit]] 函数结果一致")
+bench.run("int 循环 (无 [[jit]])", jit_n, ()( count_up(jit_n) ))
+bench.run("int 循环 ([[jit]])", jit_n, ()( count_up_jit(jit_n) ))
+
+-- ③ 调用
+new call_n = 40000
+Test.eq(call_loop(100), 100, "call_loop 结果正确")
+bench.run("函数调用", call_n, ()( call_loop(call_n) ))
+
+-- ④ 数组 vs 列表
+new mem_n = 60000
+Test.eq(array_fill(10), 90, "array_fill 结果正确")
+Test.eq(list_fill(10), 90, "list_fill 结果正确")
+bench.run("定长数组 int[n]", mem_n, ()( array_fill(mem_n) ))
+bench.run("动态列表 push", mem_n, ()( list_fill(mem_n) ))
+
+-- ⑤ 排序
+new sort_n = 2000
+new data = make_data(sort_n)
+new expected = Seq.sort(data)
+Test.eq(Seq.heap_sort(data), expected, "堆排序结果与归并排序一致")
+Test.eq(Seq.sort_native(data), expected, "原生排序结果一致")
+bench.run("归并排序", sort_n, ()( Seq.sort(data) ))
+bench.run("堆排序", sort_n, ()( Seq.heap_sort(data) ))
+bench.run("原生 sorted()", sort_n, ()( Seq.sort_native(data) ))
+
+-- ⑥ 查找
+new sorted_data = build_sorted(4000)
+new needle = sorted_data[1999]
+new dict_probe = Dict()
+for (i, v) in enumerate(sorted_data)(
+    dict_probe.set("k" + str(v), i)
+)
+new linear_probe = sorted_data
+Test.eq(Seq.bsearch(sorted_data, needle) >= 0, true, "二分能找到")
+Test.eq(dict_probe.has("k" + str(needle)), true, "哈希能找到")
+new search_n = 4000
+bench.run("二分查找 (4000 元素)", search_n, ()(
+    new acc = 0
+    for i in 0 to search_n - 1(
+        acc = acc + Seq.bsearch(sorted_data, sorted_data[i])
+    )
+) )
+bench.run("哈希查找 (4000 键)", search_n, ()(
+    new acc = 0
+    for i in 0 to search_n - 1(
+        if dict_probe.has("k" + str(sorted_data[i]))( acc = acc + 1 )
+    )
+) )
+
+-- ⑦ 快速选择
+new sel_n = 2000
+new sel_times = 6
+Test.eq(median_quickselect(data), median_by_sort(data), "快速选择中位数与排序一致")
+bench.run("中位数 (排序法)", sel_n * sel_times, ()(
+    for t in 0 to sel_times - 1( median_by_sort(data) )
+) )
+bench.run("中位数 (快速选择)", sel_n * sel_times, ()(
+    for t in 0 to sel_times - 1( median_quickselect(data) )
+) )
+
+-- ⑧ 数论
+new limit = 30000
+Test.eq(prime_count_sieve(1000), 168, "筛法素数个数")
+Test.eq(prime_count_trial(1000), 168, "试除素数个数一致")
+bench.run("筛法求素数", limit, ()( prime_count_sieve(limit) ))
+bench.run("试除求素数", limit, ()( prime_count_trial(limit) ))
+
+-- ⑨ 文本
+new hay = haystack(2000)
+Test.eq(kmp_all("abababa", "aba"), 3, "KMP 结果正确")
+bench.run("KMP 搜索 (2000 字符)", 200, ()( kmp_all(hay, "abcabc") ))
+
+-- ⑩ 编辑距离
+new word_a = haystack(80)
+new word_b = haystack(80)
+Test.eq(lev_all("kitten", "sitting", 1), 3, "编辑距离正确")
+bench.run("编辑距离 (80x80)", 80 * 80, ()( lev_all(word_a, word_b, 40) ))
+
+-- ⑪ 矩阵
+new mat_n = 30
+new mat_times = 3
+Test.eq(mat_mul(4, 1), 4, "矩阵幂保持迹")
+bench.run("矩阵乘 (30x30)", mat_n * mat_n * mat_n * mat_times, ()(
+    mat_mul(mat_n, mat_times)
+) )
+
+-- ⑫ 图
+new side = 14
+new grid = grid_graph(side)
+Test.eq(dijkstra_once(grid), side * side, "Dijkstra 覆盖所有顶点")
+bench.run("Dijkstra (14x14 网格)", side * side, ()( dijkstra_once(grid) ))
+
+print ""
+bench.report()
+print Text.repeat("-", 60)
+print "基准总耗时: " + Time.describe_ms(bench.total_ms())
+Test.check()

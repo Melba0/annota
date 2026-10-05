@@ -1,6 +1,12 @@
 // Annota - ide_cmd.cpp : `analyze`, `analyze-suite` and the `ide` query commands.
 #include "commands.hpp"
+#include "vm.hpp"
+#include "parser.hpp"
+#include "lexer.hpp"
+#include "compiler.hpp"
+#include "builtins.hpp"
 #include "analyzer.hpp"
+#include <chrono>
 #include "sys_api.hpp"
 #include "json.hpp"
 #include "common.hpp"
@@ -316,6 +322,68 @@ int cmdBench(int argc, char** argv) {
         if (!ok) failed++;
         std::printf("%s: %6lld ms  (budget %5lld ms)  %s   diagnostics=%d\n", budgets[level - 1].name,
                     best, budgets[level - 1].budget, ok ? "PASS" : "FAIL", (int)res.diagnostics.size());
+    }
+
+    // ---- VM throughput: the number to watch when the interpreter gets faster.  Each case is a
+    // self contained script; `ops` is the count of inner iterations so the result is comparable
+    // across machines.
+    struct VmCase {
+        const char* name;
+        long long ops;
+        const char* src;
+    };
+    static const VmCase vmCases[] = {
+        {"int loop      ", 1000000,
+         "new n = 1000000\nnew s = 0\nnew i = 0\nwhile i < n( s = s + i * 2 - 1, i = i + 1 )\nprint s\n"},
+        {"call loop     ", 300000,
+         "add(a, b) = a + b\nnew n = 300000\nnew s = 0\nnew i = 0\nwhile i < n( s = add(s, i), i = i + 1 )\nprint s\n"},
+        {"list loop     ", 200000,
+         "new xs = []\nnew i = 0\nwhile i < 100(\n    xs.push(i)\n    i = i + 1\n)\nnew n = 2000\nnew t = 0\nnew k = 0\nwhile k < n(\n    for x in xs( t = t + x )\n    k = k + 1\n)\nprint t\n"},
+        {"jit off loop  ", 1000000,
+         "sum_to(n)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
+        {"jit on loop   ", 1000000,
+         "[[jit]]\nsum_to(n)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
+        {"float loop    ", 500000,
+         "new n = 500000\nnew f = 0.5\nnew i = 0\nwhile i < n( f = f * 1.000001 + 0.25, i = i + 1 )\nprint f\n"},
+    };
+    for (auto& c : vmCases) {
+        long long bestNs = -1;
+        bool okRun = true;
+        for (int r = 0; r < std::max(1, repeat); r++) {
+            auto t0 = std::chrono::steady_clock::now();
+            try {
+                VM vm;
+                registerBuiltins(vm);
+                vm.capture = true;
+                MacroRegistry registry;
+                std::vector<Token> toks = lex(c.src, "<bench>");
+                Parser parser(std::move(toks), "<bench>", nullptr, &registry);
+                Program prog = parser.parse();
+                Compiler comp(prog, "<bench>", false);
+                CompileResult cr = comp.compile();
+                vm.mainChunk = cr.main;
+                vm.run();
+            } catch (CompileError& e) {
+                std::printf("  %s FAILED to compile: %s\n", c.name, e.message.c_str());
+                okRun = false;
+                break;
+            } catch (VMError& e) {
+                std::printf("  %s FAILED at run time: %s\n", c.name, e.message.c_str());
+                okRun = false;
+                break;
+            } catch (std::exception& e) {
+                std::printf("  %s FAILED: %s\n", c.name, e.what());
+                okRun = false;
+                break;
+            }
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+            if (bestNs < 0 || ns < bestNs) bestNs = ns;
+        }
+        if (!okRun) { failed++; continue; }
+        double perOp = (double)bestNs / (double)c.ops;
+        std::printf("vm %s: %6.1f ms  %7.1f ns/iter  %6.1f Mops/s\n", c.name,
+                    (double)bestNs / 1e6, perOp, perOp > 0 ? 1000.0 / perOp : 0.0);
     }
     return failed ? 1 : 0;
 }

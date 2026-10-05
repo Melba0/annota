@@ -1,7 +1,9 @@
 // Annota - analyzer.cpp : annotation registry, layer 1 checks, driver, IDE queries, reporting.
+#include "value.hpp"
 #include "analyzer.hpp"
 #include "analysis_internal.hpp"
 #include "parser.hpp"
+#include "module_loader.hpp"
 #include "lexer.hpp"
 #include "common.hpp"
 #include <algorithm>
@@ -106,6 +108,8 @@ const std::vector<AnnotationSpec>& annotationRegistry() {
         mk("pure", "安全与信任", "无副作用", "禁止写全局、写字段、调用非纯函数。",
            0, 0, {"func", "any"}),
         mk("noreturn", "安全与信任", "函数不会正常返回", "通常内部 throw 或无限循环；与 ensure: result... 冲突。",
+           0, 0, {"func", "any"}),
+        mk("jit", "性能", "加载期优化这个函数", "编译时对该函数做常量折叠与超指令融合（后续的机器码后端挂在同一个标记下）。",
            0, 0, {"func", "any"}),
         // ---- 契约
         mk("require", "契约", "前置条件", "函数入口假定成立；在每个调用点检查实参是否满足。",
@@ -380,41 +384,6 @@ struct Layer1 {
 
 // ---------------------------------------------------------------- driver
 namespace {
-struct FileLoader : ModuleLoader {
-    std::string baseDir;
-    std::vector<std::string> dirs;
-    explicit FileLoader(std::string dir) : baseDir(std::move(dir)) {
-        dirs = {baseDir, baseDir + "/lib", "lib", "."};
-    }
-    static bool exists(const std::string& p) {
-        std::FILE* f = std::fopen(p.c_str(), "rb");
-        if (!f) return false;
-        std::fclose(f);
-        return true;
-    }
-    bool loadModule(const std::string& spec, std::vector<Token>& toks, std::string& file) override {
-        std::vector<std::string> cands;
-        bool pathLike = spec.find('/') != std::string::npos || spec.find('\\') != std::string::npos ||
-                        spec.find(".mod") != std::string::npos;
-        if (pathLike) {
-            cands.push_back(spec);
-            for (auto& d : dirs) cands.push_back(d + "/" + spec);
-        } else {
-            for (auto& d : dirs) cands.push_back(d + "/" + spec + ".mod");
-            cands.push_back(spec + ".mod");
-        }
-        for (auto& c : cands) {
-            if (!exists(c)) continue;
-            std::ifstream in(c, std::ios::binary);
-            std::stringstream ss;
-            ss << in.rdbuf();
-            file = c;
-            toks = lex(ss.str(), c);
-            return true;
-        }
-        return false;
-    }
-};
 } // namespace
 
 static std::string dirOfPath(const std::string& path) {
@@ -440,7 +409,7 @@ AnalysisResult analyzeSource(const std::string& source, const std::string& file,
         res.elapsedMs = (clock() - t0) * 1000LL / CLOCKS_PER_SEC;
         return res;
     }
-    FileLoader loader(dirOfPath(file));
+    FileModuleLoader loader(dirOfPath(file));
     MacroRegistry registry;
     Program program;
     try {
@@ -821,6 +790,20 @@ HoverInfo hoverAt(const std::string& source, const std::string& file, int line, 
             return h;
         }
     }
+    if (const BuiltinTypeSpec* bt = findBuiltinType(name)) {
+        h.kind = "type";
+        h.name = name;
+        h.title = std::string(bt->name) + "  (内置类型)";
+        h.body = std::string(bt->summary);
+        std::string conv = std::string(bt->name) + "(x)";
+        h.body += "\n转换/构造: " + conv + "，声明: new x:" + bt->name + " = ...";
+        if (bt->kind != NumKind::None) {
+            NumTraits tr = numTraits(bt->kind);
+            h.body += "\n宽度: " + formatInt(tr.bits) + " 位，" + (tr.isSigned ? "有符号" : "无符号");
+        }
+        h.valid = true;
+        return h;
+    }
     h.kind = "token";
     h.name = name;
     h.title = name;
@@ -906,7 +889,7 @@ Location definitionAt(const std::string& source, const std::string& file, int li
         }
     };
     Finder finder{name, file, loc};
-    FileLoader loader(dirOfPath(file));
+    FileModuleLoader loader(dirOfPath(file));
     MacroRegistry registry;
     try {
         std::vector<Token> toks = lex(source, file);
@@ -988,8 +971,17 @@ std::vector<CompletionItem> completionsFor(const std::string& prefix, bool after
         }
         return out;
     }
+    for (auto& t : builtinTypes()) {
+        if (!prefix.empty() && std::string(t.name).compare(0, prefix.size(), prefix) != 0) continue;
+        CompletionItem c;
+        c.label = t.name;
+        c.kind = "type";
+        c.detail = t.summary;
+        c.insertText = t.name;
+        out.push_back(c);
+    }
     static const std::vector<std::pair<std::string, std::string>> kw = {
-        {"new", "声明变量"}, {"del", "删除变量"}, {"const", "常量"}, {"if", "条件"},
+        {"new", "声明变量"}, {"del", "删除变量"}, {"const", "常量"}, {"if", "条件"}, {"elif", "否则如果"},
         {"else", "否则"}, {"for", "循环"}, {"while", "当循环"}, {"in", "成员/遍历"},
         {"to", "区间"}, {"step", "步长"}, {"throw", "抛出"}, {"except", "捕获"},
         {"print", "输出"}, {"input", "输入"}, {"use", "载入模块"}, {"macro", "宏"},

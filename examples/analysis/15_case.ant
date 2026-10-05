@@ -1,0 +1,60 @@
+﻿-[ expect: none ]-
+-[ 分类讨论：if/elif/else 三档 + 区间 CAS + 布尔重言 ]-
+
+grade(score)(
+    if score >= 90( = "A" )
+    elif score >= 60( = "B" )
+    elif score >= 30( = "C" )
+    else( = "D" )
+)
+print grade(95), grade(70), grade(40), grade(10)
+
+-- 无 else：两条路径的并集推出 i >= 1
+clamp(i)(
+    if i < 1(
+        i = 1
+    )
+    [[assert: i >= 1]]
+    =i
+)
+print clamp(0)
+
+-- 有 else：else 分支自己也知道 !(i < 1)
+both(i)(
+    if i < 1(
+        i = 1
+    ) else (
+        [[assert: i >= 1]]
+    )
+    [[assert: i >= 1]]
+    =i
+)
+print both(5)
+
+-- 线性区间：i < n 与 n <= 1000 一起给出 i + 1 <= n 且 i <= 999
+range_proof(n, i)(
+    [[assume: n >= 0 && n <= 1000 && i >= 0 && i <= 500 && i < n]]
+    [[assert: i + 1 <= n && i <= n - 1 && 2 * i < 2 * n && i - n < 0 && i <= 999]]
+    =i
+)
+print range_proof(10, 3)
+
+-- 布尔重言式与矛盾
+bool_proof(k, n)(
+    [[assert: (k < n) || !(k < n)]]
+    [[assert: !((k < n) && !(k < n))]]
+    [[assert: k + 1 > k]]
+    =k
+)
+print bool_proof(1, 5)
+
+-- 循环退出时条件为假，这就是后续事实
+after_loop(n)(
+    new i = 0
+    while i < n(
+        i = i + 1
+    )
+    [[assert: i >= n]]
+    =i
+)
+print after_loop(3)

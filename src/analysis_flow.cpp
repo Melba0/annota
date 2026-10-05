@@ -1,4 +1,5 @@
 // Annota - analysis_flow.cpp : abstract domain, CFG, data-flow analysis and the checks.
+#include "value.hpp"
 #include "analyzer.hpp"
 #include "analysis_internal.hpp"
 #include <algorithm>
@@ -11,7 +12,122 @@
 #include <set>
 
 namespace annota {
+
+// ---------------------------------------------------------------- tiny CAS
+// Integer *linear* forms  sum(k_i * v_i) + c  are normalised exactly, which decides conditions
+// such as `i + 1 > i`, `2 * x == x + x`, `y - y == 0` or `n - 1 < n` symbolically instead of
+// giving up.  Equalities learned from `[[assume: x == ...]]` become substitutions, so
+// `assert(x * 2 == 10)` is provable once `x == 5` is known.
+struct Lin {
+    std::map<std::string, long long> t;
+    long long c = 0;
+    bool ok = true;
+};
+
+
+// -1 / 0 / 1 when the form is a constant, 2 when it still has terms
+static int linConstSign(const Lin& l) {
+    if (!l.ok) return 2;
+    if (!l.t.empty()) return 2;
+    return l.c < 0 ? -1 : (l.c > 0 ? 1 : 0);
+}
+
+static Lin linConst(long long v) { Lin l; l.c = v; return l; }
+static Lin linVar(const std::string& n) { Lin l; l.t[n] = 1; return l; }
+static Lin linAdd(const Lin& a, const Lin& b, long long sign) {
+    Lin r = a;
+    if (!b.ok) r.ok = false;
+    r.c += sign * b.c;
+    for (auto& kv : b.t) {
+        r.t[kv.first] += sign * kv.second;
+        if (r.t[kv.first] == 0) r.t.erase(kv.first);
+    }
+    return r;
+}
+static Lin linScale(const Lin& a, long long k) {
+    Lin r = a;
+    r.c *= k;
+    for (auto& kv : r.t) kv.second *= k;
+    for (auto it = r.t.begin(); it != r.t.end();) it = it->second == 0 ? r.t.erase(it) : std::next(it);
+    return r;
+}
+
+// ---------------------------------------------------------------- CAS context
+// Everything the symbolic layer may consult: equalities learned from conditions, linear lower and
+// upper bounds (so `i < n` really gives `i + 1 <= n`), and the numeric ranges the abstract domain
+// already knows about.
+struct CasCtx {
+    const std::map<std::string, Lin>* subst = nullptr;
+    const std::map<std::string, Lin>* lo = nullptr;
+    const std::map<std::string, Lin>* hi = nullptr;
+    std::function<bool(const std::string&, long long&, long long&)> range;
+};
+static bool linInterval(const Lin& l, const CasCtx& ctx, Lin& loOut, Lin& hiOut, int depth = 0) {
+    if (!l.ok || depth > 8) return false;
+    loOut = linConst(l.c);
+    hiOut = linConst(l.c);
+    for (auto& kv : l.t) {
+        const std::string& v = kv.first;
+        long long k = kv.second;
+        Lin vlo, vhi;
+        bool haveLo = false, haveHi = false;
+        if (ctx.lo) {
+            auto it = ctx.lo->find(v);
+            if (it != ctx.lo->end()) { vlo = it->second; haveLo = true; }
+        }
+        if (ctx.hi) {
+            auto it = ctx.hi->find(v);
+            if (it != ctx.hi->end()) { vhi = it->second; haveHi = true; }
+        }
+        if ((!haveLo || !haveHi) && ctx.range) {
+            long long rl = 0, rh = 0;
+            if (ctx.range(v, rl, rh)) {
+                if (!haveLo) { vlo = linConst(rl); haveLo = true; }
+                if (!haveHi) { vhi = linConst(rh); haveHi = true; }
+            }
+        }
+        // A missing endpoint is the variable itself: symbolic terms then cancel exactly when the
+        // same variable appears on both sides, which is what makes `i < n` prove `i + 1 <= n`
+        // and the loop exit prove `i >= n`, while anything else stays "unknown".
+        if (!haveLo) vlo = linVar(v);
+        if (!haveHi) vhi = linVar(v);
+        if ((haveLo && !vlo.t.empty() && vlo.t.count(v)) ||
+            (haveHi && !vhi.t.empty() && vhi.t.count(v)))
+            return false;                 // a bound mentioning the variable would recurse
+        if (k >= 0) {
+            loOut = linAdd(loOut, linScale(vlo, k), 1);
+            hiOut = linAdd(hiOut, linScale(vhi, k), 1);
+        } else {
+            loOut = linAdd(loOut, linScale(vhi, k), 1);
+            hiOut = linAdd(hiOut, linScale(vlo, k), 1);
+        }
+    }
+        // resolve whatever variables the bounds introduced (one round is enough for
+    // `i <= n - 1` combined with `n <= 1000`)
+    if (depth < 2) {
+        Lin l2, h2;
+        if (linInterval(loOut, ctx, l2, h2, depth + 1)) loOut = l2;
+        if (linInterval(hiOut, ctx, l2, h2, depth + 1)) hiOut = h2;
+    }
+    return true;
+}
+
+
+
 namespace detail {
+// numeric type families: declared widths and the boxed scalar names all count as numbers
+static bool isBoxedNumName(const std::string& t) {
+    return t == "longlong" || t == "ulonglong" || t == "longdouble";
+}
+static int numFamilyOf(const std::string& t) {
+    if (t == "int" || t == "long" || t == "int8" || t == "int16" || t == "int32" ||
+        t == "int64" || t == "longlong") return 1;
+    if (t == "uint" || t == "ulong" || t == "uint8" || t == "uint16" || t == "uint32" ||
+        t == "uint64" || t == "ulonglong") return 2;
+    if (t == "float" || t == "double" || t == "longdouble") return 3;
+    return 0;
+}
+
 namespace {
 
 // ================================================================ helpers
@@ -54,6 +170,7 @@ struct AbsVal {
     bool tainted = false;
     std::string taintSource;
     std::string type = "unknown";
+    std::string eltType;                  // element type of an Array value
     bool isIter = false;
     int declLine = 0;
     bool read = false;
@@ -427,6 +544,19 @@ private:
     StmtP mainHolder_;
 
     bool budgetExceeded();
+
+    // mutes the collector for the lifetime of a statement that came from a `use`d module
+    struct MuteGuard {
+        Collector& c;
+        bool on;
+        MuteGuard(Collector& cc, bool o) : c(cc), on(o) {
+            if (on) c.muteDepth++;
+        }
+        ~MuteGuard() {
+            if (on) c.muteDepth--;
+        }
+    };
+
     bool skip(const StmtP& s) const {
         return !opts_.includeModules && !s->origin.empty() && s->origin != file_;
     }
@@ -458,6 +588,39 @@ private:
     void analyzeFunc(FuncInfo* f);
     void checkReachability(FuncInfo* f);
     void checkDeadStores(FuncInfo* f);
+    std::map<std::string, Lin> subst_;   // CAS equalities
+    std::map<std::string, Lin> loBnd_, hiBnd_;   // CAS linear lower/upper bounds
+    // Fold the linear bounds that turn out to be constants back into the abstract ranges, so the
+    // overflow/index checks see them too (`[[assume: n <= 1000 && i < n]]` gives i <= 999).
+    void applyConstBounds(Env& env) {
+        for (auto& kv : loBnd_) {
+            auto hi = hiBnd_.find(kv.first);
+            if (hi == hiBnd_.end()) continue;
+            CasCtx c;
+            c.lo = &loBnd_;
+            c.hi = &hiBnd_;
+            c.range = [&](const std::string& n, long long& l, long long& h) {
+                AbsVal* v = env.find(n);
+                if (!v || !v->range.known) return false;
+                l = v->range.lo;
+                h = v->range.hi;
+                return true;
+            };
+            Lin lo, hiV, dummy;
+            if (!linInterval(kv.second, c, lo, dummy)) continue;
+            if (!linInterval(hi->second, c, dummy, hiV)) continue;
+            bool haveLo = lo.t.empty(), haveHi = hiV.t.empty();
+            if (!haveLo && !haveHi) continue;
+            AbsVal* v = env.find(kv.first);
+            if (!v) continue;
+            long long nlo = v->range.known ? v->range.lo : (long long)(-(1LL << 62));
+            long long nhi = v->range.known ? v->range.hi : (long long)(1LL << 62);
+            if (haveLo) nlo = std::max<long long>(nlo, lo.c);
+            if (haveHi) nhi = std::min<long long>(nhi, hiV.c);
+            if (nlo > nhi) continue;
+            v->range = rng(nlo, nhi);
+        }
+    }
     void macroChecks();
     void collectGlobals(const std::vector<StmtP>& stmts);
     void collectClassFields(const StmtP& cls);
@@ -496,280 +659,385 @@ void Flow::noteState(int line, Env& env) {
 }
 
 // ---------------------------------------------------------------- conditions
-int Flow::triCondOf(const ExprP& e, Env& env) {
-    if (!e) return -1;
-    if (e->kind == EK::Bool) return e->bval ? 1 : 0;
-    if (e->kind == EK::Int) return e->ival != 0 ? 1 : 0;
-    if (e->kind == EK::Null) return 0;
-    if (e->kind == EK::Unary && e->op == T::Not) {
-        int t = triCondOf(e->a, env);
-        return t < 0 ? -1 : 1 - t;
+
+// Compact source-like text of an expression, used to name branches and conditions in messages.
+static std::string exprText(const ExprP& e, int depth = 0) {
+    if (!e || depth > 8) return "...";
+    switch (e->kind) {
+        case EK::Int:    return e->wideLiteral ? e->sval : std::to_string(e->ival);
+        case EK::Float:  { std::string t = std::to_string(e->fval);
+                           while (t.size() > 1 && t.back() == '0') t.pop_back();
+                           if (!t.empty() && t.back() == '.') t.pop_back();
+                           return t; }
+        case EK::Bool:   return e->bval ? "true" : "false";
+        case EK::Null:   return "null";
+        case EK::Str:    return "\"" + e->sval + "\"";
+        case EK::Ident:  return e->name;
+        case EK::Unary:  return std::string(e->op == T::Not ? "!" : "-") + exprText(e->a, depth + 1);
+        case EK::Binary:
+        case EK::Logical:
+            return exprText(e->a, depth + 1) + " " + opNameOf(e->op) + " " +
+                   exprText(e->b, depth + 1);
+        case EK::Index:  return exprText(e->a, depth + 1) + "[" + exprText(e->b, depth + 1) + "]";
+        case EK::Field:  return exprText(e->a, depth + 1) + "." + e->name;
+        case EK::Call:   {
+            std::string t = exprText(e->a, depth + 1) + "(";
+            for (size_t i = 0; i < e->args.size(); i++) {
+                if (i) t += ", ";
+                t += exprText(e->args[i].value, depth + 1);
+            }
+            return t + ")";
+        }
+        default: return "...";
     }
-    if (e->kind == EK::Logical) {
-        int a = triCondOf(e->a, env);
-        int b = triCondOf(e->b, env);
+}
+
+// normalise to a linear form (exact, or ok == false)
+static Lin linOfExpr(const ExprP& e, const std::map<std::string, Lin>& subst, int depth = 0) {
+    Lin bad; bad.ok = false;
+    if (!e || depth > 24) return bad;
+    switch (e->kind) {
+        case EK::Int: return linConst(e->ival);
+        case EK::Ident: {
+            auto it = subst.find(e->name);
+            return it != subst.end() ? it->second : linVar(e->name);
+        }
+        case EK::Unary: {
+            Lin a = linOfExpr(e->a, subst, depth + 1);
+            if (!a.ok) return bad;
+            if (e->op == T::Minus) return linScale(a, -1);
+            if (e->op == T::Plus) return a;
+            return bad;
+        }
+        case EK::Binary: {
+            Lin a = linOfExpr(e->a, subst, depth + 1);
+            Lin b = linOfExpr(e->b, subst, depth + 1);
+            if (!a.ok || !b.ok) return bad;
+            switch (e->op) {
+                case T::Plus:  return linAdd(a, b, 1);
+                case T::Minus: return linAdd(a, b, -1);
+                case T::Star:
+                    if (a.t.empty()) return linScale(b, a.c);
+                    if (b.t.empty()) return linScale(a, b.c);
+                    return bad;
+                case T::Slash: {
+                    if (!b.t.empty() || b.c == 0) return bad;
+                    long long k = b.c;
+                    Lin r = a;
+                    if (r.c % k != 0) return bad;
+                    r.c /= k;
+                    for (auto& kv : r.t) {
+                        if (kv.second % k != 0) return bad;
+                        kv.second /= k;
+                    }
+                    for (auto it = r.t.begin(); it != r.t.end();)
+                        it = it->second == 0 ? r.t.erase(it) : std::next(it);
+                    return r;
+                }
+                default: return bad;
+            }
+        }
+        default: return bad;
+    }
+}
+
+
+// interval [loOut, hiOut] of a linear form; false when some variable is unbounded
+
+// canonical keys of a comparison, used to recognise `A || !A` and `A && !A`.
+// Every form is turned into a predicate on the *same* polynomial (rhs - lhs), so `k < n` and
+// `!(k < n)` end up with one identical polynomial key and complementary codes.
+static std::string linKey(const Lin& l) {
+    if (!l.ok) return "?";
+    std::string s = "@" + std::to_string(l.c);
+    for (auto& kv : l.t) s += "|" + kv.first + "*" + std::to_string(kv.second);
+    return s;
+}
+static std::string complementCode(const std::string& c) {
+    if (c == "gt0") return "le0";
+    if (c == "le0") return "gt0";
+    if (c == "lt0") return "ge0";
+    if (c == "ge0") return "lt0";
+    if (c == "eq0") return "ne0";
+    if (c == "ne0") return "eq0";
+    return "";
+}
+static bool cmpCanon(const ExprP& e, std::string& code, std::string& poly) {
+    if (!e) return false;
+    if (e->kind == EK::Unary && e->op == T::Not) {
+        std::string c2, p2;
+        if (!cmpCanon(e->a, c2, p2)) return false;
+        code = complementCode(c2);
+        poly = p2;
+        return !code.empty();
+    }
+    if (e->kind != EK::Binary) return false;
+    T op = e->op;
+    if (op != T::Lt && op != T::Le && op != T::Gt && op != T::Ge && op != T::Eq && op != T::Ne)
+        return false;
+    Lin a = linOfExpr(e->a, std::map<std::string, Lin>{});
+    Lin b = linOfExpr(e->b, std::map<std::string, Lin>{});
+    Lin d = linAdd(b, a, -1);                 // rhs - lhs
+    if (!d.ok) return false;
+    switch (op) {
+        case T::Lt: code = "gt0"; break;
+        case T::Le: code = "ge0"; break;
+        case T::Gt: code = "lt0"; break;
+        case T::Ge: code = "le0"; break;
+        case T::Eq: code = "eq0"; break;
+        default:    code = "ne0"; break;
+    }
+    poly = linKey(d);
+    return true;
+}
+static T negatedOp(T op) {
+    switch (op) {
+        case T::Lt: return T::Ge;
+        case T::Le: return T::Gt;
+        case T::Gt: return T::Le;
+        case T::Ge: return T::Lt;
+        case T::Eq: return T::Ne;
+        case T::Ne: return T::Eq;
+        default: return op;
+    }
+}
+
+static int casCompareIntervals(const ExprP& e, const CasCtx& ctx, const Lin& a,
+                               const Lin& b, int depth);
+
+static int casTriCtx(const ExprP& e, const CasCtx& ctx, int depth = 0) {
+    if (!e || depth > 16) return -1;
+    if (e->kind == EK::Logical && (e->op == T::AndAnd || e->op == T::OrOr)) {
+        int a = casTriCtx(e->a, ctx, depth + 1), b = casTriCtx(e->b, ctx, depth + 1);
+        // A && !A  /  A || !A  (boolean tautology and contradiction)
+        std::string ca, pa, cb, pb;
+        if (cmpCanon(e->a, ca, pa) && cmpCanon(e->b, cb, pb) && pa == pb &&
+            !ca.empty() && !cb.empty() && complementCode(ca) == cb) {
+            if (e->op == T::OrOr) return 1;
+            if (e->op == T::AndAnd) return 0;
+        }
         if (e->op == T::AndAnd) {
             if (a == 0 || b == 0) return 0;
-            if (a == 1 && b == 1) return 1;
-            return -1;
+            return (a == 1 && b == 1) ? 1 : -1;
         }
         if (a == 1 || b == 1) return 1;
-        if (a == 0 && b == 0) return 0;
-        return -1;
+        return (a == 0 && b == 0) ? 0 : -1;
     }
-    if (e->kind == EK::Binary) {
+    if (e->kind == EK::Unary && e->op == T::Not) {
+        int a = casTriCtx(e->a, ctx, depth + 1);
+        return a < 0 ? -1 : 1 - a;
+    }
+    if (e->kind != EK::Binary) return -1;
+    bool cmp = e->op == T::Eq || e->op == T::Ne || e->op == T::Lt || e->op == T::Gt ||
+               e->op == T::Le || e->op == T::Ge;
+    if (!cmp) return -1;
+    Lin a = linOfExpr(e->a, ctx.subst ? *ctx.subst : std::map<std::string, Lin>{}, depth + 1);
+    Lin b = linOfExpr(e->b, ctx.subst ? *ctx.subst : std::map<std::string, Lin>{}, depth + 1);
+    if (!a.ok || !b.ok) return -1;
+    Lin d = linAdd(a, b, -1);
+    int sign = linConstSign(d);
+    if (sign != 2) {                                  // decided without any interval work
         switch (e->op) {
-            case T::Eq: case T::Ne: case T::Lt: case T::Gt: case T::Le: case T::Ge: {
-                // null comparisons first
-                const ExprP& L = e->a;
-                const ExprP& R = e->b;
-                if ((L && L->kind == EK::Null) || (R && R->kind == EK::Null)) {
-                    const ExprP& other = (L && L->kind == EK::Null) ? R : L;
-                    AbsVal ov = eval(other, env);
-                    if (ov.nullState == AbsVal::NullUnknown) return -1;
-                    bool isNull = ov.nullState == AbsVal::IsNull;
-                    if (ov.nullState == AbsVal::MaybeNull) return -1;
-                    bool eq = (e->op == T::Eq);
-                    return (eq == isNull) ? 1 : 0;
-                }
-                AbsVal a = eval(L, env);
-                AbsVal b = eval(R, env);
-                bool aNullish = a.type == "null" || (a.nullState == AbsVal::IsNull);
-                bool bNullish = b.type == "null" || (b.nullState == AbsVal::IsNull);
-                bool numA = a.type == "int" || a.type == "float" || a.type == "bool";
-                bool numB = b.type == "int" || b.type == "float" || b.type == "bool";
-                if (numA && numB) {
-                    if (e->op == T::Eq || e->op == T::Ne) {
-                        bool bothSingle = a.range.known && b.range.known && a.range.lo == a.range.hi && b.range.lo == b.range.hi;
-                        if (bothSingle) { bool eq = a.range.lo == b.range.lo; return (e->op == T::Eq) == eq ? 1 : 0; }
-                        if (a.range.known && b.range.known &&
-                            (a.range.hi < b.range.lo || b.range.hi < a.range.lo))
-                            return e->op == T::Ne ? 1 : 0;
-                        return -1;
-                    }
-                    if (!a.range.known || !b.range.known) return -1;
-                    switch (e->op) {
-                        case T::Lt: if (a.range.hi < b.range.lo) return 1; if (a.range.lo >= b.range.hi) return 0; return -1;
-                        case T::Gt: if (a.range.lo > b.range.hi) return 1; if (a.range.hi <= b.range.lo) return 0; return -1;
-                        case T::Le: if (a.range.hi <= b.range.lo) return 1; if (a.range.lo > b.range.hi) return 0; return -1;
-                        case T::Ge: if (a.range.lo >= b.range.hi) return 1; if (a.range.hi < b.range.lo) return 0; return -1;
-                        default: return -1;
-                    }
-                }
-                if (aNullish && bNullish && (e->op == T::Eq || e->op == T::Ne))
-                    return e->op == T::Eq ? 1 : 0;
-                return -1;
-            }
-            default: break;
+            case T::Eq: return sign == 0 ? 1 : 0;
+            case T::Ne: return sign != 0 ? 1 : 0;
+            case T::Lt: return sign < 0 ? 1 : 0;
+            case T::Gt: return sign > 0 ? 1 : 0;
+            case T::Le: return sign <= 0 ? 1 : 0;
+            case T::Ge: return sign >= 0 ? 1 : 0;
+            default: return -1;
         }
     }
-    if (e->kind == EK::Call && e->a && e->a->kind == EK::Ident) {
-        const std::string& fn = e->a->name;
-        if (fn == "is_null" && !e->args.empty()) {
-            AbsVal a = eval(e->args[0].value, env);
-            if (a.nullState == AbsVal::IsNull) return 1;
-            if (a.nullState == AbsVal::NonNull) return 0;
-            return -1;
-        }
-        if (fn == "len" && !e->args.empty()) {
-            AbsVal a = eval(e->args[0].value, env);
-            if (a.size.known) return a.size.hi > 0 ? (a.size.lo > 0 ? 1 : -1) : 0;
-            return -1;
-        }
+    // Interval reasoning in two passes: first with the symbolic bounds only (so identical
+    // variables cancel, giving `i + 1 <= n` from `i <= n - 1`), then with the numeric ranges
+    // mixed in (giving `i <= 999` once `n <= 1000` is known).
+    CasCtx sym = ctx;
+    sym.range = nullptr;                       // symbolic pass: identical variables cancel
+    int r = casCompareIntervals(e, sym, a, b, depth);
+    if (r >= 0) return r;
+    if (ctx.range) {                           // numeric pass: constant bounds from the ranges
+        r = casCompareIntervals(e, ctx, a, b, depth);
+        if (r >= 0) return r;
     }
-    AbsVal v = eval(e, env);
-    if (v.range.known) {
-        if (v.range.lo == 0 && v.range.hi == 0) return 0;
-        if (v.range.lo > 0 || v.range.hi < 0) return 1;
-    }
-    if (v.type == "null") return 0;
     return -1;
 }
 
-void Flow::narrowMap(std::map<std::string, AbsVal>& m, const ExprP& cond, bool truth) {
-    if (!cond) return;
-    if (cond->kind == EK::Unary && cond->op == T::Not) { narrowMap(m, cond->a, !truth); return; }
-    if (cond->kind == EK::Logical && cond->op == T::AndAnd) {
-        if (truth) { narrowMap(m, cond->a, true); narrowMap(m, cond->b, true); }
-        else return;
+// the interval half of casTriCtx: -1 unknown, 0 false, 1 true
+static int casCompareIntervals(const ExprP& e, const CasCtx& ctx, const Lin& a, const Lin& b,
+                               int depth) {
+    (void)depth;
+    Lin aLo, aHi, bLo, bHi;
+    if (!linInterval(a, ctx, aLo, aHi) || !linInterval(b, ctx, bLo, bHi)) return -1;
+    int loGap = linConstSign(linAdd(aHi, bLo, -1));    // aHi - bLo, 2 when still symbolic
+    int hiGap = linConstSign(linAdd(aLo, bHi, -1));    // aLo - bHi
+    auto neg = [](int g) { return g != 2 && g < 0; };  // gap < 0
+    auto zero = [](int g) { return g == 0; };
+    auto pos = [](int g) { return g != 2 && g > 0; };  // gap > 0
+    auto notPos = [](int g) { return g != 2 && g <= 0; };
+    auto notNeg = [](int g) { return g != 2 && g >= 0; };
+    switch (e->op) {
+        case T::Lt:
+            if (neg(loGap)) return 1;                  // aHi < bLo
+            if (notNeg(hiGap)) return 0;               // aLo >= bHi
+            return -1;
+        case T::Le:
+            if (notPos(loGap)) return 1;
+            if (pos(hiGap)) return 0;
+            return -1;
+        case T::Gt:
+            if (pos(hiGap)) return 1;
+            if (notPos(loGap)) return 0;
+            return -1;
+        case T::Ge:
+            if (notNeg(hiGap)) return 1;
+            if (neg(loGap)) return 0;
+            return -1;
+        case T::Eq:
+            if (zero(loGap) && zero(hiGap)) return 1;
+            if (neg(loGap) || pos(hiGap)) return 0;
+            return -1;
+        case T::Ne:
+            if (neg(loGap) || pos(hiGap)) return 1;
+            if (zero(loGap) && zero(hiGap)) return 0;
+            return -1;
+        default: return -1;
+    }
+}
+
+// Remember what a condition tells us.  `truth == false` learns the *negation*, which is what
+// case analysis needs: `if i < 1 ( ... )` gives `i >= 1` on the else path.
+static void learnFacts(const ExprP& e, bool truth,
+                       std::map<std::string, Lin>& subst,
+                       std::map<std::string, Lin>& loBnd,
+                       std::map<std::string, Lin>& hiBnd, int depth = 0) {
+    if (!e || depth > 12) return;
+    if (e->kind == EK::Unary && e->op == T::Not) {
+        learnFacts(e->a, !truth, subst, loBnd, hiBnd, depth + 1);
         return;
     }
-    if (cond->kind == EK::Logical && cond->op == T::OrOr) {
-        if (!truth) { narrowMap(m, cond->a, false); narrowMap(m, cond->b, false); }
+    if (e->kind == EK::Logical && (e->op == T::AndAnd || e->op == T::OrOr)) {
+        bool both = (e->op == T::AndAnd) == truth;      // De Morgan on the negated side
+        if (both) {
+            learnFacts(e->a, truth, subst, loBnd, hiBnd, depth + 1);
+            learnFacts(e->b, truth, subst, loBnd, hiBnd, depth + 1);
+        }
         return;
     }
-    if (cond->kind == EK::Call && cond->a && cond->a->kind == EK::Ident) {
-        const std::string& fn = cond->a->name;
-        if (fn == "is_null" && !cond->args.empty()) {
-            const ExprP& arg = cond->args[0].value;
-            if (arg && arg->kind == EK::Ident) {
-                auto it = m.find(arg->name);
-                if (it != m.end()) it->second.nullState = truth ? AbsVal::IsNull : AbsVal::NonNull;
-            }
+    if (e->kind != EK::Binary) return;
+    T op = e->op;
+    if (!truth) op = negatedOp(op);
+    const ExprP& lhs = e->a;
+    const ExprP& rhs = e->b;
+    if (!lhs || !rhs) return;
+    Lin r = linOfExpr(rhs, subst);
+    Lin l = linOfExpr(lhs, subst);
+    if (!r.ok || !l.ok) return;
+    auto setLo = [&](const std::string& v, const Lin& b) { loBnd[v] = b; };
+    auto setHi = [&](const std::string& v, const Lin& b) { hiBnd[v] = b; };
+    bool lhsVar = lhs->kind == EK::Ident && !subst.count(lhs->name);
+    bool rhsVar = rhs->kind == EK::Ident && !subst.count(rhs->name);
+    if (op == T::Eq && lhsVar) { subst[lhs->name] = r; return; }
+    if (op == T::Eq && rhsVar) { subst[rhs->name] = l; return; }
+    if (op == T::Ne) return;                        // no interval information
+    // integer comparison: `x < b` is `x <= b - 1`
+    auto minusOne = [](Lin v) { v.c -= 1; return v; };
+    auto plusOne = [](Lin v) { v.c += 1; return v; };
+    if (lhsVar && (op == T::Lt || op == T::Le || op == T::Gt || op == T::Ge)) {
+        const std::string& v = lhs->name;
+        if (op == T::Lt) setHi(v, minusOne(r));
+        else if (op == T::Le) setHi(v, r);
+        else if (op == T::Gt) setLo(v, plusOne(r));
+        else setLo(v, r);
+        return;
+    }
+    if (rhsVar && (op == T::Lt || op == T::Le || op == T::Gt || op == T::Ge)) {
+        const std::string& v = rhs->name;
+        if (op == T::Lt) setLo(v, plusOne(l));       // l < v  ==  v >= l + 1
+        else if (op == T::Le) setLo(v, l);
+        else if (op == T::Gt) setHi(v, minusOne(l));
+        else setHi(v, l);
+        return;
+    }
+}
+
+// ------------------------------------------------ restored definitions
+void Flow::assignTo(const ExprP& target, const AbsVal& v, Env& env, int line, bool declare,
+                    const std::string& declType) {
+    if (!target) return;
+    if (target->kind == EK::Ident) {
+        const std::string& name = target->name;
+        if (declare) {
+            AbsVal nv = v;
+            nv.declLine = line;
+            nv.assignLine = line;
+            nv.read = false;
+            nv.readSinceAssign = false;
+            // at the top level of <main> a `new` declares a global, not a local
+            nv.isLocal = !(cur_ && cur_->name == "<main>" && env.scopes.size() == 1);
+            if (!declType.empty()) nv.type = declType;
+            outOfScope_.erase(name);
+            env.declare(name, nv);
             return;
         }
-    }
-    if (cond->kind != EK::Binary) return;
-    const ExprP& L = cond->a;
-    const ExprP& R = cond->b;
-    if (!L || !R) return;
-    // len(x) <op> constant  ->  narrow x's size
-    {
-        auto isLenOf = [](const ExprP& e, const Expr*& arg) {
-            if (e && e->kind == EK::Call && e->a && e->a->kind == EK::Ident && e->a->name == "len" &&
-                e->args.size() == 1) {
-                arg = e->args[0].value.get();
-                return true;
+        AbsVal* found = env.find(name);
+        if (!found) {
+            if (globals_.count(name) || builtinNames_.count(name)) {
+                if (cur_ && cur_->pure)
+                    col_.error("purity", line, "[[pure]] 函数不得写全局变量 '" + name + "'",
+                               "纯函数不允许有副作用", "去掉 [[pure]]，或改为返回值");
+                globalsEnv_.vars[name] = v;      // keep the file level state up to date
+                return;
             }
-            return false;
-        };
-        const Expr* argA = nullptr;
-        const Expr* argB = nullptr;
-        long long c = 0;
-        T op = cond->op;
-        bool ok = false;
-        if (isLenOf(L, argA) && R->kind == EK::Int) { c = R->ival; ok = true; }
-        else if (isLenOf(R, argB) && L->kind == EK::Int) {
-            c = L->ival;
-            ok = true;
-            switch (op) {
-                case T::Lt: op = T::Gt; break;
-                case T::Gt: op = T::Lt; break;
-                case T::Le: op = T::Ge; break;
-                case T::Ge: op = T::Le; break;
-                default: break;
-            }
-        }
-        if (ok && argA && argA->kind == EK::Ident) {
-            auto it = m.find(argA->name);
-            if (it != m.end()) {
-                T eff = truth ? op : [&] {
-                    switch (op) {
-                        case T::Lt: return T::Ge;
-                        case T::Le: return T::Gt;
-                        case T::Gt: return T::Le;
-                        case T::Ge: return T::Lt;
-                        case T::Eq: return T::Ne;
-                        case T::Ne: return T::Eq;
-                        default: return op;
-                    }
-                }();
-                Range& s = it->second.size;
-                long long lo = s.known ? s.lo : 0;
-                long long hi = s.known ? s.hi : intHi_;      // lengths are ints
-                switch (eff) {
-                    case T::Lt: s = rng(lo, std::min(hi, c - 1)); break;
-                    case T::Le: s = rng(lo, std::min(hi, c)); break;
-                    case T::Gt: s = rng(std::max(lo, c + 1), hi); break;
-                    case T::Ge: s = rng(std::max(lo, c), hi); break;
-                    case T::Eq: s = rng(c, c); break;
-                    default: break;
-                }
-                s.lo = std::max(0LL, s.lo);
-            }
+            col_.error("uninitialized", line, "给未声明的变量 '" + name + "' 赋值",
+                       "文档要求先 new 再赋值", "改为 new " + name + " = ...");
             return;
         }
-    }
-    // null comparisons
-    if (L->kind == EK::Null || R->kind == EK::Null) {
-        const ExprP& other = (L->kind == EK::Null) ? R : L;
-        if (other->kind == EK::Ident) {
-            auto it = m.find(other->name);
-            if (it != m.end()) {
-                bool isEq = cond->op == T::Eq;
-                bool nullNow = truth ? isEq : !isEq;
-                it->second.nullState = nullNow ? AbsVal::IsNull : AbsVal::NonNull;
-            }
-        }
+        if (found->init == AbsVal::NotInit)
+            found->init = AbsVal::IsInit;
+        if (!declType.empty()) checkDeclaredType(declType, v, line, "赋值给 '" + name + "'");
+        *found = v;
+        found->assignLine = line;
+        found->readSinceAssign = false;
+        if (found->declLine == 0) found->declLine = line;
         return;
     }
-    // Ident <op> literal
-    auto litOf = [](const ExprP& e, long long& out) {
-        if (e && e->kind == EK::Int) { out = e->ival; return true; }
+    if (target->kind == EK::Field) {
+        AbsVal base = eval(target->a, env);
+        if (base.nullState == AbsVal::IsNull)
+            col_.error("null-dereference", line, "对 null 写成员 '" + target->name + "'", "", "先判空");
+        else if (base.nullState == AbsVal::MaybeNull)
+            col_.warn("null-dereference", line, "可能对 null 写成员 '" + target->name + "'", "", "先判空");
+        if (cur_ && cur_->pure)
+            col_.error("purity", line, "[[pure]] 函数不得修改字段 '" + target->name + "'",
+                       "纯函数不允许有副作用", "去掉 [[pure]]，或改为返回值");
+        return;
+    }
+    if (target->kind == EK::Index) {
+        AbsVal base = eval(target->a, env);
+        AbsVal idx = eval(target->b, env);
+        checkIndex(target->a, target->b, base, idx, line);
+        if (base.nullState == AbsVal::IsNull)
+            col_.error("null-dereference", line, "对 null 写下标", "", "先判空");
+    }
+}
+
+void Flow::checkDeclaredType(const std::string& declared, const AbsVal& v, int line, const std::string& what) {
+    if (declared.empty() || v.type == "unknown" || v.type == "null") return;
+    auto compatible = [&](const std::string& d, const std::string& a) {
+        if (d == a) return true;
+        if (d == "float" && a == "int") return true;
+        if (d == "String" && a == "String") return true;
+        if (d == "List" && (a == "List")) return true;
+        if (d == "Tuple" && a == "Tuple") return true;
+        if (d == "Bytes" && a == "Bytes") return true;
+        if (d == "Fn" || d == "Any") return true;
+        // a user class name accepts instances of the same class
         return false;
     };
-    const Expr* id = nullptr;
-    long long c = 0;
-    T op = cond->op;
-    if (L->kind == EK::Ident && litOf(R, c)) id = L.get();
-    else if (R->kind == EK::Ident && litOf(L, c)) {
-        id = R.get();
-        switch (op) {
-            case T::Lt: op = T::Gt; break;
-            case T::Gt: op = T::Lt; break;
-            case T::Le: op = T::Ge; break;
-            case T::Ge: op = T::Le; break;
-            default: break;
-        }
-    }
-    if (!id) return;
-    auto it = m.find(id->name);
-    if (it == m.end()) return;
-    AbsVal& v = it->second;
-    T eff = truth ? op : [&] {
-        switch (op) {
-            case T::Lt: return T::Ge;
-            case T::Le: return T::Gt;
-            case T::Gt: return T::Le;
-            case T::Ge: return T::Lt;
-            case T::Eq: return T::Ne;
-            case T::Ne: return T::Eq;
-            default: return op;
-        }
-    }();
-    long long lo = v.range.known ? v.range.lo : intLo_;
-    long long hi = v.range.known ? v.range.hi : intHi_;
-    switch (eff) {
-        case T::Lt: v.range = rng(lo, std::min(hi, c - 1)); break;
-        case T::Le: v.range = rng(lo, std::min(hi, c)); break;
-        case T::Gt: v.range = rng(std::max(lo, c + 1), hi); break;
-        case T::Ge: v.range = rng(std::max(lo, c), hi); break;
-        case T::Eq: v.range = rng(c, c); break;
-        case T::Ne:
-            if (!v.range.known) break;
-            if (v.range.lo == c && v.range.hi == c) v.range = Range();    // contradictory
-            else if (v.range.lo == c) v.range = rng(c + 1, v.range.hi);
-            else if (v.range.hi == c) v.range = rng(v.range.lo, c - 1);
-            break;
-        default: break;
-    }
-    // `int` is a bounded type, so a narrowed range never exceeds the target width
-    if (v.range.known && (v.type == "int" || v.type == "unknown" || v.type == "bool")) {
-        v.range.lo = std::max(v.range.lo, intLo_);
-        v.range.hi = std::min(v.range.hi, intHi_);
-    }
+    if (!compatible(declared, v.type))
+        col_.error("type-mismatch", line, what + " 类型不匹配",
+                   "声明为 " + declared + "，实际是 " + v.type, "改成匹配的类型或去掉类型标注");
 }
 
-void Flow::narrow(Env& env, const ExprP& cond, bool truth) {
-    if (!cond) return;
-    // build a flat map of the visible variables, narrow, then write back
-    std::map<std::string, AbsVal> flat;
-    for (auto& sc : env.scopes)
-        for (auto& kv : sc.vars) flat[kv.first] = kv.second;
-    narrowMap(flat, cond, truth);
-    for (auto& sc : env.scopes) {
-        for (auto& kv : sc.vars) {
-            auto it = flat.find(kv.first);
-            if (it != flat.end()) kv.second = it->second;
-        }
-    }
-}
-
-std::string Flow::describeCond(const ExprP& cond, Env& env) {
-    // print the free variables of the condition with their abstract values
-    std::set<std::string> names;
-    collectUse(cond, names);
-    std::string out;
-    for (auto& n : names) {
-        AbsVal* v = env.find(n);
-        if (!v) continue;
-        if (!out.empty()) out += "; ";
-        out += n + " ∈ " + (v->range.known ? rangeText(v->range) : std::string("unknown"));
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------- expressions
 void Flow::checkIndex(const ExprP& baseE, const ExprP& idxE, const AbsVal& base, const AbsVal& idx, int line) {
     // an index that is the loop variable of `for i in 0 to len(xs)` (or `0 to n` where the
     // container was allocated with n) is proven to be in range
@@ -798,14 +1066,29 @@ void Flow::checkIndex(const ExprP& baseE, const ExprP& idxE, const AbsVal& base,
     (void)slo;
 }
 
+std::string Flow::describeCond(const ExprP& cond, Env& env) {
+    // print the free variables of the condition with their abstract values
+    std::set<std::string> names;
+    collectUse(cond, names);
+    std::string out;
+    for (auto& n : names) {
+        AbsVal* v = env.find(n);
+        if (!v) continue;
+        if (!out.empty()) out += "; ";
+        out += n + " ∈ " + (v->range.known ? rangeText(v->range) : std::string("unknown"));
+    }
+    return out;
+}
+
 AbsVal Flow::eval(const ExprP& e, Env& env, bool iterablePosition) {
     AbsVal v;
     if (!e) return v;
     if (budgetExceeded()) return v;
     switch (e->kind) {
         case EK::Int:
-            v.type = "int";
-            v.range = rng(e->ival, e->ival);
+            // a literal that did not fit in 64 bits is a 128 bit value: no 32 bit range at all
+            v.type = e->wideLiteral ? "longlong" : "int";
+            if (!e->wideLiteral) v.range = rng(e->ival, e->ival);
             v.init = AbsVal::IsInit;
             v.nullState = AbsVal::NonNull;
             return v;
@@ -998,7 +1281,7 @@ AbsVal Flow::evalBinary(const ExprP& e, Env& env) {
     v.init = AbsVal::IsInit;
     int line = e->line;
     auto num = [](const AbsVal& x) {
-        return x.type == "int" || x.type == "float" || x.type == "bool" || x.type == "unknown";
+        return numFamilyOf(x.type) != 0 || x.type == "bool" || x.type == "unknown";
     };
     switch (e->op) {
         case T::Plus: case T::Minus: case T::Star: case T::Slash: case T::Percent: case T::StarStar: {
@@ -1065,7 +1348,8 @@ AbsVal Flow::evalBinary(const ExprP& e, Env& env) {
                 hi = std::max(std::max(c1, c2), std::max(c3, c4));
             }
             v.range = rng((long long)lo, (long long)hi);
-            if (lo < (W)intLo_ || hi > (W)intHi_) {
+            bool boxedOperand = isBoxedNumName(a.type) || isBoxedNumName(b.type);
+            if (!boxedOperand && (lo < (W)intLo_ || hi > (W)intHi_)) {
                 std::string detail = "左 " + rangeText(a.range) + " " + opNameOf(e->op) + " 右 " +
                                      rangeText(b.range) + " = " + rangeText(v.range) +
                                      "，int 范围 [" + formatInt(intLo_) + ", " + formatInt(intHi_) + "]";
@@ -1171,7 +1455,18 @@ AbsVal Flow::evalCall(const ExprP& e, Env& env) {
         return v;
     }
     std::string callee;
-    if (e->a && e->a->kind == EK::Ident) callee = e->a->name;
+    if (e->a && e->a->kind == EK::Ident) {
+        callee = e->a->name;
+        // `f(x)` where f is a parameter or a local (a lambda / function value) is a *read* of f:
+        // without this, every higher order function looked like it never used its callback
+        if (AbsVal* fn = env.find(callee)) {
+            if (fn->init == AbsVal::NotInit)
+                col_.error("uninitialized", e->line, "调用了未初始化的可调用值 '" + callee + "'",
+                           "声明时没有给出初始值", "先给它赋一个函数值");
+            fn->read = true;
+            fn->readSinceAssign = true;
+        }
+    }
     else { if (e->a) eval(e->a, env); return v; }
 
     auto isBuiltin = [&](const char* n) { return callee == n; };
@@ -1340,86 +1635,278 @@ AbsVal Flow::evalCall(const ExprP& e, Env& env) {
     return v;
 }
 
-// ---------------------------------------------------------------- assignments
-void Flow::checkDeclaredType(const std::string& declared, const AbsVal& v, int line, const std::string& what) {
-    if (declared.empty() || v.type == "unknown" || v.type == "null") return;
-    auto compatible = [&](const std::string& d, const std::string& a) {
-        if (d == a) return true;
-        if (d == "float" && a == "int") return true;
-        if (d == "String" && a == "String") return true;
-        if (d == "List" && (a == "List")) return true;
-        if (d == "Tuple" && a == "Tuple") return true;
-        if (d == "Bytes" && a == "Bytes") return true;
-        if (d == "Fn" || d == "Any") return true;
-        // a user class name accepts instances of the same class
+void Flow::narrow(Env& env, const ExprP& cond, bool truth) {
+    if (!cond) return;
+    // build a flat map of the visible variables, narrow, then write back
+    std::map<std::string, AbsVal> flat;
+    for (auto& sc : env.scopes)
+        for (auto& kv : sc.vars) flat[kv.first] = kv.second;
+    narrowMap(flat, cond, truth);
+    for (auto& sc : env.scopes) {
+        for (auto& kv : sc.vars) {
+            auto it = flat.find(kv.first);
+            if (it != flat.end()) kv.second = it->second;
+        }
+    }
+}
+
+void Flow::narrowMap(std::map<std::string, AbsVal>& m, const ExprP& cond, bool truth) {
+    if (!cond) return;
+    if (cond->kind == EK::Unary && cond->op == T::Not) { narrowMap(m, cond->a, !truth); return; }
+    if (cond->kind == EK::Logical && cond->op == T::AndAnd) {
+        if (truth) { narrowMap(m, cond->a, true); narrowMap(m, cond->b, true); }
+        else return;
+        return;
+    }
+    if (cond->kind == EK::Logical && cond->op == T::OrOr) {
+        if (!truth) { narrowMap(m, cond->a, false); narrowMap(m, cond->b, false); }
+        return;
+    }
+    if (cond->kind == EK::Call && cond->a && cond->a->kind == EK::Ident) {
+        const std::string& fn = cond->a->name;
+        if (fn == "is_null" && !cond->args.empty()) {
+            const ExprP& arg = cond->args[0].value;
+            if (arg && arg->kind == EK::Ident) {
+                auto it = m.find(arg->name);
+                if (it != m.end()) it->second.nullState = truth ? AbsVal::IsNull : AbsVal::NonNull;
+            }
+            return;
+        }
+    }
+    if (cond->kind != EK::Binary) return;
+    const ExprP& L = cond->a;
+    const ExprP& R = cond->b;
+    if (!L || !R) return;
+    // len(x) <op> constant  ->  narrow x's size
+    {
+        auto isLenOf = [](const ExprP& e, const Expr*& arg) {
+            if (e && e->kind == EK::Call && e->a && e->a->kind == EK::Ident && e->a->name == "len" &&
+                e->args.size() == 1) {
+                arg = e->args[0].value.get();
+                return true;
+            }
+            return false;
+        };
+        const Expr* argA = nullptr;
+        const Expr* argB = nullptr;
+        long long c = 0;
+        T op = cond->op;
+        bool ok = false;
+        if (isLenOf(L, argA) && R->kind == EK::Int) { c = R->ival; ok = true; }
+        else if (isLenOf(R, argB) && L->kind == EK::Int) {
+            c = L->ival;
+            ok = true;
+            switch (op) {
+                case T::Lt: op = T::Gt; break;
+                case T::Gt: op = T::Lt; break;
+                case T::Le: op = T::Ge; break;
+                case T::Ge: op = T::Le; break;
+                default: break;
+            }
+        }
+        if (ok && argA && argA->kind == EK::Ident) {
+            auto it = m.find(argA->name);
+            if (it != m.end()) {
+                T eff = truth ? op : [&] {
+                    switch (op) {
+                        case T::Lt: return T::Ge;
+                        case T::Le: return T::Gt;
+                        case T::Gt: return T::Le;
+                        case T::Ge: return T::Lt;
+                        case T::Eq: return T::Ne;
+                        case T::Ne: return T::Eq;
+                        default: return op;
+                    }
+                }();
+                Range& s = it->second.size;
+                long long lo = s.known ? s.lo : 0;
+                long long hi = s.known ? s.hi : intHi_;      // lengths are ints
+                switch (eff) {
+                    case T::Lt: s = rng(lo, std::min(hi, c - 1)); break;
+                    case T::Le: s = rng(lo, std::min(hi, c)); break;
+                    case T::Gt: s = rng(std::max(lo, c + 1), hi); break;
+                    case T::Ge: s = rng(std::max(lo, c), hi); break;
+                    case T::Eq: s = rng(c, c); break;
+                    default: break;
+                }
+                s.lo = std::max(0LL, s.lo);
+            }
+            return;
+        }
+    }
+    // null comparisons
+    if (L->kind == EK::Null || R->kind == EK::Null) {
+        const ExprP& other = (L->kind == EK::Null) ? R : L;
+        if (other->kind == EK::Ident) {
+            auto it = m.find(other->name);
+            if (it != m.end()) {
+                bool isEq = cond->op == T::Eq;
+                bool nullNow = truth ? isEq : !isEq;
+                it->second.nullState = nullNow ? AbsVal::IsNull : AbsVal::NonNull;
+            }
+        }
+        return;
+    }
+    // Ident <op> literal
+    auto litOf = [](const ExprP& e, long long& out) {
+        if (e && e->kind == EK::Int) { out = e->ival; return true; }
         return false;
     };
-    if (!compatible(declared, v.type))
-        col_.error("type-mismatch", line, what + " 类型不匹配",
-                   "声明为 " + declared + "，实际是 " + v.type, "改成匹配的类型或去掉类型标注");
+    const Expr* id = nullptr;
+    long long c = 0;
+    T op = cond->op;
+    if (L->kind == EK::Ident && litOf(R, c)) id = L.get();
+    else if (R->kind == EK::Ident && litOf(L, c)) {
+        id = R.get();
+        switch (op) {
+            case T::Lt: op = T::Gt; break;
+            case T::Gt: op = T::Lt; break;
+            case T::Le: op = T::Ge; break;
+            case T::Ge: op = T::Le; break;
+            default: break;
+        }
+    }
+    if (!id) return;
+    auto it = m.find(id->name);
+    if (it == m.end()) return;
+    AbsVal& v = it->second;
+    T eff = truth ? op : [&] {
+        switch (op) {
+            case T::Lt: return T::Ge;
+            case T::Le: return T::Gt;
+            case T::Gt: return T::Le;
+            case T::Ge: return T::Lt;
+            case T::Eq: return T::Ne;
+            case T::Ne: return T::Eq;
+            default: return op;
+        }
+    }();
+    long long lo = v.range.known ? v.range.lo : intLo_;
+    long long hi = v.range.known ? v.range.hi : intHi_;
+    switch (eff) {
+        case T::Lt: v.range = rng(lo, std::min(hi, c - 1)); break;
+        case T::Le: v.range = rng(lo, std::min(hi, c)); break;
+        case T::Gt: v.range = rng(std::max(lo, c + 1), hi); break;
+        case T::Ge: v.range = rng(std::max(lo, c), hi); break;
+        case T::Eq: v.range = rng(c, c); break;
+        case T::Ne:
+            if (!v.range.known) break;
+            if (v.range.lo == c && v.range.hi == c) v.range = Range();    // contradictory
+            else if (v.range.lo == c) v.range = rng(c + 1, v.range.hi);
+            else if (v.range.hi == c) v.range = rng(v.range.lo, c - 1);
+            break;
+        default: break;
+    }
+    // `int` is a bounded type, so a narrowed range never exceeds the target width
+    if (v.range.known && (v.type == "int" || v.type == "unknown" || v.type == "bool")) {
+        v.range.lo = std::max(v.range.lo, intLo_);
+        v.range.hi = std::min(v.range.hi, intHi_);
+    }
 }
 
-void Flow::assignTo(const ExprP& target, const AbsVal& v, Env& env, int line, bool declare,
-                    const std::string& declType) {
-    if (!target) return;
-    if (target->kind == EK::Ident) {
-        const std::string& name = target->name;
-        if (declare) {
-            AbsVal nv = v;
-            nv.declLine = line;
-            nv.assignLine = line;
-            nv.read = false;
-            nv.readSinceAssign = false;
-            // at the top level of <main> a `new` declares a global, not a local
-            nv.isLocal = !(cur_ && cur_->name == "<main>" && env.scopes.size() == 1);
-            if (!declType.empty()) nv.type = declType;
-            outOfScope_.erase(name);
-            env.declare(name, nv);
-            return;
+int Flow::triCondOf(const ExprP& e, Env& env) {
+    CasCtx ctx;
+    ctx.subst = &subst_;
+    ctx.lo = &loBnd_;
+    ctx.hi = &hiBnd_;
+    ctx.range = [&](const std::string& name, long long& lo, long long& hi) {
+        AbsVal* v = env.find(name);
+        if (!v || !v->range.known) return false;
+        lo = v->range.lo;
+        hi = v->range.hi;
+        return true;
+    };
+    int sym = casTriCtx(e, ctx);
+    if (sym >= 0) return sym;                      // the CAS decided it exactly
+    if (!e) return -1;
+    if (e->kind == EK::Bool) return e->bval ? 1 : 0;
+    if (e->kind == EK::Int) return e->ival != 0 ? 1 : 0;
+    if (e->kind == EK::Null) return 0;
+    if (e->kind == EK::Unary && e->op == T::Not) {
+        int t = triCondOf(e->a, env);
+        return t < 0 ? -1 : 1 - t;
+    }
+    if (e->kind == EK::Logical) {
+        int a = triCondOf(e->a, env);
+        int b = triCondOf(e->b, env);
+        if (e->op == T::AndAnd) {
+            if (a == 0 || b == 0) return 0;
+            if (a == 1 && b == 1) return 1;
+            return -1;
         }
-        AbsVal* found = env.find(name);
-        if (!found) {
-            if (globals_.count(name) || builtinNames_.count(name)) {
-                if (cur_ && cur_->pure)
-                    col_.error("purity", line, "[[pure]] 函数不得写全局变量 '" + name + "'",
-                               "纯函数不允许有副作用", "去掉 [[pure]]，或改为返回值");
-                globalsEnv_.vars[name] = v;      // keep the file level state up to date
-                return;
+        if (a == 1 || b == 1) return 1;
+        if (a == 0 && b == 0) return 0;
+        return -1;
+    }
+    if (e->kind == EK::Binary) {
+        switch (e->op) {
+            case T::Eq: case T::Ne: case T::Lt: case T::Gt: case T::Le: case T::Ge: {
+                // null comparisons first
+                const ExprP& L = e->a;
+                const ExprP& R = e->b;
+                if ((L && L->kind == EK::Null) || (R && R->kind == EK::Null)) {
+                    const ExprP& other = (L && L->kind == EK::Null) ? R : L;
+                    AbsVal ov = eval(other, env);
+                    if (ov.nullState == AbsVal::NullUnknown) return -1;
+                    bool isNull = ov.nullState == AbsVal::IsNull;
+                    if (ov.nullState == AbsVal::MaybeNull) return -1;
+                    bool eq = (e->op == T::Eq);
+                    return (eq == isNull) ? 1 : 0;
+                }
+                AbsVal a = eval(L, env);
+                AbsVal b = eval(R, env);
+                bool aNullish = a.type == "null" || (a.nullState == AbsVal::IsNull);
+                bool bNullish = b.type == "null" || (b.nullState == AbsVal::IsNull);
+                bool numA = a.type == "int" || a.type == "float" || a.type == "bool";
+                bool numB = b.type == "int" || b.type == "float" || b.type == "bool";
+                if (numA && numB) {
+                    if (e->op == T::Eq || e->op == T::Ne) {
+                        bool bothSingle = a.range.known && b.range.known && a.range.lo == a.range.hi && b.range.lo == b.range.hi;
+                        if (bothSingle) { bool eq = a.range.lo == b.range.lo; return (e->op == T::Eq) == eq ? 1 : 0; }
+                        if (a.range.known && b.range.known &&
+                            (a.range.hi < b.range.lo || b.range.hi < a.range.lo))
+                            return e->op == T::Ne ? 1 : 0;
+                        return -1;
+                    }
+                    if (!a.range.known || !b.range.known) return -1;
+                    switch (e->op) {
+                        case T::Lt: if (a.range.hi < b.range.lo) return 1; if (a.range.lo >= b.range.hi) return 0; return -1;
+                        case T::Gt: if (a.range.lo > b.range.hi) return 1; if (a.range.hi <= b.range.lo) return 0; return -1;
+                        case T::Le: if (a.range.hi <= b.range.lo) return 1; if (a.range.lo > b.range.hi) return 0; return -1;
+                        case T::Ge: if (a.range.lo >= b.range.hi) return 1; if (a.range.hi < b.range.lo) return 0; return -1;
+                        default: return -1;
+                    }
+                }
+                if (aNullish && bNullish && (e->op == T::Eq || e->op == T::Ne))
+                    return e->op == T::Eq ? 1 : 0;
+                return -1;
             }
-            col_.error("uninitialized", line, "给未声明的变量 '" + name + "' 赋值",
-                       "文档要求先 new 再赋值", "改为 new " + name + " = ...");
-            return;
+            default: break;
         }
-        if (found->init == AbsVal::NotInit)
-            found->init = AbsVal::IsInit;
-        if (!declType.empty()) checkDeclaredType(declType, v, line, "赋值给 '" + name + "'");
-        *found = v;
-        found->assignLine = line;
-        found->readSinceAssign = false;
-        if (found->declLine == 0) found->declLine = line;
-        return;
     }
-    if (target->kind == EK::Field) {
-        AbsVal base = eval(target->a, env);
-        if (base.nullState == AbsVal::IsNull)
-            col_.error("null-dereference", line, "对 null 写成员 '" + target->name + "'", "", "先判空");
-        else if (base.nullState == AbsVal::MaybeNull)
-            col_.warn("null-dereference", line, "可能对 null 写成员 '" + target->name + "'", "", "先判空");
-        if (cur_ && cur_->pure)
-            col_.error("purity", line, "[[pure]] 函数不得修改字段 '" + target->name + "'",
-                       "纯函数不允许有副作用", "去掉 [[pure]]，或改为返回值");
-        return;
+    if (e->kind == EK::Call && e->a && e->a->kind == EK::Ident) {
+        const std::string& fn = e->a->name;
+        if (fn == "is_null" && !e->args.empty()) {
+            AbsVal a = eval(e->args[0].value, env);
+            if (a.nullState == AbsVal::IsNull) return 1;
+            if (a.nullState == AbsVal::NonNull) return 0;
+            return -1;
+        }
+        if (fn == "len" && !e->args.empty()) {
+            AbsVal a = eval(e->args[0].value, env);
+            if (a.size.known) return a.size.hi > 0 ? (a.size.lo > 0 ? 1 : -1) : 0;
+            return -1;
+        }
     }
-    if (target->kind == EK::Index) {
-        AbsVal base = eval(target->a, env);
-        AbsVal idx = eval(target->b, env);
-        checkIndex(target->a, target->b, base, idx, line);
-        if (base.nullState == AbsVal::IsNull)
-            col_.error("null-dereference", line, "对 null 写下标", "", "先判空");
+    AbsVal v = eval(e, env);
+    if (v.range.known) {
+        if (v.range.lo == 0 && v.range.hi == 0) return 0;
+        if (v.range.lo > 0 || v.range.hi < 0) return 1;
     }
+    if (v.type == "null") return 0;
+    return -1;
 }
 
-// ---------------------------------------------------------------- statements
 void Flow::block(const BlockP& b, Env& env, bool newScope) {
     if (!b) return;
     if (newScope) env.push();
@@ -1450,7 +1937,7 @@ void Flow::block(const BlockP& b, Env& env, bool newScope) {
                         col_.info("dead-store", dl, "死存储：'" + nm + "' 的新值从未被读取",
                                   "下一条语句直接覆盖了这个值，中间没有任何读取", "删除这次赋值，或先使用该值");
                     });
-                    deadReported_.insert(x);
+                                        deadReported_.insert(x);
                 }
                 pendingStore[x] = s->line;
             }
@@ -1470,7 +1957,6 @@ void Flow::block(const BlockP& b, Env& env, bool newScope) {
                 if (endsControl(prev->body) && endsControl(prev->elseBody)) dead = true;
             }
         }
-        if (skip(s)) continue;
         if (dead) {
             if (s->kind == SK::Annot) continue;
             if (hasAnnotation(s->annotations, "unreachable")) { sawUnreachableAnn = true; continue; }
@@ -1507,7 +1993,10 @@ void Flow::block(const BlockP& b, Env& env, bool newScope) {
 
 void Flow::stmt(const StmtP& s, Env& env) {
     if (!s || budgetExceeded()) return;
-    if (skip(s)) return;
+    // A statement inlined from a `use`d module used to be skipped entirely, which meant the
+    // module's own globals were never declared and every later use looked "undefined".  Analyse
+    // it, and mute the diagnostics that belong to the module file.
+    MuteGuard mute(col_, skip(s));
     // statements inlined from a `use`d module keep their own line numbers, so report them
     // against their origin file (only visible with --modules)
     std::string savedFile = col_.file;
@@ -1528,6 +2017,8 @@ void Flow::stmt(const StmtP& s, Env& env) {
                 col_.warn("annotation-argument", a.line, "[[assume]] 的条件在当前状态恒为假",
                           "假设与已有事实矛盾，后续分析可能不可靠", "");
             narrow(env, a.args[0].expr, true);
+            learnFacts(a.args[0].expr, true, subst_, loBnd_, hiBnd_);   // [[assume]] facts
+            applyConstBounds(env);
         }
         if (a.name == "assert" && !a.args.empty() && a.args[0].expr) {
             int tri = triCondOf(a.args[0].expr, env);
@@ -1542,6 +2033,10 @@ void Flow::stmt(const StmtP& s, Env& env) {
                 narrow(env, a.args[0].expr, true);
         }
     }
+
+    // the CAS bounds learned above (`i < n` with `n <= 1000`) also narrow the numeric ranges,
+    // so the overflow and index checks see them
+    applyConstBounds(env);
 
     bool taintMark = false;
     bool unsafeMark = false;
@@ -1563,11 +2058,25 @@ void Flow::stmt(const StmtP& s, Env& env) {
         }
         case SK::New: case SK::Const: {
             AbsVal v;
-            if (s->initExpr) v = eval(s->initExpr, env);
+            if (!s->typeDims.empty()) {
+                // `T[n]` / `T[]` / `T[m][n]`: an Array of the element type, with a statically
+                // known outermost length whenever that dimension is a literal
+                v.type = "Array";
+                v.eltType = s->type;
+                v.init = AbsVal::IsInit;
+                v.nullState = AbsVal::NonNull;
+                if (s->typeDims[0] && s->typeDims[0]->kind == EK::Int) {
+                    long long n = (long long)s->typeDims[0]->ival;
+                    if (n < 0) n = 0;
+                    v.size = rng(n, n);
+                }
+            } else if (s->initExpr) v = eval(s->initExpr, env);
             else { v.init = AbsVal::NotInit; v.type = s->type.empty() ? "unknown" : s->type; }
             if (s->names.size() == 1) {
-                checkDeclaredType(s->type, v, s->line, "声明 '" + s->names[0] + "'");
-                assignTo(makeIdent(s->names[0], s->line), v, env, s->line, true, s->type);
+                if (s->typeDims.empty())
+                    checkDeclaredType(s->type, v, s->line, "声明 '" + s->names[0] + "'");
+                assignTo(makeIdent(s->names[0], s->line), v, env, s->line, true,
+                         s->typeDims.empty() ? s->type : std::string());
             } else {
                 if (v.size.known && v.size.lo != (long long)s->names.size())
                     col_.warn("out-of-bounds", s->line, "解构的元素个数与右侧长度不一致",
@@ -1642,22 +2151,61 @@ void Flow::stmt(const StmtP& s, Env& env) {
                 else if (tri == 0 && !s->elseBody)
                     col_.info("redundant-condition", s->line, "条件恒为假，分支永远不会执行", "", "");
             }
+            // Case analysis: the then path assumes the condition, the else path assumes its
+            // negation; both learn symbolic facts (equalities and linear bounds) and every
+            // diagnostic inside says which path it came from.
+            auto savedSubst = subst_, savedLo = loBnd_, savedHi = hiBnd_;
+            std::string savedNote = col_.branchNote;
+            std::string condText = exprText(s->cond);
+            std::string negText = condText;
+            if (s->cond && s->cond->kind == EK::Binary) {
+                ExprP flipped = std::make_shared<Expr>(*s->cond);
+                flipped->op = negatedOp(s->cond->op);
+                negText = exprText(flipped);
+            } else {
+                negText = "!" + condText;
+            }
             Env thenEnv = env;
             narrow(thenEnv, s->cond, true);
-            {
-                // detect an inner redundant condition
-                size_t before = res_.diagnostics.size();
-                block(s->body, thenEnv, true);
-                (void)before;
-            }
+            learnFacts(s->cond, true, subst_, loBnd_, hiBnd_);
+            applyConstBounds(thenEnv);
+            col_.branchNote = savedNote + (savedNote.empty() ? "" : " 且 ") +
+                              "条件成立（" + condText + "）";
+            block(s->body, thenEnv, true);
+            subst_ = savedSubst; loBnd_ = savedLo; hiBnd_ = savedHi;
             Env elseEnv = env;
             if (s->elseBody) {
                 narrow(elseEnv, s->cond, false);
+                learnFacts(s->cond, false, subst_, loBnd_, hiBnd_);
+                applyConstBounds(elseEnv);
+                col_.branchNote = savedNote + (savedNote.empty() ? "" : " 且 ") +
+                                  "条件不成立（" + negText + "）";
                 block(s->elseBody, elseEnv, true);
+                subst_ = savedSubst; loBnd_ = savedLo; hiBnd_ = savedHi;
             }
-            mergeEnv(env, thenEnv);
-            if (s->elseBody) mergeEnv(env, elseEnv);
-            else mergeEnv(env, env);
+            col_.branchNote = savedNote;
+            // The state after the branch is the *join of the two paths that reach it* - joining
+            // the pre-if state as well would let "unknown" wipe out what both paths established,
+            // which is exactly the case-analysis payoff (`if i < 1 ( i = 1 )` gives `i >= 1`:
+            // one path has [1, 1], the other is narrowed to [1, max]).
+            auto endsControl = [](const BlockP& blk) {
+                if (!blk || blk->stmts.empty()) return false;
+                SK k = blk->stmts.back()->kind;
+                return k == SK::Return || k == SK::Throw || k == SK::Break || k == SK::Continue;
+            };
+            bool thenExits = endsControl(s->body);
+            Env joined = thenEnv;
+            if (s->elseBody) {
+                if (thenExits) joined = elseEnv;             // only the else path reaches the join
+                else mergeEnv(joined, elseEnv);
+            } else {
+                Env falsePath = env;
+                narrow(falsePath, s->cond, false);
+                // `if n < 2( =n )` never falls through, so what follows only sees `n >= 2`
+                if (thenExits) joined = falsePath;
+                else mergeEnv(joined, falsePath);
+            }
+            env = joined;
             break;
         }
         case SK::While: {
@@ -1843,9 +2391,11 @@ void Flow::analyzeLoop(const StmtP& s, Env& env, bool isFor) {
             if (!boundKey.empty()) indexBound_[v] = boundKey;
         }
         if (!it.isIter && it.type != "unknown" && it.type != "List" && it.type != "Tuple" &&
-            it.type != "String" && s->iterable && s->iterable->kind != EK::Call)
+            it.type != "String" && it.type != "Array" && s->iterable &&
+            s->iterable->kind != EK::Call)
             col_.error("type-mismatch", s->iterable ? s->iterable->line : s->line,
-                       "for 遍历的对象不可迭代：" + it.type, "", "使用列表 / 元组 / 字符串 / 1 to 10 迭代器");
+                       "for 遍历的对象不可迭代：" + it.type, "",
+                       "使用列表 / 元组 / 字符串 / 数组 / 1 to 10 迭代器");
     } else {
         eval(s->cond, env);
     }
@@ -1863,6 +2413,11 @@ void Flow::analyzeLoop(const StmtP& s, Env& env, bool isFor) {
     // fixed point: two passes, then widen the variables the body modifies so that the
     // analysis cannot conclude "the condition is still true" from a single iteration
     Env bodyExit;                       // state at the end of one iteration (for invariant/decrease)
+    auto savedSubst = subst_, savedLo = loBnd_, savedHi = hiBnd_;
+    std::string savedNote = col_.branchNote;
+    std::string condText = s->cond ? exprText(s->cond) : std::string("条件");
+    learnFacts(s->cond, true, subst_, loBnd_, hiBnd_);
+    col_.branchNote = "分支: 循环体（" + condText + "）";
     for (int pass = 0; pass < 2; pass++) {
         Env bodyEnv = env;
         narrow(bodyEnv, s->cond, true);
@@ -1873,6 +2428,10 @@ void Flow::analyzeLoop(const StmtP& s, Env& env, bool isFor) {
         mergeEnv(env, bodyEnv);
         if (budgetExceeded()) break;
     }
+    col_.branchNote = savedNote;
+    subst_ = savedSubst; loBnd_ = savedLo; hiBnd_ = savedHi;
+    // the loop is only left when the condition is false: that is a fact for what follows
+    learnFacts(s->cond, false, subst_, loBnd_, hiBnd_);
 
     // ---- the checks below run before widening
     if (bodyExit.scopes.empty()) bodyExit = env;
@@ -2070,8 +2629,9 @@ void Flow::collectGlobals(const std::vector<StmtP>& stmts) {
         if (!s) continue;
         switch (s->kind) {
             case SK::New: case SK::Const:
-                if (s->origin.empty() || opts_.includeModules)
-                    for (auto& n : s->names) globals_.insert(n);
+                // a `new`/`const` at the top level of a module is a real global: the runtime
+                // inlines module statements, so the analyzer has to know it too
+                for (auto& n : s->names) globals_.insert(n);
                 break;
             case SK::State: globals_.insert(s->name); break;
             case SK::FuncDef: globals_.insert(s->name); break;
@@ -2153,6 +2713,9 @@ void Flow::collectStmts(const std::vector<StmtP>& stmts, const std::string& cls,
 
 void Flow::analyzeFunc(FuncInfo* f) {
     if (!f || !f->def || !f->def->body) return;
+    subst_.clear();
+    loBnd_.clear();
+    hiBnd_.clear();
     if (!opts_.includeModules && !f->def->origin.empty() && f->def->origin != file_) return;
     FunctionStatus st;
     st.name = f->qual;
@@ -2277,6 +2840,11 @@ void Flow::run() {
                           "_sys_make_time", "_sys_info", "_sys_env", "_sys_env_set",
                           "_sys_env_all", "_sys_exec", "_sys_spawn", "_sys_join",
                           "_sys_task_done", "_sys_socket",
+                          // built-in type names (also usable as conversion functions)
+                          "int", "long", "longlong", "uint", "ulong", "ulonglong",
+                          "int8", "int16", "int32", "int64",
+                          "uint8", "uint16", "uint32", "uint64",
+                          "float", "double", "longdouble", "float32", "float64",
                           // builtin module namespaces registered by the runtime
                           "math", "io", "json", "time", "net", "os", "thread", "system", "slice"})
         builtinNames_.insert(b);
@@ -2301,7 +2869,10 @@ void Flow::run() {
         const ExprP& init = s->initExpr;
         if (init) {
             switch (init->kind) {
-                case EK::Int: v.type = "int"; v.range = rng(init->ival, init->ival); break;
+                case EK::Int:
+                    v.type = init->wideLiteral ? "longlong" : "int";
+                    if (!init->wideLiteral) v.range = rng(init->ival, init->ival);
+                    break;
                 case EK::Float: v.type = "float"; break;
                 case EK::Str: v.type = "String"; v.size = rng((long long)init->sval.size(), (long long)init->sval.size()); break;
                 case EK::Bool: v.type = "bool"; break;

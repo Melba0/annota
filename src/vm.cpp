@@ -2,9 +2,16 @@
 #include "vm.hpp"
 #include "builtins.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace annota {
+
+// numeric width conversion (defined below, used by OP_CONVERT)
+static Value convertNum(VM& vm, const Value& v, NumKind k, const char* what);
+static Value convertNumCode(VM& vm, const Value& v, uint8_t raw, const char* what);
+__int128 parseWide(const std::string& text, bool isUnsigned);
+std::string wideText(__int128 v, bool isUnsigned);
 
 static const int kMaxFrames = 512;
 
@@ -24,8 +31,22 @@ std::string VM::toStr(const Value& v) {
     switch (v.t) {
         case VT::Null:  return "null";
         case VT::Bool:  return v.b ? "true" : "false";
-        case VT::Int:   return formatInt(v.i);
+        case VT::Int: {
+            // an unsigned width prints its full range (uint64(0) - uint64(1) is 2^64-1)
+            if (numIsUnsigned(v.numKind())) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)(uint64_t)v.i);
+                return buf;
+            }
+            return formatInt(v.i);
+        }
         case VT::Float: return formatDouble(v.f);
+        case VT::Wide:  return wideText(v.o ? v.o->wide : 0, v.wideUnsigned());
+        case VT::LongDouble: {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.17Lg", v.o ? v.o->wideF : 0.0L);
+            return buf;
+        }
         case VT::Str:   return v.o->str;
         case VT::Bytes: {
             std::string s = "b\"";
@@ -40,6 +61,30 @@ std::string VM::toStr(const Value& v) {
             char buf[16];
             std::snprintf(buf, sizeof(buf), "#%06x", (unsigned)(v.o->color & 0xFFFFFF));
             return buf;
+        }
+        case VT::Array: {
+            // nested rendering driven by the shape
+            std::function<std::string(const Value&, const Value&)> render =
+                [&](const Value& arr, const Value& depth) -> std::string {
+                (void)depth;
+                if (arr.o->dims.size() <= 1) {
+                    std::string s = "[";
+                    int64_t n = arr.o->dims.empty() ? 0 : arr.o->dims[0];
+                    for (int64_t i = 0; i < n; i++) {
+                        if (i) s += ", ";
+                        s += toStr(getIndex(arr, Value::integer(i)));
+                    }
+                    return s + "]";
+                }
+                std::string s = "[";
+                int64_t n = arr.o->dims[0];
+                for (int64_t i = 0; i < n; i++) {
+                    if (i) s += ", ";
+                    s += render(arr.arrayView(arr.o->offset + i * arr.o->strides[0], 1), Value::null());
+                }
+                return s + "]";
+            };
+            return render(v, Value::null());
         }
         case VT::List: {
             std::string s = "[";
@@ -224,6 +269,20 @@ void VM::setField(Value& obj, const std::string& name, const Value& v, int line)
 }
 
 Value VM::getIndex(const Value& obj, const Value& idx) {
+    if (obj.t == VT::Array) {
+        int64_t i = idx.t == VT::Int ? idx.i : (int64_t)idx.asFloat();
+        int64_t n = obj.o->dims.empty() ? 0 : obj.o->dims[0];
+        if (i < 0 || i >= n)
+            throwError("array index " + formatInt(i) + " out of range [0, " + formatInt(n) + ")");
+        int64_t stride = obj.o->strides.empty() ? 1 : obj.o->strides[0];
+        int64_t at = obj.o->offset + i * stride;
+        if (obj.o->dims.size() == 1) {
+            if (at < 0 || !obj.o->buf || at >= (int64_t)obj.o->buf->size()) return obj.defaultElement();
+            return (*obj.o->buf)[(size_t)at];
+        }
+        return obj.arrayView(at, 1);            // row view shares the buffer
+    }
+
     switch (obj.t) {
         case VT::List:
         case VT::Tuple: {
@@ -269,6 +328,18 @@ Value VM::getIndex(const Value& obj, const Value& idx) {
 }
 
 void VM::setIndex(Value& obj, const Value& idx, const Value& v) {
+    if (obj.t == VT::Array) {
+        int64_t i = idx.t == VT::Int ? idx.i : (int64_t)idx.asFloat();
+        int64_t n = obj.o->dims.empty() ? 0 : obj.o->dims[0];
+        if (i < 0 || i >= n)
+            throwError("array index " + formatInt(i) + " out of range [0, " + formatInt(n) + ")");
+        int64_t stride = obj.o->strides.empty() ? 1 : obj.o->strides[0];
+        int64_t at = obj.o->offset + i * stride;
+        if (!obj.o->buf) obj.o->buf = std::make_shared<std::vector<Value>>();
+        if (at >= 0 && at < (int64_t)obj.o->buf->size()) (*obj.o->buf)[(size_t)at] = deepCopy(v);
+        return;
+    }
+
     switch (obj.t) {
         case VT::List: {
             if (idx.t != VT::Int) throwError("list index must be an int");
@@ -307,6 +378,17 @@ void VM::setIndex(Value& obj, const Value& idx, const Value& v) {
 
 // ---------------------------------------------------------------- iterators
 Value VM::makeIter(const Value& v) {
+    if (v.t == VT::Array) {
+        std::vector<Value> out;
+        int64_t n = v.o->dims.empty() ? 0 : v.o->dims[0];
+        if (v.o->dims.size() <= 1) {
+            for (int64_t i = 0; i < n; i++) out.push_back(getIndex(v, Value::integer(i)));
+        } else {
+            for (int64_t i = 0; i < n; i++) out.push_back(v.arrayView(v.o->offset + i * v.o->strides[0], 1));
+        }
+        return Value::iterList(out, false);
+    }
+
     switch (v.t) {
         case VT::Iter: return v;
         case VT::List: return Value::iterList(v.o->items, false);
@@ -737,6 +819,89 @@ Value VM::execute(size_t stopDepth) {
                         setField(obj, f.chunk->consts[k].o->str, v, line);
                         break;
                     }
+                    case OP_NEW_ARRAY: {
+                        uint8_t nd = code[f.ip++];
+                        uint8_t info = code[f.ip++];
+                        bool eltStr = (info & 2) != 0;
+                        bool dyn = (info & 4) != 0;
+                        int kindCode = (info >> 3);
+                        NumKind ek = kindCode > 0 ? (NumKind)(kindCode - 1) : NumKind::None;
+                        // the initialiser list sits on top of the dimensions
+                        Value init;
+                        bool hasInit = (info & 1) != 0;
+                        if (hasInit) init = pop();
+                        std::vector<int64_t> dims((size_t)nd, 0);
+                        for (int i = (int)nd - 1; i >= 0; i--) {
+                            Value d = pop();
+                            dims[(size_t)i] = d.t == VT::Int ? d.i : (int64_t)d.asFloat();
+                        }
+                        int64_t total = 1;
+                        for (int64_t d : dims) total *= d < 0 ? 0 : d;
+                        auto buf = std::make_shared<std::vector<Value>>();
+                        Value proto = Value::array(buf, dims, {}, 0, ek, eltStr, dyn);
+                        buf->assign((size_t)total, proto.defaultElement());
+                        if (hasInit && total > 0) {
+                            std::vector<Value> src;
+                            if (init.t == VT::List || init.t == VT::Tuple) src = init.o->items;
+                            else if (init.t == VT::Array && init.o->buf) src = *init.o->buf;
+                            for (size_t i = 0; i < src.size() && i < (size_t)total; i++)
+                                (*buf)[i] = deepCopy(src[i]);
+                        }
+                        std::vector<int64_t> strides((size_t)nd, 1);
+                        for (int i = (int)nd - 2; i >= 0; i--)
+                            strides[(size_t)i] = strides[(size_t)i + 1] * dims[(size_t)i + 1];
+                        push(Value::array(buf, dims, strides, 0, ek, eltStr, dyn));
+                        break;
+                    }
+                    case OP_LOCAL_ADD_IMM: {
+                        uint8_t sl = code[f.ip++];
+                        int8_t imm = (int8_t)code[f.ip++];
+                        Cell& c = f.locals[sl];
+                        if (!c) c = std::make_shared<Value>(Value::integer(0));
+                        // the original GET_LOCAL/INT1/ADD/SET_LOCAL sequence leaves the stack
+                        // unchanged, so the fused form must store the result, never push it
+                        if (c->t == VT::Int) *c = Value::typedInt(c->i + imm, c->k);
+                        else *c = binaryResult(OP_ADD, *c, Value::integer(imm), "+");
+                        break;
+                    }
+                    case OP_LOCAL_SUB_IMM: {
+                        uint8_t sl = code[f.ip++];
+                        int8_t imm = (int8_t)code[f.ip++];
+                        Cell& c = f.locals[sl];
+                        if (!c) c = std::make_shared<Value>(Value::integer(0));
+                        if (c->t == VT::Int) *c = Value::typedInt(c->i - imm, c->k);
+                        else *c = binaryResult(OP_SUB, *c, Value::integer(imm), "-");
+                        break;
+                    }
+                    case OP_LOCAL_ADD_LOCAL: {
+                        uint8_t sl = code[f.ip++];
+                        uint8_t src = code[f.ip++];
+                        Cell& c = f.locals[sl];
+                        Value sv = f.locals[src] ? *f.locals[src] : Value::integer(0);
+                        if (!c) c = std::make_shared<Value>(Value::integer(0));
+                        if (c->t == VT::Int && sv.t == VT::Int)
+                            *c = Value::typedInt(c->i + sv.i, promoteNum(c->k, sv.k));
+                        else *c = binaryResult(OP_ADD, *c, sv, "+");
+                        break;
+                    }
+                    case OP_GET_INDEX_FAST: {
+                        Value idx = pop();
+                        Value obj = pop();
+                        if (obj.t == VT::Array) {
+                            int64_t i = idx.t == VT::Int ? idx.i : (int64_t)idx.asFloat();
+                            int64_t stride = obj.o->strides.empty() ? 1 : obj.o->strides[0];
+                            int64_t at = obj.o->offset + i * stride;
+                            if (obj.o->dims.size() == 1) {
+                                push(obj.o->buf && at >= 0 && at < (int64_t)obj.o->buf->size()
+                                         ? (*obj.o->buf)[(size_t)at] : obj.defaultElement());
+                            } else {
+                                push(obj.arrayView(at, 1));
+                            }
+                            break;
+                        }
+                        push(getIndex(obj, idx));
+                        break;
+                    }
                     case OP_GET_INDEX: {
                         Value idx = pop();
                         Value obj = pop();
@@ -985,6 +1150,8 @@ Value VM::execute(size_t stopDepth) {
                         Value a = pop();
                         if (a.t == VT::Int) push(Value::integer(-a.i));
                         else if (a.t == VT::Float) push(Value::real(-a.f));
+                        else if (a.t == VT::Wide) push(Value::wide(-a.asWide(), a.wideUnsigned()));
+                        else if (a.t == VT::LongDouble) push(Value::longDouble(-a.asLongDouble()));
                         else {
                             Value out;
                             if (callMagic(a, "__neg__", {}, out)) push(out);
@@ -1154,6 +1321,12 @@ Value VM::execute(size_t stopDepth) {
                         }
                         break;
                     }
+                    case OP_CONVERT: {
+                        uint8_t kk = code[f.ip++];
+                        Value v = pop();
+                        push(convertNumCode(*this, v, kk, "convert"));
+                        break;
+                    }
                     case OP_DEEPCOPY: {
                         Value v = pop();
                         push(deepCopy(v));
@@ -1175,6 +1348,38 @@ Value VM::execute(size_t stopDepth) {
 // ---------------------------------------------------------------- operators
 static bool isStrLike(const Value& a, const Value& b) {
     return a.t == VT::Str || b.t == VT::Str;
+}
+
+// ---------------------------------------------------------------- numeric width conversion
+// `int8(x)` / `OP_CONVERT` wrap an integer into the target width and truncate a float toward
+// zero, which is what C does for a narrowing conversion.
+// the same helper also serves the boxed widths (`long long`, `long double`); `raw` carries their
+// conversion code when it is one of kConvertWide*
+static Value convertNumCode(VM& vm, const Value& v, uint8_t raw, const char* what) {
+    if (raw == kConvertWideS || raw == kConvertWideU) {
+        bool uns = raw == kConvertWideU;
+        if (v.t == VT::Str) return Value::wide(parseWide(v.o->str, uns), uns);
+        if (v.isANumber() || v.t == VT::Bool) return Value::wide(v.asWide(), uns);
+        vm.throwError(std::string(what) + ": cannot convert " + v.typeName());
+    }
+    if (raw == kConvertLongDouble) {
+        if (v.t == VT::Str) return Value::longDouble(std::strtold(v.o->str.c_str(), nullptr));
+        if (v.isANumber() || v.t == VT::Bool) return Value::longDouble(v.asLongDouble());
+        vm.throwError(std::string(what) + ": cannot convert " + v.typeName());
+    }
+    return convertNum(vm, v, (NumKind)raw, what);
+}
+
+static Value convertNum(VM& vm, const Value& v, NumKind k, const char* what) {
+    if (k == NumKind::None) return v;
+    if (v.t == VT::Int)   return Value::typedInt(v.i, k);
+    if (v.t == VT::Float) {
+        if (numIsFloat(k)) return Value::typedReal(v.f, k);
+        return Value::typedInt((int64_t)v.f, k);
+    }
+    if (v.t == VT::Bool)  return Value::typedInt(v.b ? 1 : 0, k);
+    vm.throwError(std::string(what) + ": cannot convert " + v.typeName() + " to " + numKindName(k));
+    return Value::null();
 }
 
 Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name) {
@@ -1286,6 +1491,33 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
     switch (op) {
         case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
             if (an && bn) {
+                if ((a.t == VT::Wide || b.t == VT::Wide) &&
+                    (a.t != VT::LongDouble && b.t != VT::LongDouble && a.t != VT::Float && b.t != VT::Float)) {
+                    __int128 x = a.asWide(), y = b.asWide();
+                    bool uns = a.wideUnsigned() || b.wideUnsigned();
+                    bool r;
+                    if (uns) {
+                        unsigned __int128 ux = (unsigned __int128)x, uy = (unsigned __int128)y;
+                        r = op == OP_LT ? ux < uy : op == OP_GT ? ux > uy : op == OP_LE ? ux <= uy : ux >= uy;
+                    } else {
+                        r = op == OP_LT ? x < y : op == OP_GT ? x > y : op == OP_LE ? x <= y : x >= y;
+                    }
+                    return Value::boolean(r);
+                }
+                if (a.t == VT::Int && b.t == VT::Int) {
+                    // C comparison: if either side is unsigned at the same or wider rank, the
+                    // comparison happens in the unsigned domain
+                    bool useUnsigned = numIsUnsigned(promoteNum(a.numKind(), b.numKind()));
+                    bool r;
+                    if (useUnsigned) {
+                        uint64_t x = (uint64_t)a.i, y = (uint64_t)b.i;
+                        r = op == OP_LT ? x < y : op == OP_GT ? x > y : op == OP_LE ? x <= y : x >= y;
+                    } else {
+                        int64_t x = a.i, y = b.i;
+                        r = op == OP_LT ? x < y : op == OP_GT ? x > y : op == OP_LE ? x <= y : x >= y;
+                    }
+                    return Value::boolean(r);
+                }
                 double x = a.asFloat(), y = b.asFloat();
                 bool r = op == OP_LT ? x < y : op == OP_GT ? x > y : op == OP_LE ? x <= y : x >= y;
                 return Value::boolean(r);
@@ -1298,17 +1530,59 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
             throwError(std::string("cannot compare ") + a.typeName() + " and " + b.typeName() + " with '" + name + "'");
         }
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_POW: {
+            // 128 bit and long double operands: compute in the boxed domain (no precision loss)
+            if (a.t == VT::Wide || b.t == VT::Wide || a.t == VT::LongDouble || b.t == VT::LongDouble) {
+                bool wantFloat = a.t == VT::LongDouble || b.t == VT::LongDouble ||
+                                 a.t == VT::Float || b.t == VT::Float;
+                bool uns = a.wideUnsigned() || b.wideUnsigned();
+                if (!wantFloat) {
+                    __int128 x = a.asWide(), y = b.asWide();
+                    switch (op) {
+                        case OP_ADD: return Value::wide(x + y, uns);
+                        case OP_SUB: return Value::wide(x - y, uns);
+                        case OP_MUL: return Value::wide(x * y, uns);
+                        case OP_DIV:
+                            if (y == 0) throwError("division by zero");
+                            return Value::wide(x / y, uns);
+                        case OP_MOD:
+                            if (y == 0) throwError("modulo by zero");
+                            return Value::wide(x % y, uns);
+                        case OP_POW: {
+                            if (y < 0) return Value::longDouble(::powl(x, (long double)y));
+                            __int128 r = 1, base = x, e = y;
+                            while (e > 0) { if (e & 1) r *= base; base *= base; e >>= 1; }
+                            return Value::wide(r, uns);
+                        }
+                        default: break;
+                    }
+                }
+                long double x = a.asLongDouble(), y = b.asLongDouble();
+                switch (op) {
+                    case OP_ADD: return Value::longDouble(x + y);
+                    case OP_SUB: return Value::longDouble(x - y);
+                    case OP_MUL: return Value::longDouble(x * y);
+                    case OP_DIV:
+                        if (y == 0) throwError("division by zero");
+                        return Value::longDouble(x / y);
+                    case OP_MOD:
+                        if (y == 0) throwError("modulo by zero");
+                        return Value::longDouble(::fmodl(x, y));
+                    case OP_POW: return Value::longDouble(::powl(x, y));
+                    default: break;
+                }
+            }
             if (!an || !bn)
                 throwError(std::string("unsupported operand types for '") + name + "': " +
                            a.typeName() + " and " + b.typeName());
             bool intMode = (a.t == VT::Int && b.t == VT::Int);
-            if (op == OP_ADD && intMode) return Value::integer(a.i + b.i);
-            if (op == OP_SUB && intMode) return Value::integer(a.i - b.i);
-            if (op == OP_MUL && intMode) return Value::integer(a.i * b.i);
+            NumKind kr = promoteNum(a.numKind(), b.numKind());
+            if (op == OP_ADD && intMode) return Value::typedInt(a.i + b.i, kr);
+            if (op == OP_SUB && intMode) return Value::typedInt(a.i - b.i, kr);
+            if (op == OP_MUL && intMode) return Value::typedInt(a.i * b.i, kr);
             if (op == OP_MOD) {
                 if (intMode) {
                     if (b.i == 0) throwError("modulo by zero");
-                    return Value::integer(a.i % b.i);
+                    return Value::typedInt(a.i % b.i, kr);
                 }
                 if (b.asFloat() == 0.0) throwError("modulo by zero");
                 return Value::real(std::fmod(a.asFloat(), b.asFloat()));
@@ -1316,7 +1590,7 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
             if (op == OP_POW && intMode && b.i >= 0) {
                 int64_t r = 1, base = a.i, e = b.i;
                 while (e) { if (e & 1) r *= base; base *= base; e >>= 1; }
-                return Value::integer(r);
+                return Value::typedInt(r, kr);
             }
             double x = a.asFloat(), y = b.asFloat();
             switch (op) {
@@ -1324,10 +1598,16 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
                 case OP_SUB: return Value::real(x - y);
                 case OP_MUL: return Value::real(x * y);
                 case OP_DIV: {
+                    // C semantics: int / int truncates toward zero; a float on either side
+                    // makes it a floating point division
+                    if (intMode) {
+                        if (b.i == 0) throwError("division by zero");
+                        if (a.i == std::numeric_limits<int64_t>::min() && b.i == -1)
+                            return Value::typedInt(std::numeric_limits<int64_t>::min(), kr);
+                        return Value::typedInt(a.i / b.i, kr);
+                    }
                     if (y == 0.0) throwError("division by zero");
-                    double r = x / y;
-                    if (intMode && a.i % b.i == 0) return Value::integer((int64_t)r);
-                    return Value::real(r);
+                    return Value::typedReal(x / y, kr);
                 }
                 case OP_POW: return Value::real(std::pow(x, y));
                 default: break;
@@ -1432,6 +1712,13 @@ const char* opName(uint8_t op) {
         case OP_CLASS: return "class";
         case OP_INIT_CLASS: return "init_class";
         case OP_DEEPCOPY: return "deepcopy";
+        case OP_CONVERT: return "convert";
+        case OP_NEW_ARRAY: return "new-array";
+        case OP_GET_INDEX_FAST: return "index-fast";
+        case OP_NOP: return "nop";
+        case OP_LOCAL_ADD_IMM: return "local+=";
+        case OP_LOCAL_SUB_IMM: return "local-=";
+        case OP_LOCAL_ADD_LOCAL: return "local+=local";
         case OP_INT1: return "int1";
         default: return "?";
     }

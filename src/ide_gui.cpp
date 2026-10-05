@@ -6,6 +6,7 @@
 //   * structure panel showing every function with its ✓ / ? / ✗ contract status
 //   * output panel that runs the buffer with F5
 //   * hover panel, quick fixes, coverage, and the annotation / check reference dialogs
+#include "value.hpp"
 #include "commands.hpp"
 #include "common.hpp"
 
@@ -325,14 +326,22 @@ public:
         QTextCharFormat kw;
         kw.setForeground(QColor(0x00, 0x5C, 0xC5));
         kw.setFontWeight(QFont::Bold);
-        for (const char* k : {"new", "del", "const", "if", "else", "while", "for", "in", "to", "step",
+        for (const char* k : {"new", "del", "const", "if", "elif", "else", "while", "for", "in", "to", "step",
                               "break", "continue", "throw", "except", "print", "input", "use", "macro",
                               "view", "state", "true", "false", "null"})
             add(QStringLiteral("\\b%1\\b").arg(k), kw);
 
         QTextCharFormat type;
         type.setForeground(QColor(0x7A, 0x3E, 0x9D));
-        add(QStringLiteral("\\b(int|float|bool|str|String|Bytes|List|Tuple|Fn|Any)\\b"), type);
+        // the type names come from the same registry the parser and the analyzer use
+        // (`builtinTypes()`), so `long`, `longlong`, `int8`, `double`, ... highlight too
+        QString typePattern;
+        for (auto& t : builtinTypes()) {
+            if (!typePattern.isEmpty()) typePattern += "|";
+            typePattern += QString::fromUtf8(t.name);
+        }
+        typePattern += "|Fn|Any|str";
+        add(QStringLiteral("\\b(%1)\\b").arg(typePattern), type);
 
         QTextCharFormat ann;
         ann.setForeground(QColor(0xB0, 0x50, 0x00));

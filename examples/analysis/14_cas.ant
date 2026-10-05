@@ -1,0 +1,31 @@
+﻿-[ expect: none ]-
+-[ CAS：线性式条件可被证明，因此不报 assert-unproven ]-
+
+new j = 0
+new k = 0
+new m = 0
+new n = 0
+[[assert: j + 1 > j && 2 * k == k + k && m - m == 0 && n - 1 < n]]
+
+-- [[assume]] 的等式会作为代入使用
+new x = 5
+[[assume: x == 5]]
+[[assert: x * 2 == 10]]
+
+-- 函数里同样成立
+fact(n)(
+    new y = n + 1
+    [[assume: y == n + 1]]
+    [[assert: y - n == 1 && y > n]]
+    =y
+)
+
+print fact(2)
+
+redundant(a)(
+    if a + 1 > a( print "always" )
+    if a - a == 0( print "equal" )
+    =a
+)
+
+print redundant(3)

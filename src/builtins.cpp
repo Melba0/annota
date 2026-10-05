@@ -65,6 +65,8 @@ static bool tryToNumber(VM& vm, const Value& v, double& out) {
 
 static Value convertTo(VM& vm, const std::string& type, const Value& v) {
     if (type == "int") {
+        // the boxed widths (`long long`, `long double`) convert through the same path
+        if (v.t == VT::Wide || v.t == VT::LongDouble) return Value::integer(v.asInt());
         switch (v.t) {
             case VT::Int: return v;
             case VT::Float: return Value::integer((int64_t)v.f);
@@ -86,6 +88,7 @@ static Value convertTo(VM& vm, const std::string& type, const Value& v) {
     }
     if (type == "float") {
         double d;
+        if (v.t == VT::Wide || v.t == VT::LongDouble) return Value::real(v.asFloat());
         if (v.t == VT::Float) return v;
         if (v.t == VT::Instance) {
             Value out;
@@ -174,6 +177,7 @@ static std::vector<Value> itemsOf(VM& vm, const Value& v) {
 // ---------------------------------------------------------------- pseudo methods
 static Value methodSize(VM& vm, const Value& self, std::vector<Value>&) {
     switch (self.t) {
+        case VT::Array: return Value::integer(self.o->dims.empty() ? 0 : self.o->dims[0]);
         case VT::List: case VT::Tuple: return Value::integer((int64_t)self.o->items.size());
         case VT::Str: return Value::integer((int64_t)self.o->str.size());
         case VT::Bytes: return Value::integer((int64_t)self.o->bytes.size());
@@ -192,13 +196,15 @@ Value builtinMethod(VM& vm, const Value& obj, const std::string& name) {
     // `.size` / `.count` also behave as the length itself when used as a value
     auto bindSized = [&](std::function<Value(VM&, const Value&, std::vector<Value>&)> fn) {
         Value m = bind(fn);
-        if (obj.t == VT::List || obj.t == VT::Tuple) m.o->implicit = Value::integer((int64_t)obj.o->items.size());
+        if (obj.t == VT::Array) m.o->implicit = Value::integer(obj.o->dims.empty() ? 0 : obj.o->dims[0]);
+        else if (obj.t == VT::List || obj.t == VT::Tuple) m.o->implicit = Value::integer((int64_t)obj.o->items.size());
         else if (obj.t == VT::Str) m.o->implicit = Value::integer((int64_t)obj.o->str.size());
         else if (obj.t == VT::Bytes) m.o->implicit = Value::integer((int64_t)obj.o->bytes.size());
         else if (obj.t == VT::UiNode) m.o->implicit = Value::integer((int64_t)obj.o->items.size());
         return m;
     };
-    bool isSeq = obj.t == VT::List || obj.t == VT::Tuple || obj.t == VT::Str || obj.t == VT::Bytes;
+    bool isSeq = obj.t == VT::List || obj.t == VT::Tuple || obj.t == VT::Str ||
+                  obj.t == VT::Bytes || obj.t == VT::Array;
     if (!isSeq) {
         if (obj.t == VT::UiNode) {
             if (name == "size") return bind(methodSize);
@@ -220,18 +226,35 @@ Value builtinMethod(VM& vm, const Value& obj, const std::string& name) {
         for (auto& x : s.o->items) if (valueEquals(x, needle)) return Value::boolean(true);
         return Value::boolean(false);
     });
-    if (obj.t == VT::List || obj.t == VT::Bytes) {
+    if (obj.t == VT::List || obj.t == VT::Bytes || obj.t == VT::Array) {
         if (name == "set") return bind([](VM& vm, const Value& s, std::vector<Value>& a) {
             Value self = s;
             vm.setIndex(self, argAt(a, 0), argAt(a, 1));
             return Value::null();
         });
         if (name == "push" || name == "append" || name == "add") return bind([](VM& vm, const Value& s, std::vector<Value>& a) {
+            if (s.t == VT::Array) {
+                if (!s.o->dynamic)
+                    vm.throwError("append() on a fixed size array; declare it as T[] to grow");
+                for (auto& x : a) {
+                    s.o->buf->push_back(deepCopy(x));
+                    if (!s.o->dims.empty()) s.o->dims[0]++;
+                }
+                return s;
+            }
             if (s.t != VT::List) vm.throwError("append() is only supported by List");
             for (auto& x : a) s.o->items.push_back(deepCopy(x));
             return s;
         });
         if (name == "pop") return bind([](VM& vm, const Value& s, std::vector<Value>& a) {
+            if (s.t == VT::Array) {
+                if (!s.o->dynamic) vm.throwError("pop() on a fixed size array");
+                if (s.o->buf->empty()) vm.throwError("pop() on an empty array");
+                Value out = s.o->buf->back();
+                s.o->buf->pop_back();
+                if (!s.o->dims.empty()) s.o->dims[0]--;
+                return out;
+            }
             if (s.t != VT::List) vm.throwError("pop() is only supported by List");
             if (s.o->items.empty()) vm.throwError("pop() on an empty list");
             if (!a.empty()) {
@@ -941,6 +964,59 @@ void registerFilePrimitives(VM& vm) {
 } // namespace
 
 // ---------------------------------------------------------------- registration
+
+// ---------------------------------------------------------------- numeric width conversions
+// `int8(x)`, `uint32(x)`, `float32(x)` ... produce a value carrying that width, so arithmetic
+// follows C conversion/wrapping rules.  `typeof` reports the width name.
+static void registerNumericConversions(VM& vm) {
+    static const struct { const char* name; NumKind kind; } tbl[] = {
+        {"int8", NumKind::I8},     {"int16", NumKind::I16},   {"int32", NumKind::I32},
+        {"int64", NumKind::I64},   {"uint8", NumKind::U8},    {"uint16", NumKind::U16},
+        {"uint32", NumKind::U32},  {"uint64", NumKind::U64},  {"uint", NumKind::U32},
+        {"ulong", NumKind::U64},   {"long", NumKind::I64},    {"float32", NumKind::F32},
+        {"float64", NumKind::F64},
+    };
+    // widths that need the boxed representation
+    static const struct { const char* name; bool isFloat; bool isUnsigned; } wide[] = {
+        {"longlong", false, false}, {"ulonglong", false, true}, {"longdouble", true, false},
+    };
+    for (auto& w : wide) {
+        std::string nm = w.name;
+        bool isFloat = w.isFloat, isUnsigned = w.isUnsigned;
+        vm.globals[w.name] = std::make_shared<Value>(vm.makeNative(nm, [nm, isFloat, isUnsigned](
+            VM& v, std::vector<Value>& a) {
+            Value x = a.empty() ? Value::integer(0) : a[0];
+            if (x.t == VT::Str) {
+                if (isFloat) return Value::longDouble(std::strtold(x.o->str.c_str(), nullptr));
+                return Value::wide(parseWide(x.o->str, isUnsigned), isUnsigned);
+            }
+            if (!x.isANumber()) v.throwError(nm + ": cannot convert " + x.typeName());
+            if (isFloat) return Value::longDouble(x.asLongDouble());
+            return Value::wide(x.asWide(), isUnsigned);
+        }));
+    }
+    for (auto& e : tbl) {
+        NumKind k = e.kind;
+        std::string nm = e.name;
+        vm.globals[e.name] = std::make_shared<Value>(vm.makeNative(e.name, [k, nm](VM& v, std::vector<Value>& a) {
+            Value x = a.empty() ? Value::integer(0) : a[0];
+            if (x.t == VT::Int)   return Value::typedInt(x.i, k);
+            if (x.t == VT::Float) return numIsFloat(k) ? Value::typedReal(x.f, k)
+                                                       : Value::typedInt((int64_t)x.f, k);
+            if (x.t == VT::Bool)  return Value::typedInt(x.b ? 1 : 0, k);
+            if (x.t == VT::Str) {
+                // keep the string parsing behaviour of int()/float()
+                Value base = numIsFloat(k) ? Value::real(std::atof(x.o->str.c_str()))
+                                           : Value::integer((int64_t)std::strtoll(x.o->str.c_str(), nullptr, 10));
+                return numIsFloat(k) ? Value::typedReal(base.f, k) : Value::typedInt(base.i, k);
+            }
+            if (numIsFloat(k)) v.throwError(nm + ": cannot convert " + x.typeName());
+            v.throwError(nm + ": cannot convert " + x.typeName());
+            return Value::null();
+        }));
+    }
+}
+
 void registerBuiltins(VM& vm) {
     auto reg = [&](const std::string& name, std::function<Value(VM&, std::vector<Value>&)> fn) {
         vm.globals[name] = std::make_shared<Value>(vm.makeNative(name, std::move(fn)));
@@ -957,6 +1033,7 @@ void registerBuiltins(VM& vm) {
     reg("len", [](VM& v, std::vector<Value>& a) {
         Value x = argAt(a, 0);
         switch (x.t) {
+            case VT::Array: return Value::integer(x.o->dims.empty() ? 0 : x.o->dims[0]);
             case VT::List: case VT::Tuple: return Value::integer((int64_t)x.o->items.size());
             case VT::Str: return Value::integer((int64_t)x.o->str.size());
             case VT::Bytes: return Value::integer((int64_t)x.o->bytes.size());
@@ -1123,6 +1200,7 @@ void registerBuiltins(VM& vm) {
     vm.globals["json"] = std::make_shared<Value>(jsonModule(vm));
     // time / os / thread / net come from the unified native registry (native_api.hpp); the
     // `system` facade mirrors every namespace, including the ones registered above.
+    registerNumericConversions(vm);
     registerSysPrimitives(vm);
 }
 

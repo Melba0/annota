@@ -1,5 +1,5 @@
 -[ files.ant : 文件与目录 API 导览 ]-
--[ 底层是 _file_* / _dir_* / _path_* 原语，上层是 lib/file.mod 的 File / Dir / Path / Text ]-
+-[ 底层是 _file_* / _dir_* / _path_* 原语，上层是 lib/file.mod 的 File / Dir / Path / FileText ]-
 
 use std
 
@@ -77,9 +77,9 @@ Test.eq(Path.is_abs("a/b"), false, "相对路径")
 Test.eq(len(Path.parts("a/b/c")) , 3, "parts")
 
 -- ---------- 文本工具
-Test.eq(Text.to_lines("a\nb\n\n"), ["a", "b"], "to_lines")
-Test.eq(Text.from_lines(["a", "b"]), "a\nb\n", "from_lines")
-Test.eq(Text.count_lines("a\nb"), 2, "count_lines")
+Test.eq(FileText.to_lines("a\nb\n\n"), ["a", "b"], "to_lines")
+Test.eq(FileText.from_lines(["a", "b"]), "a\nb\n", "from_lines")
+Test.eq(FileText.count_lines("a\nb"), 2, "count_lines")
 
 -- ---------- 原语直接可用（下划线前缀 = 底层）
 new raw = Path.join(sandbox, "raw.txt")

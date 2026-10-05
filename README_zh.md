@@ -31,6 +31,17 @@ Annota 是一门"标注即规范"的小语言：`[[require]]`、`[[ensure]]`、`
   CFG 上的抽象解释，调用点契约检查。
 * 🖥️ **真正的 Qt 6 界面**——既用于 Annota 程序自己的 `view` 组件，也用于写代码的 IDE；
   没有 Qt 时优雅降级为 `--gui-tree` + REPL + 完整分析器。
+* 🔢 **C 风格数值宽度**——`int8..int64` / `uint8..uint64` / `float32` / `float64`，外加盒式的
+  `longlong`（128 位）与 `longdouble`（80 位）；声明宽度按 C 语义回绕/舍入，整数除法向零截断。
+* 🧱 **定长类型化数组**——`int[5]`、`int[3][4]`、`int[]`：连续存储、自动补 0、O(1) 行视图、
+  静态越界证明，以及用 `[[unsafe]]` 关掉运行时检查的开关。
+* ⚡ **`[[jit]]` 标记**——唯一的优化标记，让某函数在加载期做常量折叠与超指令融合，基准可量化。
+* 🧭 **分类讨论与 `elif`**——`if` / `elif` / `else` 链；每条路径各自学习事实
+  （`if i < 1 ( i = 1 )` 之后可证 `i >= 1`），会返回的分支不污染并集，
+  并且每条诊断都会注明来自哪个分支。
+* 🧠 **IDE 认得类型**——悬停 `int` / `long` / `longlong` / `double` 会给出类型信息
+  （宽度、有无符号、怎么声明与转换），补全把它们作为 `type` 提供，编辑器也会高亮；
+  这些名字来自 parser / 分析器 / 高亮器共用的同一份注册表。
 * 📁 **开箱可用的标准库**——`Seq` / `Str` / `Dict` / `Mathx` / `File` / `Dir` / `Path` / `Test` / 切片，
   以及正确处理 UTF-8 路径的文件层与 JSON 模块。
 * ✅ **自带验证**——`build.ps1 -Verify` 一条命令跑完 8 个示例、12 个分析用例、性能基准、
@@ -358,6 +369,11 @@ build\annota.exe analyze file.ant --int-bits=64 --modules
 > 完整清单见 [docs/reference.md](docs/reference.md)（由 `annota ide docs` 从注册表生成，
 > 不会与实现脱节）。
 
+**内置一个很小的 CAS**：条件会被规范化成整数线性式（`sum(k_i * v_i) + c`），于是
+`assert(i + 1 > i)`、`assert(2 * k == k + k)`、`assert(n - 1 < n)` 是**被证明**而不是报
+“无法证明”；`[[assume: x == 5]]` 作为代入使 `assert(x * 2 == 10)` 可证；
+`if a + 1 > a` 会被指出是冗余条件。
+
 **标注即规范**：`[[assume]]` 缩小抽象状态；`[[assert]]` 必须被证明；`[[require]]` 在函数入口被假设、
 并**在每个调用点被检查**；`[[ensure]]` 在每个返回点代入 `result` 检查；`[[invariant]]` 在循环入口与
 每次迭代末尾检查；`[[decrease]]` 必须为正且严格递减；`[[taint]]` 标记来源、`[[unsafe]]` 标记边界；
@@ -391,26 +407,43 @@ powershell -ExecutionPolicy Bypass -File tools/lsp_smoke.ps1    # 端到端自�
 
 `lib/` 下的脚本模块，用 `use <名字>` 载入，或一次 `use std`：
 
+`lib/` 下的脚本模块，用 `use <名字>` 载入（子目录写法 `use sub/名字`），或一次 `use std`。
+模块找不到会直接报错，并列出搜索路径、可用模块与最接近的名字。完整 API 见
+**[docs/stdlib.md](docs/stdlib.md)**。
+
 | 模块 | 对象 | 内容 |
 |---|---|---|
-| `slice` | `SliceView` | `arr[1:4]`、`arr[2:]`、`arr[:3]`、`arr[:]` |
-| `seq` | `Seq` | `map` `filter` `reject` `reduce` `fold` `any` `all` `count` `find` `index_where` `reverse` `unique` `flatten` `take` `drop` `slice_of` `chunk` `sort` `min_of` `max_of` `first` `last` `zip_with` `join` `sum_of` |
+| `seq` | `Seq` `Heap` | `map` `filter` `reduce` `scan` `zip_with` `chunk` `window` `rotate` `flatten` `transpose`；**算法**：`merge_sort` `sort_by` `heap_sort` `insertion_sort` `kth` `median` `quantile` `lower_bound` `upper_bound` `bsearch` `merge_sorted` `insert_sorted`；**集合**：`dedup` `union` `intersect` `difference` `is_subset`；**统计**：`mean` `variance` `stddev` `frequencies` `mode` `min_max`；`Heap.from_list(...).drain()` |
+| `dict` | `Dict` `Set` `Counter` | 开放寻址哈希表（FNV-1a，负载 0.75 扩容 / 0.125 收缩）：`set` `get` `get_or` `has` `remove` `items_sorted` `map_values` `filter` `invert` `merge` `copy` `d[k]` `len(d)`；`Set` 交并差；`Counter` `most_common` `total` |
+| `text` | `Text` | KMP `find_all` `find_kmp` `split_by` `replace_all` `words` `wrap` `snake_case` `camel_case` `levenshtein` `similarity` `lcs` `is_palindrome` `is_anagram` `caesar` `rot13` `csv_parse` `csv_format` `base64_encode` `hex_dump` `ngrams` `char_freq` `word_freq` |
+| `numeric` | `Num` | `sieve` `is_prime` `nth_prime` `prime_sum` `prime_factors` `divisors` `divisor_count` `divisor_sum` `totient` `goldbach` `mod_pow` `mod_inverse` `gcd_ext` `fib`（快速倍增）`collatz_*` `binomial` `pascal_row` `catalan` `integer_sqrt` `digits` `base_str` `parse_base` `binary_search_monotone` `hanoi` |
+| `matrix` | `Matrix` | 行优先一维存储，`mul`（i-k-j）`pow`（快速幂）`det`（高斯消元）`transpose` `trace` `add` `scale` `mul_list` `from_lists` `to_lists` `identity` |
+| `stats` | `Stats` | `mean` `weighted_mean` `median` `mode` `variance` `stddev` `percentile` `iqr` `skewness` `kurtosis` `covariance` `correlation` `rank` `zscores` `normalize` `histogram` `moving_average` `summary` |
+| `graph` | `Graph` `DSU` | `bfs` `dfs` `distances` `shortest_path`（Dijkstra + 二叉堆）`all_pairs`（Floyd–Warshall）`topological_sort`（Kahn）`has_cycle` `connected_components` `is_bipartite` `kruskal`；`DSU` 路径压缩 + 按秩合并 |
+| `geometry` | `Geo` | `dist` `dist2` `cross` `orientation` `segments_intersect` `polygon_area`（鞋带）`point_in_polygon`（射线法）`convex_hull`（Andrew 单调链 O(n log n)）`closest_pair`（分治）`bounding_box` `centroid` |
+| `slice` | `Slice` `SliceView` | `arr[1:4]`、`arr[2:]`、`arr[:3]`、`arr[:]` |
 | `str` | `Str` | `repeat` `pad_left` `pad_right` `center` `reverse` `capitalize` `title` `count` `blank` `is_digit` `lines` `join` `hex` `format` |
-| `dict` | `Dict` | `set` `get` `has` `remove` `size` `is_empty` `key_list` `value_list` `items` `clear` `merge` `copy` `keys_sorted` |
 | `mathx` | `Mathx` | `gcd` `lcm` `factorial` `fib` `fib_iter` `is_prime` `primes` `clamp` `lerp` `round_to` `mean` `median` `variance` `stddev` `is_even` `is_odd` `digit_sum` |
-| `file` | `File` `Dir` `Path` `Text` `Result` | 见下一节 |
-| `time` | `Time` `Stopwatch` | `millis` `clock` `parts` `year`…`weekday` `make` `format`（strftime 风格，Annota 实现）`iso` `date` `stamp_text` `leap` `days_in_month` `day_of_year` `diff_ms` `describe_ms` |
+| `file` | `File` `Dir` `Path` `FileText` `Result` | 读写、复制、遍历、路径拼接 |
+| `time` | `Time` `Stopwatch` | `millis` `clock` `parts` `make` `format`（strftime 风格，脚本实现）`iso` `date` `stamp_text` `leap` `days_in_month` `diff_ms` `describe_ms` |
 | `os` | `Os` | `platform` `arch` `cpus` `pid` `home` `temp` `cwd` `env` `set_env` `env_all` `exec` `run` `ok` `which` |
 | `thread` | `Thread` `Task` `Pool` | `hardware` `spawn` `run` `parallel_map` `parallel_each` `pool` |
-| `net` | `Net` `Tcp` `Url` `Response` | `tcp` `server` `get` `post` `request` `parse_http` `resolve`，`Tcp` 的 send/recv/recv_until/recv_all/close，`Url.encode/decode/parse` |
+| `net` | `Net` `Tcp` `Url` `Response` | `tcp` `server` `get` `post` `request` `parse_http` `resolve` |
 | `test` | `Test` | `suite` `ok` `eq` `ne` `near` `raises` `report` `check` |
 
 ```powershell
-build\annota.exe examples\stdlib.ant      # 标准库导览
-build\annota.exe examples\algorithms.ant  # 用标准库实现经典算法
-build\annota.exe examples\files.ant       # 文件 API，39 条断言
-build\annota.exe examples\system.ant      # 时钟、线程、套接字、HTTP 解析（53 条断言）
+build\annota.exe examples\stdlib.ant       # 标准库导览（69 条断言）
+build\annota.exe examples\algorithms.ant   # 排序 / 动态规划 / 图 / 数论 / 几何（82 条）
+build\annota.exe examples\perf.ant         # 性能基准：12 个工作负载 + 计时表
+build\annota.exe examples\collections.ant  # 哈希容器，哈希 vs 线性扫描
+build\annota.exe examples\strings.ant      # 字符串算法
+build\annota.exe examples\graphs.ant       # BFS / Dijkstra / 拓扑 / MST / 迷宫寻路
+build\annota.exe examples\numerics.ant     # 数论练习册
+build\annota.exe examples\geometry.ant     # 凸包 / 面积 / 最近点对
+build\annota.exe examples\files.ant        # 文件 API，39 条断言
+build\annota.exe examples\system.ant       # 时钟、线程、套接字、HTTP 解析（53 条断言）
 ```
+
 
 ## 原语
 
@@ -692,7 +725,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify   # 提 PR 前必须�
 3. **类型转换 vs 匿名函数**：内置类型名/已声明类名后跟操作数时按转换解析，否则紧跟 `(` 按匿名函数解析。
 4. **类型标注不参与运行期检查**：只用于字段默认值推导与分析器。
 5. **`[[private]]` / `[[public]]` 不强制**：作为元数据记录，不做访问控制。
-6. **整数除法**：整除时结果为 `int`，否则为 `float`（`7 / 2` → `3.5`）。
+6. **整数除法与 C 对齐**：两侧都是整数时向零截断（`7 / 2` → `3`，`-7 / 2` → `-3`），
+   任一侧是浮点才是浮点除法（`7 / 2.0` → `3.5`）。
 7. **`for (a, b) in xs`**：元素是二元组/列表时按下标 0、1 解构，否则退化为 `(下标, 元素)`。
 8. **`children()`**：编译成取当前实例的 `__children` 字段。
 9. **递归宏**必然触发 `[[macro_depth]]` 限制。

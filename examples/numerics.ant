@@ -1,0 +1,114 @@
+-[ numerics.ant : 数论练习册（筛法、因数、欧拉函数、快速幂、斐波那契、考拉兹……） ]-
+-[ 都是经典小题目，答案用断言固定下来，改算法时立刻能发现算错。 ]-
+
+use test
+use seq
+use numeric
+
+Test.suite("数论练习")
+
+-- ---------------------------------------------------------------- 素数与因数
+-- 第 1 题：1000 以内素数之和
+Test.eq(Num.prime_sum(1000), 76127, "1000 以内素数和")
+
+-- 第 2 题：13195 的最大质因数
+new factors = Num.prime_factors(13195)
+Test.eq(factors, [5, 7, 13, 29], "13195 的质因数")
+Test.eq(factors[len(factors) - 1], 29, "最大质因数")
+
+-- 第 3 题：约数与完全数
+Test.eq(Num.divisor_count(360), 24, "360 的约数个数")
+Test.eq(Num.divisors(28), [1, 2, 4, 7, 14, 28], "28 的约数")
+Test.eq(Num.is_perfect(496), true, "496 是完全数")
+Test.eq(Num.is_perfect(500), false, "500 不是完全数")
+
+-- 第 4 题：欧拉函数（与 n 互素的个数）
+Test.eq(Num.totient(1), 1, "φ(1)")
+Test.eq(Num.totient(9), 6, "φ(9)")
+Test.eq(Num.totient(100), 40, "φ(100)")
+-- 用互素计数交叉验证 φ
+new coprime = 0
+for k in 1 to 100(
+    if Num.gcd(k, 100) == 1( coprime = coprime + 1 )
+)
+Test.eq(coprime, 40, "φ(100) 与互素计数一致")
+
+-- 第 5 题：哥德巴赫（每个不小于 4 的偶数都能拆成两个素数）
+new ok = true
+[[ignore: redundant-condition]]   -- 分析器假设函数返回值非空，这里要显式检查
+for n in 4 to 200 step 2(
+    if Num.goldbach(n) == null( ok = false )
+)
+Test.eq(ok, true, "4..200 的偶数都能写成两素数之和")
+Test.eq(Num.goldbach(180), (7, 173), "180 = 7 + 173")
+
+-- ---------------------------------------------------------------- 幂与模运算
+Test.suite("幂与模")
+
+-- 快速幂：3^100 的末 7 位
+Test.eq(Num.mod_pow(3, 100, 10000000), 7522001, "3^100 mod 10^7")
+Test.eq(Num.pow_int(2, 30), 1073741824, "2^30")
+Test.eq(Num.mod_inverse(17, 3120), 2753, "17 在模 3120 下的逆元")
+Test.eq((17 * Num.mod_inverse(17, 3120)) % 3120, 1, "逆元验证")
+Test.eq(Num.mod_pow(7, 0, 13), 1, "指数 0 返回 1")
+
+-- RSA 式的玩具加密：m^e 再取 d 次幂能还原
+new p = 61
+new q = 53
+new n = p * q
+new phi = (p - 1) * (q - 1)
+new e = 17
+new d = Num.mod_inverse(e, phi)
+new message = 65
+new encrypted = Num.mod_pow(message, e, n)
+new decrypted = Num.mod_pow(encrypted, d, n)
+Test.eq(decrypted, message, "玩具 RSA 往返")
+
+-- ---------------------------------------------------------------- 递推与序列
+Test.suite("序列")
+Test.eq(Num.fib(10), 55, "斐波那契第 10 项")
+Test.eq(Num.fib_pair(20), (6765, 10946), "相邻两项")
+Test.eq(Num.triangular(100), 5050, "1..100 之和")
+Test.eq(Num.is_triangular(55), true, "55 是三角数")
+Test.eq(Num.catalan(6), 132, "卡特兰数")
+Test.eq(Num.pascal_row(6), [1, 6, 15, 20, 15, 6, 1], "帕斯卡第 6 行")
+-- 帕斯卡三角的对称性
+new row = Num.pascal_row(10)
+Test.eq(row[0], row[10], "首尾相等")
+Test.eq(row[3], row[7], "对称")
+
+-- 考拉兹：1000 以内最长的序列
+new longest = Num.longest_collatz(1000)
+Test.eq(longest[0], 871, "最长考拉兹的起点")
+Test.eq(longest[1], 178, "最长长度")
+
+-- ---------------------------------------------------------------- 数位与进制
+Test.suite("数位与进制")
+Test.eq(Num.digits(90210), [9, 0, 2, 1, 0], "数位")
+Test.eq(Num.from_digits([9, 0, 2, 1, 0]), 90210, "由数位还原")
+Test.eq(Num.digit_sum(Num.pow_int(2, 15)), 26, "2^15 = 32768 的数位和")
+Test.eq(Num.digital_root(123456), 3, "数根")
+Test.eq(Num.is_palindrome_number(12321), true, "回文数")
+Test.eq(Num.is_armstrong(1634), true, "1634 是阿姆斯特朗数")
+Test.eq(Num.base_str(255, 16), "ff", "十六进制")
+Test.eq(Num.base_str(8, 2), "1000", "二进制")
+Test.eq(Num.parse_base("1000", 2), 8, "二进制解析")
+Test.eq(Num.parse_base("zz", 36), 1295, "36 进制解析")
+
+-- ---------------------------------------------------------------- 整数开方与二分
+Test.suite("开方与二分")
+Test.eq(Num.integer_sqrt(1000000), 1000, "整数平方根")
+Test.eq(Num.integer_sqrt(999999), 999, "向下取整")
+Test.eq(Num.is_perfect_square(1048576), true, "2^20 是完全平方")
+Test.eq(Num.integer_root(1000000, 3), 100, "整数立方根")
+-- 用二分找单调函数的分界点：最小的使 x^2 > 1000 的 x
+Test.eq(Num.binary_search_monotone(1, 100, (x)( =x * x > 1000)), 32, "单调二分")
+
+-- ---------------------------------------------------------------- 汉诺塔
+new moves = Num.hanoi(3)
+Test.eq(len(moves), 7, "3 层汉诺塔步数")
+Test.eq(moves[0], (1, 3), "第一步")
+Test.eq(moves[6], (1, 3), "最后一步")
+Test.eq(len(Num.hanoi(10)), 1023, "2^10 - 1 步")
+
+Test.check()

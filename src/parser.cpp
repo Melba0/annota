@@ -1,5 +1,7 @@
 // Annota - parser.cpp : recursive descent parser with a compile-time macro engine.
+#include "value.hpp"
 #include "parser.hpp"
+#include "builtins.hpp"
 #include <algorithm>
 #include <cctype>
 #include <map>
@@ -22,7 +24,8 @@ Parser::Parser(std::vector<Token> toks, std::string file, ModuleLoader* loader, 
         t_.push_back(e);
     }
     depth_.assign(t_.size(), 0);
-    knownTypes_ = {"int", "float", "bool", "String", "Bytes", "List", "Tuple", "Map", "Color", "str"};
+    knownTypes_ = {"bool", "String", "List", "Tuple", "Map", "Bytes", "Color"};
+    for (auto& t : builtinTypes()) knownTypes_.insert(t.name);
 }
 
 void Parser::error(const std::string& msg) { errorAt(p_, msg); }
@@ -81,7 +84,7 @@ size_t Parser::findBlockParen(size_t from) const {
             if (cl == (size_t)-1) return (size_t)-1;
             T after = at(cl + 1).type;
             if (after == T::Newline || after == T::End || after == T::RParen ||
-                after == T::RBrace || after == T::Kw_else)
+                after == T::RBrace || after == T::Kw_else || after == T::Kw_elif)
                 return i;
             i = cl;
             continue;
@@ -593,6 +596,9 @@ StmtP Parser::statementCore(Ctx ctx) {
         case T::Kw_macro:  return parseMacro();
         case T::Kw_view:   return parseView();
         case T::Kw_if:     return parseIf(ctx);
+        case T::Kw_elif:
+            error("'elif' must follow an if/elif block (write `) elif cond( ... )`)");
+            return nullptr;
         case T::Kw_while:  return parseWhile(ctx);
         case T::Kw_for:    return parseFor(ctx);
         case T::Kw_break: {
@@ -623,9 +629,16 @@ StmtP Parser::statementCore(Ctx ctx) {
         case T::Kw_print:  return parsePrint();
         case T::Kw_input: {
             p_++;
-            StmtP s = std::make_shared<Stmt>(); s->kind = SK::Input; s->line = line;
-            s->target = parseExpr();
-            return s;
+            StmtP first;
+            for (;;) {                           // `input a, b` reads one line each
+                StmtP s = std::make_shared<Stmt>(); s->kind = SK::Input; s->line = line;
+                s->target = parseExpr();
+                if (!first) first = s;
+                else pendingStmts_.push_back(s);
+                if (!accept(T::Comma)) break;
+                skipNL();
+            }
+            return first;
         }
         case T::Assign: {                       // `= expr` -> return
             p_++;
@@ -666,6 +679,7 @@ StmtP Parser::statementCore(Ctx ctx) {
                 s->name = cur().text; p_++;
                 p_++;                                   // ':'
                 s->type = expect(T::Ident, "a type name").text;
+                s->typeDims = parseDims();
                 if (accept(T::Assign)) s->initExpr = parseExpr();
                 return s;
             }
@@ -759,12 +773,18 @@ StmtP Parser::parseIf(Ctx ctx) {
     blockParen_ = (size_t)-1;
     Ctx bc = ctx; bc.classBody = false;
     s->body = parseBlock(bc, ctx.ui);
-    if (accept(T::Kw_else)) {
+    // `elif c( ... )` is exactly `else if c( ... )`; the token is rewritten so both spellings
+    // take the same path (and `elif` chains nest like the documentation describes)
+    bool elifHere = check(T::Kw_elif);
+    if (elifHere) t_[p_].type = T::Kw_if;
+    if (elifHere || accept(T::Kw_else)) {
         if (check(T::Kw_if)) {
             BlockP b = std::make_shared<Block>();
             b->line = cur().line;
             b->stmts.push_back(parseIf(ctx));
             s->elseBody = b;
+        } else if (elifHere) {
+            error("'elif' needs a condition: elif <条件>( ... )");
         } else {
             s->elseBody = parseBlock(bc, ctx.ui);
         }
@@ -828,14 +848,20 @@ StmtP Parser::parsePrint() {
 }
 
 StmtP Parser::parseState() {
-    int line = cur().line;
     expect(T::Kw_state);
-    StmtP s = std::make_shared<Stmt>(); s->kind = SK::State; s->line = line;
-    s->name = expect(T::Ident, "a state name").text;
-    if (accept(T::Colon)) s->type = expect(T::Ident, "a type name").text;
-    expect(T::Assign, "'=' in a state declaration");
-    s->initExpr = parseExpr();
-    return s;
+    StmtP first;
+    for (;;) {                                  // `state a = 0, b = 1`
+        StmtP s = std::make_shared<Stmt>(); s->kind = SK::State; s->line = cur().line;
+        s->name = expect(T::Ident, "a state name").text;
+        if (accept(T::Colon)) { s->type = expect(T::Ident, "a type name").text; s->typeDims = parseDims(); }
+        expect(T::Assign, "'=' in a state declaration");
+        s->initExpr = parseExpr();
+        if (!first) first = s;
+        else pendingStmts_.push_back(s);
+        if (!accept(T::Comma)) break;
+        skipNL();
+    }
+    return first;
 }
 
 StmtP Parser::parseNew() {
@@ -847,7 +873,7 @@ StmtP Parser::parseNew() {
         s->names.push_back(expect(T::Ident, "a variable name").text);
         while (accept(T::Comma)) s->names.push_back(expect(T::Ident, "a variable name").text);
         expect(T::RParen, "')' after the destructuring pattern");
-        if (accept(T::Colon)) s->type = expect(T::Ident, "a type name").text;
+        if (accept(T::Colon)) { s->type = expect(T::Ident, "a type name").text; s->typeDims = parseDims(); }
         if (accept(T::Assign)) s->initExpr = parseExpr();
         return s;
     }
@@ -860,6 +886,7 @@ StmtP Parser::parseNew() {
             // either a plain type or a leftover of `(T)` casts
             if (check(T::Ident)) s->type = cur().text, p_++;
             else if (check(T::LParen)) { p_++; s->type = expect(T::Ident, "a type name").text; expect(T::RParen); }
+            s->typeDims = parseDims();
         }
         if (accept(T::Assign)) s->initExpr = parseExpr();
         if (!first) first = s;
@@ -871,14 +898,21 @@ StmtP Parser::parseNew() {
 }
 
 StmtP Parser::parseSimpleDecl(SK kind, bool requireInit) {
-    int line = cur().line;
     p_++;                                    // 'const'
-    StmtP s = std::make_shared<Stmt>(); s->kind = kind; s->line = line; s->isConst = true;
-    s->names.push_back(expect(T::Ident, "a constant name").text);
-    if (accept(T::Colon)) s->type = expect(T::Ident, "a type name").text;
-    if (accept(T::Assign)) s->initExpr = parseExpr();
-    else if (requireInit) error("a constant requires an initial value");
-    return s;
+    StmtP first;
+    for (;;) {                               // `const a = 1, b = 2`
+        StmtP s = std::make_shared<Stmt>(); s->kind = kind; s->line = cur().line;
+        s->isConst = true;
+        s->names.push_back(expect(T::Ident, "a constant name").text);
+        if (accept(T::Colon)) { s->type = expect(T::Ident, "a type name").text; s->typeDims = parseDims(); }
+        if (accept(T::Assign)) s->initExpr = parseExpr();
+        else if (requireInit) error("a constant requires an initial value");
+        if (!first) first = s;
+        else pendingStmts_.push_back(s);
+        if (!accept(T::Comma)) break;
+        skipNL();
+    }
+    return first;
 }
 
 // A `use`d module contributes its statements to the current program; remember where they came
@@ -897,8 +931,19 @@ StmtP Parser::parseUse() {
     std::string spec;
     if (check(T::Str)) { spec = cur().text; p_++; }
     else {
-        spec = expect(T::Ident, "a module name").text;
-        while (accept(T::Dot)) spec += "." + expect(T::Ident, "a module name").text;
+        // `use name`, `use a.b.c`, `use sub/dir/name`, `use ./rel/name.mod` - a module spec is a
+        // path made of identifiers separated by `.` or `/`, with an optional `.mod` suffix
+        if (check(T::Dot)) { spec = "."; p_++; }                 // leading `./`
+        spec += expect(T::Ident, "a module name").text;
+        while (check(T::Dot) || check(T::Slash)) {
+            bool dot = check(T::Dot);
+            size_t save = p_;
+            p_++;
+            if (!check(T::Ident)) { p_ = save; break; }          // not part of the path
+            if (dot && cur().text == "mod") { spec += ".mod"; p_++; break; }
+            spec += (dot ? "." : "/") + cur().text;
+            p_++;
+        }
     }
     StmtP s = std::make_shared<Stmt>(); s->kind = SK::Use; s->line = line; s->module = spec;
     if (loader_ && reg_ && !reg_->loaded.count(spec)) {
@@ -913,6 +958,10 @@ StmtP Parser::parseUse() {
             b->stmts = mp.stmts;
             b->line = line;
             s->body = b;
+        } else if (!isBuiltinModule(spec)) {
+            // a missing module used to be a silent no-op, which turned into confusing
+            // "undefined variable" errors much later - say it right here instead
+            error("cannot find module '" + spec + "'" + (loader_ ? loader_->searchHint(spec) : ""));
         }
     }
     return s;
@@ -953,6 +1002,20 @@ StmtP Parser::parseView() {
     return parseClassDef(nm, ps, true, false);
 }
 
+// `T[10]`, `T[]`, `T[10][10]` after a type name; a null entry means an open dimension
+std::vector<ExprP> Parser::parseDims() {
+    std::vector<ExprP> dims;
+    while (check(T::LBracket)) {
+        p_++;
+        skipNL();
+        if (check(T::RBracket)) { dims.push_back(nullptr); p_++; continue; }
+        dims.push_back(parseExpr());
+        skipNL();
+        expect(T::RBracket, "']' after an array dimension");
+    }
+    return dims;
+}
+
 std::vector<Param> Parser::parseParams() {
     std::vector<Param> ps;
     expect(T::LParen, "'(' starting a parameter list");
@@ -967,6 +1030,7 @@ std::vector<Param> Parser::parseParams() {
         if (accept(T::Colon)) {
             if (check(T::Ident)) p.type = cur().text, p_++;
             else if (check(T::LParen)) { p_++; p.type = expect(T::Ident, "a type name").text; expect(T::RParen); }
+            p.typeDims = parseDims();
         }
         if (accept(T::Assign)) p.def = parseExpr();
         if (p.vararg && p.def) error("a variadic parameter cannot have a default value");
@@ -1033,6 +1097,7 @@ BlockP Parser::parseBlock(Ctx ctx, bool ui) {
         std::vector<StmtP> ss = statement(ctx);
         for (auto& s : ss) b->stmts.push_back(s);
         if (check(T::RParen) || atEnd()) break;
+        if (check(T::Comma)) { p_++; skipNL(); continue; }   // `a = 1, b = 2` inside a block
         expectStmtEnd();
         skipNL();
     }
@@ -1387,7 +1452,15 @@ ExprP Parser::parsePrimary() {
     if (tryMacro()) return parsePostfix();
 
     switch (cur().type) {
-        case T::Int:   { int64_t v = cur().ival; p_++; ExprP e = mkExpr(EK::Int, line); e->ival = v; return e; }
+        case T::Int:   {
+            int64_t v = cur().ival;
+            std::string big = cur().text;          // set by the lexer when the literal needs 128 bits
+            p_++;
+            ExprP e = mkExpr(EK::Int, line);
+            e->ival = v;
+            if (!big.empty()) { e->wideLiteral = true; e->sval = big; }
+            return e;
+        }
         case T::Float: { double v = cur().fval; p_++; ExprP e = mkExpr(EK::Float, line); e->fval = v; return e; }
         case T::Str:   { std::string v = cur().text; p_++; ExprP e = mkExpr(EK::Str, line); e->sval = v; return e; }
         case T::Char:  { std::string v = cur().text; p_++; ExprP e = mkExpr(EK::Str, line); e->sval = v; return e; }

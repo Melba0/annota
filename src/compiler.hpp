@@ -29,6 +29,8 @@ private:
         int slot = 0;
         int depth = 0;
         bool isConst = false;
+        std::string type;                    // declared type name ("" when untyped)
+        std::vector<int64_t> fixedDims;      // declared `T[n][m]` shape, when all sizes are known
         bool captured = false;
     };
     struct LoopCtx {
@@ -121,7 +123,12 @@ private:
                                            const BlockP& body, bool isMethod,
                                            const std::shared_ptr<ClassInfo>& cls,
                                            const std::vector<Annotation>& anns);
+    bool stmtUnsafe_ = false;      // the statement being compiled carries [[unsafe]]
     Value makeDefault(const std::string& type);
+    void emitNewArray(const StmtP& s);
+    void optimizeChunk(const std::shared_ptr<Chunk>& ch);   // [[jit]]: fold + fuse this function
+    void noteLocalShape(const std::string& name, const std::string& type,
+                        const std::vector<ExprP>& dims);
     bool hasAnn(const std::vector<Annotation>& anns, const char* name) const;
     const Annotation* findAnn(const std::vector<Annotation>& anns, const char* name) const;
     Value constEval(const ExprP& e, bool& ok);

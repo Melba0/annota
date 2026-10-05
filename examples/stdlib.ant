@@ -1,64 +1,133 @@
--[ 标准库导览：use std 一次载入全部模块 ]-
+-[ stdlib.ant : 标准库导览（序列 / 哈希容器 / 文本 / 数论 / 矩阵 / 统计 / 图 / 时间） ]-
+-[ 每个模块都会在 examples/ 里有一个专门的示例文件，这个文件给出整体印象。 ]-
 
-use std
+use test
+use time
+use seq
+use dict
+use text
+use numeric
+use matrix
+use stats
+use graph
 
-—分段 序列 Seq
+-- ================================================================ Seq：序列算法
+Test.suite("Seq")
+new xs = [5, 1, 4, 2, 8, 4]
+Test.eq(Seq.sort(xs), [1, 2, 4, 4, 5, 8], "排序（归并，稳定）")
+Test.eq(Seq.median(xs), 4, "中位数（快速选择）")
+Test.eq(Seq.unique(xs), [5, 1, 4, 2, 8], "去重（保序）")
+Test.eq(Seq.take(xs, 2), [5, 1], "取前两个")
+Test.eq(Seq.chunk(xs, 2), [[5, 1], [4, 2], [8, 4]], "分块")
+Test.eq(Seq.window([1, 2, 3, 4], 3), [[1, 2, 3], [2, 3, 4]], "滑动窗口")
+Test.eq(Seq.frequencies([1, 1, 2, 3, 3, 3]), [(1, 2), (2, 1), (3, 3)], "频次表")
+Test.eq(Seq.mean([1, 2, 3, 4]), 2.5, "均值")
+Test.eq(Seq.stddev([2, 4, 4, 4, 5, 5, 7, 9]), 2.0, "总体标准差")
+Test.eq(Seq.zip_with([1, 2, 3], [10, 20, 30], (a, b)( =a + b)), [11, 22, 33], "逐元素合并")
+Test.eq(Seq.partition([1, 2, 3, 4, 5], (x)( =x % 2 == 0)), ([2, 4], [1, 3, 5]), "按条件分组")
+Test.eq(Seq.flatten([[1, 2], [3], [4, 5]]), [1, 2, 3, 4, 5], "展平")
+Test.eq(Seq.transpose([[1, 2, 3], [4, 5, 6]]), [[1, 4], [2, 5], [3, 6]], "转置")
+Test.eq(Seq.scan([1, 2, 3], (acc, x)( =acc + x), 0), [0, 1, 3, 6], "前缀扫描")
+Test.eq(Seq.rotate([1, 2, 3, 4, 5], 2), [3, 4, 5, 1, 2], "旋转")
+Test.eq(Seq.intersect([1, 2, 3], [2, 3, 4]), [2, 3], "交集")
+Test.eq(Seq.is_subset([1, 2], [1, 2, 3]), true, "子集判定")
 
-print Seq.map([1, 2, 3, 4], (x)( =x * x ))
-print Seq.filter([1, 2, 3, 4, 5], (x)( =x % 2 == 1 ))
-print Seq.reduce([1, 2, 3, 4], (a, b)( =a + b ), 0)
-print Seq.sort([5, 3, 8, 1]), Seq.sort(["pear", "apple"], reverse=true)
-print Seq.unique([1, 2, 2, 3, 1]), Seq.flatten([[1], [2, 3]])
-print Seq.take([1, 2, 3, 4], 2), Seq.drop([1, 2, 3, 4], 2)
-print Seq.chunk([1, 2, 3, 4, 5], 2)
-print Seq.min_of([4, 2, 9]), Seq.max_of([4, 2, 9]), Seq.sum_of([1, 2, 3])
-print Seq.any([1, 2, 3], (x)( =x > 2 )), Seq.all([1, 2, 3], (x)( =x > 0 ))
-print Seq.join(["a", "b", "c"], " / ")
+-- Heap：优先队列
+new heap = Heap.from_list([5, 3, 8, 1])
+Test.eq(heap.pop(), 1, "堆顶最小")
+heap.push(0)
+Test.eq(heap.drain(), [0, 3, 5, 8], "依次弹出得到有序序列")
 
-—分段 字符串 Str
-
-print Str.format("{} has {} items", "cart", 3)
-print Str.pad_left("42", 6, "0"), "[" + Str.center("hi", 8, "*") + "]"
-print Str.capitalize("hELLO"), Str.title("the quick fox"), Str.reverse("abc")
-print Str.repeat("-", 10), Str.count("mississippi", "ss"), Str.hex(48879)
-print Str.lines("  one  " + chr(10) + "two"), Str.is_digit("2024")
-
-—分段 字典 Dict
-
+-- ================================================================ 哈希容器
+Test.suite("Dict / Set / Counter")
 new scores = Dict()
 scores.set("alice", 91)
 scores.set("bob", 78)
 scores.set("carol", 85)
-print scores, len(scores)
-print scores.get("alice"), scores.get("dave", 0)
-print scores.has("bob"), scores.keys_sorted()
-for (name, score) in scores.items()(
-    if score >= 85(
-        print "  " + name + " passed with " + score
-    )
-)
+Test.eq(len(scores), 3, "字典长度")
+Test.eq(scores.get("bob"), 78, "取值")
+Test.eq(scores.get("dave", 0), 0, "默认值")
+Test.eq(scores.keys_sorted(), ["alice", "bob", "carol"], "键排序")
+Test.eq(scores.items_sorted()[0], ("alice", 91), "有序键值对")
+scores.remove("bob")
+Test.eq(scores.has("bob"), false, "删除")
 
-—分段 数学 Mathx
+new words = Set(["a", "b", "a"])
+Test.eq(words.items(), ["a", "b"], "集合去重 + 排序")
+Test.eq(words.has("b"), true, "成员判定")
 
-print Mathx.gcd(1071, 462), Mathx.lcm(21, 6), Mathx.factorial(10)
-print Mathx.primes(40)
-print Mathx.is_prime(9973), Mathx.digit_sum(98765)
-print Mathx.clamp(120, 0, 100), Mathx.round_to(3.14159, 3)
-print Mathx.mean([2, 4, 6, 8]), Mathx.median([7, 1, 5, 3]), Mathx.stddev([2, 4, 4, 4, 5, 5, 7, 9])
+new counts = Counter("abracadabra")
+Test.eq(counts.most_common(2), [("a", 5), ("b", 2)], "计数表最高频")
+Test.eq(counts.total(), 11, "总数")
 
-—分段 切片 slice
+-- ================================================================ 文本
+Test.suite("Text")
+Test.eq(Text.words("  one two   three "), ["one", "two", "three"], "切词")
+Test.eq(Text.snake_case("HelloWorld"), "hello_world", "snake_case")
+Test.eq(Text.camel_case("hello_world"), "helloWorld", "camel_case")
+Test.eq(Text.levenshtein("flaw", "lawn"), 2, "编辑距离")
+Test.eq(Text.find_kmp("the needle in the haystack", "needle"), 4, "KMP 查找")
+Test.eq(Text.is_anagram("elbow", "below"), true, "变位词")
+Test.eq(Text.pad_left("7", 3, "0"), "007", "左填充")
+Test.eq(Text.reverse("abc"), "cba", "反转")
+Test.eq(Text.csv_format(["a", "b,c"]), "a,\"b,c\"", "CSV 生成")
+Test.eq(Text.hex_dump("Hi"), "48 69", "十六进制转储")
 
-new data = [10, 20, 30, 40, 50, 60]
-new middle = data[1:4]
-print middle, middle.size(), middle.get(0), middle.to_list()
-print data[4:].to_list(), data[:2].to_list(), data[:].size()
+-- ================================================================ 数论
+Test.suite("Num")
+Test.eq(Num.is_prime(9973), true, "素数判定")
+Test.eq(Num.sieve(30), [2, 3, 5, 7, 11, 13, 17, 19, 23, 29], "筛法")
+Test.eq(Num.divisor_sum(28), 56, "约数和")
+Test.eq(Num.is_perfect(28), true, "完全数")
+Test.eq(Num.digital_root(9875), 2, "数根")
+Test.eq(Num.collatz_path(6), [6, 3, 10, 5, 16, 8, 4, 2, 1], "考拉兹路径")
+Test.eq(Num.parse_base("ff", 16), 255, "进制解析")
+Test.eq(Num.triangular(10), 55, "三角数")
 
-—分段 断言 Test
+-- ================================================================ 矩阵
+Test.suite("Matrix")
+new m = Matrix.from_lists([[2, 0], [0, 3]])
+Test.eq(m.det(), 6.0, "对角矩阵行列式")
+Test.eq(m.pow(2).to_lists(), [[4, 0], [0, 9]], "矩阵幂")
+Test.eq(m.mul_list([1, 1]), [2, 3], "矩阵乘向量")
+Test.eq(Matrix.identity(2).add(m).to_lists(), [[3, 0], [0, 4]], "矩阵加法")
 
-Test.suite("stdlib 导览")
-Test.eq(Seq.sum_of([1, 2, 3]), 6, "sum_of")
-Test.eq(Str.format("{}-{}", "a", "b"), "a-b", "format")
-Test.eq(Mathx.gcd(12, 18), 6, "gcd")
-Test.eq(scores.get("alice"), 91, "dict get")
-Test.near(Mathx.mean([1, 2, 3]), 2.0, 0.000001, "mean")
+-- ================================================================ 统计
+Test.suite("Stats")
+new sample = [2, 4, 4, 4, 5, 5, 7, 9]
+Test.eq(Stats.mean(sample), 5.0, "均值")
+Test.eq(Stats.median(sample), 4.5, "中位数")
+Test.eq(Stats.mode(sample), 4, "众数")
+Test.eq(Stats.percentile(sample, 25), 4, "25% 分位")
+Test.eq(Stats.correlation([1, 2, 3], [3, 6, 9]) > 0.9999, true, "完全正相关")
+Test.eq(Stats.histogram([1, 2, 3, 4], 2)[2], [2, 2], "直方图")
+Test.eq(Stats.rank([30, 10, 20]), [3.0, 1.0, 2.0], "秩")
+new summary = Stats.summary(sample)
+Test.eq(summary.get("count"), 8, "摘要计数")
+Test.eq(summary.get("median"), 4.5, "摘要中位数")
+
+-- ================================================================ 图
+Test.suite("Graph")
+new g = Graph()
+g.add_edge(1, 2)
+g.add_edge(2, 3)
+g.add_edge(1, 3)
+Test.eq(g.bfs(1), [1, 2, 3], "BFS")
+Test.eq(g.degree(1), 2, "度数")
+Test.eq(g.has_cycle(), true, "无向环检测")
+new dg = Graph(true)
+dg.add_edge("a", "b")
+dg.add_edge("b", "c")
+Test.eq(dg.topological_sort(), ["a", "b", "c"], "拓扑排序")
+
+-- ================================================================ 时间
+Test.suite("Time")
+new sw = Stopwatch()
+sw.lap()
+Test.eq(sw.elapsed() >= 0, true, "计时器非负")
+Test.eq(len(Time.describe_ms(1234)) > 0, true, "耗时描述")
+Test.eq(Time.leap(2024), true, "闰年")
+Test.eq(Time.days_in_month(2023, 2), 28, "二月天数")
+Test.eq(Time.diff_seconds(5000, 2000), 3, "秒差")
+
 Test.check()

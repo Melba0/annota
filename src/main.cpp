@@ -13,6 +13,7 @@
 //     --gui-shot <path>    render the view to a PNG without opening a window
 //     --gui-tree           print the view tree as text
 #include "parser.hpp"
+#include "module_loader.hpp"
 #include "compiler.hpp"
 #include "vm.hpp"
 #include "builtins.hpp"
@@ -20,6 +21,9 @@
 #include "repl.hpp"
 #include "commands.hpp"
 #include "analyzer.hpp"
+#include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -66,44 +70,6 @@ static void printSourceError(const std::string& file, int line, const std::strin
 }
 
 // ---------------------------------------------------------------- module loader
-struct FileModuleLoader : ModuleLoader {
-    std::vector<std::string> searchDirs;
-
-    explicit FileModuleLoader(std::string dir) {
-        searchDirs.push_back(dir);
-        searchDirs.push_back(dir + "/lib");
-        searchDirs.push_back("lib");
-        searchDirs.push_back(".");
-    }
-
-    // keep the directory a module was loaded from, so that modules can `use` their siblings
-    void remember(const std::string& file) {
-        std::string d = dirOf(file);
-        for (auto& s : searchDirs) if (s == d) return;
-        searchDirs.insert(searchDirs.begin(), d);
-    }
-
-    bool loadModule(const std::string& spec, std::vector<Token>& toks, std::string& file) override {
-        std::vector<std::string> candidates;
-        bool looksLikePath = spec.find('/') != std::string::npos || spec.find('\\') != std::string::npos ||
-                             spec.find(".mod") != std::string::npos;
-        if (looksLikePath) {
-            candidates.push_back(spec);
-            for (auto& d : searchDirs) candidates.push_back(d + "/" + spec);
-        } else {
-            for (auto& d : searchDirs) candidates.push_back(d + "/" + spec + ".mod");
-            candidates.push_back(spec + ".mod");
-        }
-        for (auto& c : candidates) {
-            if (!fileExists(c)) continue;
-            file = c;
-            toks = lex(readFile(c), c);
-            remember(c);
-            return true;
-        }
-        return false;   // not a file module - maybe a native one
-    }
-};
 
 // ---------------------------------------------------------------- disassembler
 static void disassemble(const std::shared_ptr<Chunk>& ch, int depth);
@@ -118,15 +84,22 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
         uint8_t op = ch->code[i++];
         std::string extra;
         int line = (int)ch->lines.size() > (int)at ? ch->lines[at] : 0;
-        auto u16 = [&]() { uint16_t v = (uint16_t)((ch->code[i] << 8) | ch->code[i + 1]); i += 2; return v; };
-        auto s16 = [&]() { int16_t v = (int16_t)((ch->code[i] << 8) | ch->code[i + 1]); i += 2; return v; };
-        auto u8 = [&]() { return ch->code[i++]; };
+        // operand readers are bounds checked: a malformed chunk must print, not crash
+        auto constAt = [&](size_t k) -> const Value& {
+            static Value nullv;
+            if (k >= ch->consts.size()) return nullv;
+            return *(ch->consts.begin() + (long)k);
+        };
+        auto byteAt = [&](size_t k) -> uint8_t { return k < ch->code.size() ? ch->code[k] : 0; };
+        auto u16 = [&]() { uint16_t v = (uint16_t)((byteAt(i) << 8) | byteAt(i + 1)); i += 2; return v; };
+        auto s16 = [&]() { int16_t v = (int16_t)((byteAt(i) << 8) | byteAt(i + 1)); i += 2; return v; };
+        auto u8 = [&]() { return byteAt(i++); };
         switch (op) {
-            case OP_CONST: { uint16_t k = u16(); const Value& v = ch->consts[k]; extra = formatInt(k) + " (" + (v.t == VT::Str ? "\"" + v.o->str + "\"" : std::string(v.typeName())) + ")"; break; }
+            case OP_CONST: { uint16_t k = u16(); const Value& v = constAt(k); extra = formatInt(k) + " (" + (v.t == VT::Str ? "\"" + v.o->str + "\"" : std::string(v.typeName())) + ")"; break; }
             case OP_GET_GLOBAL: case OP_SET_GLOBAL: case OP_DEF_GLOBAL: case OP_DEL_GLOBAL:
-            case OP_GET_FIELD: case OP_SET_FIELD: { uint16_t k = u16(); extra = ch->consts[k].o ? ch->consts[k].o->str : "?"; break; }
-            case OP_GET_SUPER: { uint16_t k = u16(); uint16_t c = u16(); extra = ch->consts[k].o->str + " of class#" + formatInt(c); break; }
-            case OP_CLASS: case OP_SUPER_INIT: case OP_CLOSURE: { uint16_t k = u16(); extra = "#" + formatInt(k) + " " + (ch->consts[k].o && ch->consts[k].o->klass ? ch->consts[k].o->klass->name : (ch->consts[k].o ? ch->consts[k].o->str : "")); break; }
+            case OP_GET_FIELD: case OP_SET_FIELD: { uint16_t k = u16(); extra = constAt(k).o ? constAt(k).o->str : "?"; break; }
+            case OP_GET_SUPER: { uint16_t k = u16(); uint16_t c = u16(); extra = constAt(k).o->str + " of class#" + formatInt(c); break; }
+            case OP_CLASS: case OP_SUPER_INIT: case OP_CLOSURE: { uint16_t k = u16(); extra = "#" + formatInt(k) + " " + (constAt(k).o && constAt(k).o->klass ? constAt(k).o->klass->name : (constAt(k).o ? constAt(k).o->str : "")); break; }
             case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_FALSE_KEEP: case OP_JUMP_IF_TRUE_KEEP:
             case OP_LOOP: case OP_TRY: case OP_ITER_NEXT: { int16_t j = s16(); extra = "-> " + formatInt((int64_t)i + j); break; }
             case OP_JUMP_IF_PROVIDED: { uint8_t p = u8(); int16_t j = s16(); extra = "param " + formatInt(p) + " -> " + formatInt((int64_t)i + j); break; }
@@ -137,7 +110,21 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
             case OP_ITER_BIND2: { uint8_t a = u8(); uint8_t b = u8(); extra = formatInt(a) + ", " + formatInt(b); break; }
             case OP_PRINT: { uint8_t n = u8(); uint8_t s = u8(); extra = formatInt(n) + (s ? " with sep" : ""); break; }
             case OP_INT1: { int8_t v = (int8_t)u8(); extra = formatInt(v); break; }
-            case OP_ASSERT: { uint16_t k = u16(); extra = "\"" + ch->consts[k].o->str + "\""; break; }
+            case OP_NOP: break;
+            case OP_LOCAL_ADD_IMM: case OP_LOCAL_SUB_IMM: {
+                uint8_t s = u8();
+                int8_t v = (int8_t)u8();
+                extra = "slot " + formatInt(s) + (op == OP_LOCAL_ADD_IMM ? " += " : " -= ") +
+                        formatInt(v);
+                break;
+            }
+            case OP_LOCAL_ADD_LOCAL: {
+                uint8_t a = u8();
+                uint8_t b = u8();
+                extra = "slot " + formatInt(a) + " += slot " + formatInt(b);
+                break;
+            }
+            case OP_ASSERT: { uint16_t k = u16(); extra = "\"" + constAt(k).o->str + "\""; break; }
             default: break;
         }
         std::printf("%s%5d  %5d  %-18s %s\n", pad.c_str(), (int)at, line, opName(op), extra.c_str());

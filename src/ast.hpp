@@ -29,6 +29,7 @@ struct Param {
     std::string type;
     ExprP def;          // optional default
     bool vararg = false;
+    std::vector<ExprP> typeDims;   // `T[n][m]`, `[]` -> null entry
 };
 
 // one `[[name: a, k=v]]` annotation; arguments kept as raw text and, when possible, as expressions
@@ -71,6 +72,7 @@ struct Expr {
     int line = 0;
     // literals
     int64_t ival = 0;
+    bool wideLiteral = false;   // the literal only fits in 128 bits
     double fval = 0.0;
     bool bval = false;
     std::string sval;
@@ -121,7 +123,8 @@ struct Stmt {
     std::vector<std::string> names;     // new / destructuring / class params
     std::vector<std::string> types;     // parallel type annotations
     std::string name;                   // single name
-    std::string type;                   // single type
+    std::string type;
+    std::vector<ExprP> typeDims;   // `T[n][m]`                   // single type
     std::string module;                 // use
     bool isConst = false;
     bool isStatic = false;

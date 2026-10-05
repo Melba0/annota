@@ -87,13 +87,13 @@ Mathx()=(
     [[static]]
     round_to(x, digits)(
         new f = 10 ** digits
-        =math.round(x * f) / f
+        =float(math.round(x * f)) / float(f)      -- 显式浮点除法（int/int 现在向零截断）
     )
 
     [[static]]
     mean(xs)(
         if len(xs) == 0( =null )
-        =sum(xs) / len(xs)
+        =float(sum(xs)) / float(len(xs))
     )
 
     [[static]]
@@ -104,7 +104,7 @@ Mathx()=(
         if n % 2 == 1(
             =s[math.floor((n - 1) / 2)]
         )
-        =(s[n / 2 - 1] + s[n / 2]) / 2
+        =float(s[n / 2 - 1] + s[n / 2]) / 2.0
     )
 
     [[static]]
@@ -114,7 +114,7 @@ Mathx()=(
         for x in xs(
             acc = acc + (x - m) * (x - m)
         )
-        =acc / len(xs)
+        =float(acc) / float(len(xs))
     )
 
     [[static]]
