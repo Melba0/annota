@@ -1,4 +1,4 @@
-﻿// Annota - parser.hpp
+// Annota - parser.hpp
 #pragma once
 #include "ast.hpp"
 #include <set>
@@ -87,6 +87,8 @@ private:
     void stmtList(Ctx ctx, std::vector<StmtP>& out, T terminator);
     std::vector<StmtP> statement(Ctx ctx);
     StmtP statementCore(Ctx ctx);
+    // extra statements produced by one source line (`new a = 1, b = 2`), drained by statement()
+    std::vector<StmtP> pendingStmts_;
     void describeAndRecord(const std::vector<Annotation>& anns, const StmtP& s);
     Annotation parseAnnotation();
     std::vector<Annotation> parseAnnotations(bool& any);

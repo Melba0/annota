@@ -269,7 +269,7 @@ void stmtUseDef(const Stmt* s, std::set<std::string>& use, std::set<std::string>
         case SK::Print: for (auto& a : s->args) collectUse(a, use); collectUse(s->sep, use); return;
         case SK::Input: if (s->target && s->target->kind == EK::Ident) def.insert(s->target->name);
                         collectDef(s->target, def); return;
-        case SK::Del: def.insert(s->name); return;
+        case SK::Del: for (auto& n : s->names) def.insert(n); return;
         case SK::If: collectUse(s->cond, use); break;
         case SK::While: collectUse(s->cond, use); break;
         case SK::For: collectUse(s->iterable, use); for (auto& v : s->loopVars) def.insert(v); break;
@@ -322,7 +322,7 @@ void stmtDirectUseDef(const Stmt* s, std::set<std::string>& use, std::set<std::s
             if (s->target && s->target->kind == EK::Ident) def.insert(s->target->name);
             collectDef(s->target, def);
             return;
-        case SK::Del: def.insert(s->name); return;
+        case SK::Del: for (auto& n : s->names) def.insert(n); return;
         case SK::If: collectUse(s->cond, use); return;
         case SK::While: collectUse(s->cond, use); return;
         case SK::For:
@@ -1626,8 +1626,10 @@ void Flow::stmt(const StmtP& s, Env& env) {
             break;
         }
         case SK::Del: {
-            AbsVal* v = env.find(s->name);
-            if (v) { v->init = AbsVal::NotInit; }
+            for (auto& n : s->names) {
+                AbsVal* v = env.find(n);
+                if (v) v->init = AbsVal::NotInit;
+            }
             break;
         }
         case SK::If: {
@@ -2211,6 +2213,9 @@ void Flow::analyzeFunc(FuncInfo* f) {
         size_t errBefore = res_.diagnostics.size();
         block(f->def->body, env, false);
         // unused parameters and function level locals
+        // (`__init__` has no parameters of its own: its real inputs are the class constructor
+        //  parameters, which live in the constructor chunk and are checked there)
+        const bool skipParamUse = f->def->name == "__init__";
         for (auto& sc : env.scopes) {
             for (auto& kv : sc.vars) {
                 if (kv.second.read || kv.first == "this" || kv.first.empty() || kv.first[0] == '_') continue;
@@ -2219,6 +2224,14 @@ void Flow::analyzeFunc(FuncInfo* f) {
                 bool param = dl == 0;
                 if (param) dl = f->def->line;
                 else if (!kv.second.isLocal) continue;
+                // `__init__` has no parameters of its own; the class parameters are seeded into
+                // every method, and they are used by the constructor body or by `__init__`, so a
+                // method that does not touch them must not be reported.
+                if (param) {
+                    if (skipParamUse) continue;
+                    auto cf = classFields_.find(f->cls);
+                    if (!f->cls.empty() && cf != classFields_.end() && cf->second.count(nm)) continue;
+                }
                 withSuppression(dl, [&] {
                     col_.info("unused-variable", dl,
                               param ? ("参数 '" + nm + "' 从未被使用")

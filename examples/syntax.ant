@@ -1,0 +1,128 @@
+-[ syntax.ant : 语法糖导览 ]-
+-[ 覆盖：多条声明 / 同行多条语句 / 续行 / 裸表达式 / del / 可变参数 / __init__ / 切片 ]-
+
+use std
+
+Test.suite("语法")
+
+-- ---------------------------------------------------------------- 声明与赋值
+new a, b
+a = 1, b = 2
+Test.eq(a + b, 3, "new a, b 一次声明两个，随后分别赋值")
+
+new x = 1, y = 2, z = 3
+Test.eq(x + y + z, 6, "new x = 1, y = 2, z = 3 同行多声明")
+
+x = 10, y = 20
+Test.eq(x + y, 30, "同行多条赋值语句")
+
+-- ---------------------------------------------------------------- 续行
+new total = 1 +
+            2 +
+            3
+Test.eq(total, 6, "行尾运算符自动续行")
+
+new joined = "a" +
+             "b"
+Test.eq(joined, "ab", "字符串也可以续行")
+
+new slashed = 1 + \
+              2
+Test.eq(slashed, 3, "反斜杠显式续行")
+
+-- ---------------------------------------------------------------- 裸表达式
+new noise = "x"
+noise + "y"
+Test.eq(noise, "x", "裸表达式语句不会改变变量")
+
+-- ---------------------------------------------------------------- del
+new doomed = 1, survivor = 2
+del doomed
+Test.eq(survivor, 2, "del 不影响其他变量")
+
+new p = 1, q = 2
+del p, q
+Test.eq(true, true, "del p, q 一次删除多个")
+
+-- ---------------------------------------------------------------- 可变参数
+sum_all(*nums)(
+    new s = 0
+    for n in nums( s = s + n )
+    =s
+)
+Test.eq(sum_all(), 0, "变长参数可以为空")
+Test.eq(sum_all(1), 1, "一个参数")
+Test.eq(sum_all(1, 2, 3, 4), 10, "多个参数")
+
+join_with(sep, *parts)(
+    new out = ""
+    for p in parts(
+        if out != ""( out = out + sep )
+        out = out + p
+    )
+    =out
+)
+Test.eq(join_with(",", "a", "b", "c"), "a,b,c", "定长 + 变长参数")
+Test.eq(join_with(","), "", "只有定长参数")
+
+legacy(...rest) = len(rest)
+Test.eq(legacy(1, 2, 3), 3, "...rest 与 *rest 等价")
+
+describe(*xs) = typeof(xs) + ":" + str(len(xs))
+Test.eq(describe("a", "b"), "List:2", "变长参数是普通 List")
+
+-- ---------------------------------------------------------------- __init__
+Point(x, y)=(
+    X:int
+    Y:int
+
+    __init__()(
+        X = x
+        Y = y
+    )
+
+    norm2() = X * X + Y * Y
+    __str__() = "Point(" + str(X) + ", " + str(Y) + ")"
+)
+
+new pt = Point(3, 4)
+Test.eq(pt.X, 3, "__init__ 里能读到构造参数")
+Test.eq(pt.Y, 4, "第二个字段")
+Test.eq(pt.norm2(), 25, "方法读到 __init__ 写入的字段")
+Test.eq(str(pt), "Point(3, 4)", "__str__")
+
+Counter(start = 0)=(
+    n:int
+    tag = "c"
+
+    __init__()(
+        n = start
+    )
+
+    bump(step = 1)(
+        n = n + step
+        =n
+    )
+)
+
+new c = Counter(5)
+Test.eq(c.bump(), 6, "__init__ 覆盖字段默认值")
+Test.eq(c.bump(4), 10, "带默认参数的方法")
+
+-- ---------------------------------------------------------------- 切片
+use slice
+
+new arr = [10, 20, 30, 40, 50]
+Test.eq(arr[1:3].to_list(), [20, 30], "列表切片")
+Test.eq(len(arr[2:]), 3, "省略起点")
+Test.eq(len(arr[:2]), 2, "省略终点")
+Test.eq(len(arr[:]), 5, "全切片")
+
+new text = "abcdefg"
+Test.eq(text[2:5], "cde", "字符串切片返回字符串")
+Test.eq(typeof(text[1:3]), "String", "字符串切片类型")
+Test.eq(text[5:], "fg", "字符串省略起点")
+Test.eq(text[:3], "abc", "字符串省略终点")
+Test.eq(text[:], "abcdefg", "字符串全切片")
+
+Test.check()

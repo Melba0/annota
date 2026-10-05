@@ -313,7 +313,11 @@ bool Parser::looksLikeParamList(size_t a, size_t b) const {
     if (b <= a) return true;
     size_t i = a;
     while (i < b) {
-        if (at(i).type == T::Ellipsis) { i++; if (i >= b || at(i).type != T::Ident) return false; i++; }
+        if (at(i).type == T::Ellipsis || at(i).type == T::Star || at(i).type == T::StarStar) {
+            i++;
+            if (i >= b || at(i).type != T::Ident) return false;
+            i++;
+        }
         else if (at(i).type == T::Ident) { i++; }
         else return false;
         if (i < b && at(i).type == T::Colon) {
@@ -428,6 +432,7 @@ void Parser::stmtList(Ctx ctx, std::vector<StmtP>& out, T terminator) {
         std::vector<StmtP> ss = statement(ctx);
         for (auto& s : ss) out.push_back(s);
         if (check(terminator) || atEnd()) break;
+        if (check(T::Comma)) { p_++; skipNL(); continue; }   // `a = 1, b = 2` on one line
         expectStmtEnd();
         skipNL();
     }
@@ -571,6 +576,9 @@ std::vector<StmtP> Parser::statement(Ctx ctx) {
             describeAndRecord(anns, s);
         }
         out.push_back(s);
+        // statements produced by one source line, e.g. `new a = 1, b = 2`
+        for (auto& extra : pendingStmts_) out.push_back(extra);
+        pendingStmts_.clear();
     }
     return out;
 }
@@ -598,7 +606,12 @@ StmtP Parser::statementCore(Ctx ctx) {
         case T::Kw_del: {
             p_++;
             StmtP s = std::make_shared<Stmt>(); s->kind = SK::Del; s->line = line;
-            s->name = expect(T::Ident, "a variable name").text;
+            s->names.push_back(expect(T::Ident, "a variable name").text);
+            while (check(T::Comma)) {
+                p_++;
+                skipNL();
+                s->names.push_back(expect(T::Ident, "a variable name").text);
+            }
             return s;
         }
         case T::Kw_throw: {
@@ -828,13 +841,19 @@ StmtP Parser::parseState() {
 StmtP Parser::parseNew() {
     int line = cur().line;
     expect(T::Kw_new);
-    StmtP s = std::make_shared<Stmt>(); s->kind = SK::New; s->line = line;
+    StmtP first;
     if (accept(T::LParen)) {
+        StmtP s = std::make_shared<Stmt>(); s->kind = SK::New; s->line = line;
         s->names.push_back(expect(T::Ident, "a variable name").text);
         while (accept(T::Comma)) s->names.push_back(expect(T::Ident, "a variable name").text);
         expect(T::RParen, "')' after the destructuring pattern");
         if (accept(T::Colon)) s->type = expect(T::Ident, "a type name").text;
-    } else {
+        if (accept(T::Assign)) s->initExpr = parseExpr();
+        return s;
+    }
+    // `new a, b` / `new a = 1, b = 2` : one statement per name
+    for (;;) {
+        StmtP s = std::make_shared<Stmt>(); s->kind = SK::New; s->line = cur().line;
         Token nm = expect(T::Ident, "a variable name");
         s->names.push_back(nm.text);
         if (accept(T::Colon)) {
@@ -842,9 +861,13 @@ StmtP Parser::parseNew() {
             if (check(T::Ident)) s->type = cur().text, p_++;
             else if (check(T::LParen)) { p_++; s->type = expect(T::Ident, "a type name").text; expect(T::RParen); }
         }
+        if (accept(T::Assign)) s->initExpr = parseExpr();
+        if (!first) first = s;
+        else pendingStmts_.push_back(s);
+        if (!accept(T::Comma)) break;     // only a comma joins the next declaration
+        skipNL();
     }
-    if (accept(T::Assign)) s->initExpr = parseExpr();
-    return s;
+    return first;
 }
 
 StmtP Parser::parseSimpleDecl(SK kind, bool requireInit) {
@@ -936,7 +959,10 @@ std::vector<Param> Parser::parseParams() {
     skipNL();
     while (!check(T::RParen)) {
         Param p;
-        if (accept(T::Ellipsis)) p.vararg = true;
+        // `*args` (Python style) or `...args` marks the variadic tail
+        if (check(T::StarStar))
+            error("'**kwargs' is not supported; pass a Dict as a normal parameter instead");
+        if (accept(T::Star) || accept(T::Ellipsis)) p.vararg = true;
         p.name = expect(T::Ident, "a parameter name").text;
         if (accept(T::Colon)) {
             if (check(T::Ident)) p.type = cur().text, p_++;

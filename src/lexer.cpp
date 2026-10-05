@@ -129,8 +129,28 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
     auto err = [&](const std::string& m) -> void {
         throw CompileError(file + ":" + formatInt(line) + ": " + m, line);
     };
+    // A line that ends with a binary operator (or `=` / `.`) continues on the next line, so
+    //     a + b +
+    //     c + d
+    // is one expression.  Ends with a comma are NOT implicit, because `new a, b` is a
+    // statement list.
+    auto continuesLine = [](T t) {
+        switch (t) {
+            case T::Plus: case T::Minus: case T::Star: case T::Slash: case T::Percent:
+            case T::StarStar: case T::Amp: case T::Pipe: case T::Caret: case T::Shl: case T::Shr:
+            case T::Eq: case T::Ne: case T::Lt: case T::Gt: case T::Le: case T::Ge:
+            case T::AndAnd: case T::OrOr: case T::Assign: case T::Dot:
+            case T::PlusA: case T::MinusA: case T::StarA: case T::SlashA: case T::PercentA:
+            case T::StarStarA: case T::AmpA: case T::PipeA: case T::CaretA: case T::ShlA:
+            case T::ShrA: case T::Kw_to: case T::Kw_step:
+                return true;
+            default:
+                return false;
+        }
+    };
     auto newline = [&]() {
         if (!out.empty() && out.back().type == T::Newline) return;   // collapse runs
+        if (!out.empty() && continuesLine(out.back().type)) return;  // implicit continuation
         push(T::Newline, line, col);
     };
 
@@ -145,6 +165,14 @@ std::vector<Token> lex(const std::string& src, const std::string& file) {
         if (c == '\n') { p++; line++; col = 1; atLineStart = true; newline(); continue; }
         if (c == '\r') { p++; col++; continue; }
         if (c == ' ' || c == '\t') { p++; col++; continue; }
+
+        // ---- explicit line continuation: a trailing `\` joins the next line
+        if (c == '\\') {
+            size_t q = p + 1;
+            while (q < n && (src[q] == ' ' || src[q] == '\t' || src[q] == '\r')) q++;
+            if (q < n && src[q] == '\n') { p = q + 1; line++; col = 1; atLineStart = false; continue; }
+            err(std::string("unexpected character '\\'"));
+        }
 
         int tl = line, tc = col;
 

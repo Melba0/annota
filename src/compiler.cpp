@@ -244,14 +244,16 @@ void Compiler::stmt(const StmtP& s) {
         case SK::Assign: stmtAssign(s); return;
         case SK::CompoundAssign: stmtCompound(s); return;
         case SK::Del: {
-            if (constGlobals_.count(s->name) && resolveLocal(fs_, s->name) < 0)
-                error("cannot delete constant '" + s->name + "'", s->line);
-            int slot = resolveLocal(fs_, s->name);
-            if (slot >= 0) { emit(OP_DEL_LOCAL, s->line); emitByte((uint8_t)slot, s->line); return; }
-            int up = resolveUpval(fs_, s->name);
-            if (up >= 0) { emit(OP_GET_UPVAL, s->line); emitByte((uint8_t)up, s->line); return; }
-            emit(OP_DEL_GLOBAL, s->line);
-            emitU16((uint16_t)addString(s->name), s->line);
+            for (auto& nm : s->names) {
+                if (constGlobals_.count(nm) && resolveLocal(fs_, nm) < 0)
+                    error("cannot delete constant '" + nm + "'", s->line);
+                int slot = resolveLocal(fs_, nm);
+                if (slot >= 0) { emit(OP_DEL_LOCAL, s->line); emitByte((uint8_t)slot, s->line); continue; }
+                int up = resolveUpval(fs_, nm);
+                if (up >= 0) { emit(OP_GET_UPVAL, s->line); emitByte((uint8_t)up, s->line); continue; }
+                emit(OP_DEL_GLOBAL, s->line);
+                emitU16((uint16_t)addString(nm), s->line);
+            }
             return;
         }
         case SK::If: stmtIf(s); return;
@@ -658,6 +660,7 @@ void Compiler::stmtClassDef(const StmtP& s) {
 
     std::vector<StmtP> initStmts, uiStmts, staticStmts;
     std::vector<StmtP> methodStmts, staticFns;
+    StmtP initBody;                     // explicit `__init__`, if the class declares one
     // ---- pass 1: classify members and collect the field layout, so that methods know
     //              which bare names refer to fields of the enclosing class
     for (auto& m : s->members) {
@@ -680,6 +683,15 @@ void Compiler::stmtClassDef(const StmtP& s) {
             ci->parentName = m->parentName;
             initStmts.push_back(m);
         } else if (m->kind == SK::FuncDef) {
+            // `__init__()` is the constructor body: it runs first inside the constructor and
+            // sees the class parameters (`tuple(a, b)` -> `a`, `b`) as locals.
+            if (m->name == "__init__" && !hasAnn(m->annotations, "static")) {
+                if (!m->params.empty())
+                    error("'__init__' takes no parameters; declare them on the class instead "
+                          "(e.g. `Name(a, b)=( __init__()( ... ) )`)", m->line);
+                initBody = m;
+                continue;
+            }
             if (hasAnn(m->annotations, "static")) staticFns.push_back(m);
             else methodStmts.push_back(m);
         } else {
@@ -722,10 +734,16 @@ void Compiler::stmtClassDef(const StmtP& s) {
         ci->statics.push_back({m->name, Value::function(ch), true});
     }
 
-    // constructor
+    // constructor: declared field defaults (and the automatic `param -> field` copies) first,
+    // then the explicit `__init__`, so that `__init__` can override them.  `__init__` sees the
+    // class parameters (`tuple(a, b)` -> `a`, `b`) as locals.
     {
+        std::vector<StmtP> ctorStmts;
+        for (auto& st : initStmts) ctorStmts.push_back(st);
+        if (initBody && initBody->body)
+            for (auto& st : initBody->body->stmts) ctorStmts.push_back(st);
         BlockP ib = std::make_shared<Block>();
-        ib->stmts = initStmts;
+        ib->stmts = ctorStmts;
         ib->line = s->line;
         std::shared_ptr<Chunk> ch = compileFunction(s->name, s->params, ib, true, ci, s->annotations);
         ch->fnName = s->name;
