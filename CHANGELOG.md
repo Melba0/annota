@@ -11,6 +11,38 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* **A C++ linking interface (FFI).**  `src/ffi.hpp` lets any C++ translation unit register native
+  functions and whole modules (`ANNOTA_MODULE` / `ANNOTA_FUNCTION`); `use <module>` resolves them
+  and members are ordinary calls, so new native capability no longer requires a language core
+  change.  `native/fast.cpp` is a worked example (numeric kernels, a sieve, callbacks into Annota
+  and a timing helper), `build.ps1` links `native/*.cpp` automatically, and `--plugin <file>` /
+  `ANNOTA_PLUGIN` load the same module as a shared library.  See `docs/ffi.md`.
+* **A machine-code backend for `[[jit]]`.**  Eligible integer functions are translated to x86-64
+  at load time (`src/jit.hpp`), on top of the superinstruction pass; anything that cannot be
+  translated keeps running on the interpreter, so the marker never changes a program's meaning.
+  New fusions: compare-and-branch (`i < n` + jump), compare-and-branch against an immediate, and
+  `a[i] = a[i] + k`.  A `while` loop of 400k iterations went from 69 ms to under 1 ms.
+* **The hot standard-library kernels moved out of the core.**  `sorted`, `nth`, `argsort`,
+  `lower_bound` and `upper_bound` are no longer builtins compiled into the interpreter: they are
+  the native module **`seqnative`** (`native/seq_native.cpp`), registered through the FFI, and
+  `lib/seq.mod` calls it explicitly (`use seqnative`).  `Seq.sort`, `Seq.kth`, `Seq.median`,
+  `Seq.dedup`, `Seq.sort_by`, `Seq.lower_bound`, `Seq.upper_bound` and `Seq.bsearch` are thin
+  wrappers over it; the script implementations stay available under their own names as reference
+  versions and for custom comparators.  Adding another algorithm now means adding a
+  `native/*.cpp` file - `src/builtins.cpp` is untouched.
+* `annota ide docs` gained a **Linked C++ modules (FFI)** section generated from the FFI
+  registry, so the reference manual lists every linked module and member automatically.
+* `examples/ffi.ant` and `examples/jit.ant`, plus `docs/ffi.md` and `docs/jit.md`.
+
+### Changed
+
+* Faster calls: frames reuse pooled local cells (captured cells are detached), parameter
+  presence is a bitmask instead of a vector, immutable values are shared instead of deep-copied
+  per argument, and the empty named-argument map is shared.  A 40k-call loop went from ~1250 ns
+  to ~550 ns per call.
+* Faster dispatch and operand stack: integer operands are combined in place (no temporaries),
+  `pop` moves instead of copying, and branches on the fused comparison opcodes avoid a dispatch.
+
 * **A much larger, faster standard library.**  `seq` gained proper algorithms - stable merge sort,
   heap sort, binary search (`lower_bound` / `upper_bound` / `bsearch`), quickselect
   (`kth` / `median` / `quantile`), merge/insert helpers, set algebra and a binary `Heap` - so the

@@ -1,5 +1,6 @@
 // Annota - builtins.cpp : built-in functions, pseudo methods, GUI components, std modules.
 #include "builtins.hpp"
+#include "ffi.hpp"
 #include "sys_api.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -671,6 +672,9 @@ Value builtinModule(const std::string& name) {
     return Value::null();
 }
 bool isBuiltinModule(const std::string& name) {
+    // native modules come from two places: the ones the core ships, and anything a linked C++
+    // file (or a plugin) registered through the FFI - so `use fast` works without core changes
+    if (ffiHasModule(name) || ffiHasFunction(name)) return true;
     return name == "math" || name == "io" || name == "json" || name == "time" || name == "net" ||
            name == "os" || name == "thread" || name == "system" || name == "slice";
 }
@@ -1117,26 +1121,8 @@ void registerBuiltins(VM& vm) {
     reg("Err", [](VM&, std::vector<Value>& a) { return argAt(a, 0); });
     reg("is_null", [](VM&, std::vector<Value>& a) { return Value::boolean(argAt(a, 0).isNull()); });
 
-    // sequence helpers that are more convenient natively than in lib/
-    reg("sorted", [](VM& v, std::vector<Value>& a) {
-        if (a.empty()) v.throwError("sorted() expects a sequence");
-        std::vector<Value> items = itemsOf(v, a[0]);
-        bool reverse = a.size() > 1 && v.truthy(a[1]);
-        if (auto* nm = namedOf(v)) {
-            auto it = nm->find("reverse");
-            if (it != nm->end()) reverse = v.truthy(it->second);
-        }
-        bool allComparable = true;
-        std::stable_sort(items.begin(), items.end(), [&](const Value& x, const Value& y) {
-            bool ok = false;
-            bool r = asLess(x, y, ok);
-            if (!ok) allComparable = false;
-            return r;
-        });
-        if (!allComparable) v.throwError("sorted(): elements are not comparable");
-        if (reverse) std::reverse(items.begin(), items.end());
-        return Value::list(items);
-    });
+    // (the hot sequence kernels - sorted / nth / argsort / lower_bound / upper_bound -
+    //  live in native/seq_native.cpp and are registered through the FFI)
     reg("sum", [](VM& v, std::vector<Value>& a) {
         std::vector<Value> items = itemsOf(v, argAt(a, 0));
         Value acc = a.size() > 1 ? a[1] : Value::integer(0);
@@ -1202,6 +1188,9 @@ void registerBuiltins(VM& vm) {
     // `system` facade mirrors every namespace, including the ones registered above.
     registerNumericConversions(vm);
     registerSysPrimitives(vm);
+
+    // everything a linked C++ file or a plugin registered (see src/ffi.hpp, docs/ffi.md)
+    ffiInstallAll(vm);
 }
 
 Value builtinFunction(VM& vm, const std::string& name) {

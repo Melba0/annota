@@ -240,6 +240,16 @@ new t = "a"
 📘 **[Syntax reference](docs/syntax.md)** — every statement, operator and literal, plus the
 exact rules for line continuation and `else` placement.
 📘 **[Coding style](docs/style.md)** — how to lay out a file, name things and use annotations.
+📘 **[`[[jit]]`](docs/jit.md)** — what the optimisation marker does: superinstructions plus a
+x86-64 machine-code backend for integer code, with automatic fallback.
+📘 **[Linking C++ (FFI)](docs/ffi.md)** — register native functions and modules from C++, either
+linked into the binary or loaded as a plugin; the way to make the standard library faster
+without touching the language core.
+
+The standard library is layered accordingly: the language core is lexer / parser / compiler / VM,
+`lib/*.mod` is the readable script layer, and the hot kernels live in C++ registered through the
+FFI — `Seq.sort`, `kth`, `median`, `dedup`, `sort_by`, `lower_bound` and `upper_bound` call the
+native `seqnative` module in `native/seq_native.cpp`, which is not part of the core at all.
 *(Both guides are currently written in Chinese.)*
 
 ## Command line
@@ -582,6 +592,50 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 | L1 keystroke | 50 ms | **8 ms** |
 | L2 save | 500 ms | **23 ms** |
 | L3 background | 5 s | **23 ms** |
+
+### Runtime speed vs C++
+
+`examples/perf.ant` is a self-timing benchmark (`annota examples/perf.ant`), and
+`tools/cpp_baseline.cpp` runs the same workloads in C++ (`g++ -O2 tools/cpp_baseline.cpp -o cpp_baseline`).
+On one machine (MinGW-w64 g++ 13.1, `-O2`, one core), comparing **total time per workload**:
+
+| Workload | Annota | C++ | Ratio | % of C++ |
+|---|---|---|---|---|
+| int loop, no `[[jit]]` | 62 ms | 0.085 ms | 729x | 0.14% |
+| int loop with `[[jit]]` | 26 ms | 0.085 ms | 306x | 0.33% |
+| function call (40k) | 43 ms | 0.056 ms | 768x | 0.13% |
+| fixed array `int[n]` | 23 ms | 0.232 ms | 99x | 1.0% |
+| list push | 69 ms | 0.508 ms | 136x | 0.74% |
+| merge sort (2000) | 207 ms | 0.087 ms | 2379x | 0.04% |
+| heap sort (2000) | 25 ms | 0.078 ms | 321x | 0.31% |
+| binary search (4k x4k) | 67 ms | 0.185 ms | 362x | 0.28% |
+| hash lookup (4k keys) | 147 ms | 0.239 ms | 615x | 0.16% |
+| median by sorting | 1455 ms | 0.142 ms | 10246x | 0.01% |
+| median by quickselect | 59 ms | 0.058 ms | 1017x | 0.10% |
+| sieve of Eratosthenes | 54 ms | 0.107 ms | 505x | 0.20% |
+| KMP search (2000 chars) | 4 ms | 0.211 ms | 19x | 5.3% |
+| edit distance (80x80) | 665 ms | 0.428 ms | 1554x | 0.06% |
+| matrix multiply (30x30) | 128 ms | 0.010 ms | 12800x | 0.01% |
+| Dijkstra (14x14 grid) | 149 ms | 0.065 ms | 2292x | 0.04% |
+| **total** | **3183 ms** | **2.58 ms** | **1236x** | **0.081%** |
+
+How to read this:
+
+* **Dispatch costs ~30 ns per VM instruction**: the plain loop is 155 ns per iteration (about
+  five instructions: add, store, increment, store, compare/branch) and the `[[jit]]`-fused loop is
+  65 ns for two instructions - the same ~30 ns either way.  A *scalar* C++ loop is ~0.5-1 ns per
+  operation, so instruction dispatch is roughly **2-3% of scalar C++**; the 0.14% above is against
+  a vectorized C++ loop.
+* **Script-level algorithms land at 0.01%-1%** of C++ (sorting, DP, graphs), because each
+  algorithmic step expands into many VM instructions and allocations.  `KMP` (5.3%) and fixed
+  arrays (1.0%) are the good cases: long tight loops over cheap operations.
+* **Native primitives run at C++ speed**: `sorted()`, `len`, `sum`, string methods and file I/O are
+  single C++ calls (the `原生 sorted()` row measures 0 ms - it is one `std::sort`).
+* For calibration, this is **CPython-class on dispatch** (CPython's simple int loop is ~20-35 ns per
+  iteration, the fused Annota loop is 65 ns) and **~12x slower than CPython on function calls**
+  (~1075 ns vs ~50-90 ns), which is the clearest remaining target.
+* Algorithm choice still matters more than the interpreter: quickselect is 25x faster than
+  "sort then take the middle" *inside Annota*, exactly as `nth_element` beats `sort` in C++.
 
 ## FAQ & troubleshooting
 

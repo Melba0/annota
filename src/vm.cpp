@@ -1,5 +1,6 @@
 // Annota - vm.cpp : the bytecode virtual machine.
 #include "vm.hpp"
+#include "jit.hpp"
 #include "builtins.hpp"
 #include <algorithm>
 #include <cmath>
@@ -457,7 +458,61 @@ void VM::applyStyle(Value& node) {
     node.o->map.erase("style");
 }
 
+// Reading a local without copying it: a null cell behaves like null.
+static inline const Value& cellValue(const Cell& c) {
+    static const Value kNull;
+    return c ? *c : kNull;
+}
+
+// Integer + integer is by far the most common arithmetic in real programs.  This computes it
+// directly on the two stack slots (no temporaries, no deep copies) but only for the operators
+// whose semantics are provably identical to `binaryResult`: plain 64 bit ints on both sides
+// (`NumKind::None`), the wrapping arithmetic C would do, signed comparisons and bit logic.
+// Division, modulo, power and shifts still go through the general path (they can raise).
+static inline bool fastIntBinary(Op op, const Value& a, const Value& b, Value& out) {
+    if (a.t != VT::Int || b.t != VT::Int) return false;
+    if (a.k != NumKind::None || b.k != NumKind::None) return false;
+    int64_t x = a.i, y = b.i;
+    switch (op) {
+        case OP_ADD:  out = Value::typedInt(x + y, NumKind::I64); return true;
+        case OP_SUB:  out = Value::typedInt(x - y, NumKind::I64); return true;
+        case OP_MUL:  out = Value::typedInt(x * y, NumKind::I64); return true;
+        case OP_EQ:   out = Value::boolean(x == y); return true;
+        case OP_NE:   out = Value::boolean(x != y); return true;
+        case OP_LT:   out = Value::boolean(x < y); return true;
+        case OP_GT:   out = Value::boolean(x > y); return true;
+        case OP_LE:   out = Value::boolean(x <= y); return true;
+        case OP_GE:   out = Value::boolean(x >= y); return true;
+        case OP_BAND: out = Value::integer(x & y); return true;
+        case OP_BOR:  out = Value::integer(x | y); return true;
+        case OP_BXOR: out = Value::integer(x ^ y); return true;
+        default: return false;
+    }
+}
+
 // ---------------------------------------------------------------- calls
+// An argument is deep copied only when the value is mutable (lists, maps, instances, bytes).
+// Numbers, booleans, null and strings are immutable, so sharing them is both correct and much
+// cheaper than a copy per argument per call.
+static bool bindNeedsCopy(const Value& v) {
+    switch (v.t) {
+        case VT::Int: case VT::Float: case VT::Bool: case VT::Null:
+        case VT::Wide: case VT::LongDouble: case VT::Str:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static void bindArg(Cell& c, const Value& v) {
+    if (!c) {
+        c = std::make_shared<Value>(bindNeedsCopy(v) ? deepCopy(v) : v);
+        return;
+    }
+    if (bindNeedsCopy(v)) *c = deepCopy(v);
+    else *c = v;
+}
+
 void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, const Value& named) {
     size_t base = ch->isMethod ? 1 : 0;
     size_t nparams = ch->params.size();
@@ -467,22 +522,24 @@ void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, 
         if (ch->params[i].vararg) varargIdx = (int)i;
         else nfixed++;
     }
-    const std::vector<Value>& pa = pos.o ? pos.o->items : std::vector<Value>{};
-    f.provided.assign(nparams, 0);
+    static const std::vector<Value> kNoArgs;
+    const std::vector<Value>& pa = pos.o ? pos.o->items : kNoArgs;
+    if (nparams > 64) throwError("too many parameters in '" + ch->fnName + "' (at most 64)");
+    f.providedMask = 0;
     f.argc = (int)pa.size();
     size_t pi = 0;
     for (size_t i = 0; i < nparams; i++) {
         if ((int)i == varargIdx) continue;
         if (pi < pa.size()) {
-            *f.locals[base + i] = deepCopy(pa[pi++]);
-            f.provided[i] = 1;
+            bindArg(f.locals[base + i], pa[pi++]);
+            f.providedMask |= (1ull << i);
         }
     }
     if (varargIdx >= 0) {
         std::vector<Value> rest;
-        while (pi < pa.size()) rest.push_back(deepCopy(pa[pi++]));
+        while (pi < pa.size()) rest.push_back(pa[pi++]);
         *f.locals[base + (size_t)varargIdx] = Value::list(rest);
-        f.provided[(size_t)varargIdx] = 1;
+        f.providedMask |= (1ull << (size_t)varargIdx);
     } else if (pi < pa.size()) {
         throwError("too many arguments: '" + ch->fnName + "' expects " + formatInt((int64_t)nfixed) +
                    " but got " + formatInt((int64_t)pa.size()));
@@ -492,13 +549,14 @@ void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, 
             int idx = -1;
             for (size_t i = 0; i < nparams; i++) if (ch->params[i].name == kv.first) { idx = (int)i; break; }
             if (idx < 0) throwError("unexpected named argument '" + kv.first + "' for '" + ch->fnName + "'");
-            if (f.provided[(size_t)idx]) throwError("argument '" + kv.first + "' given twice");
-            *f.locals[base + (size_t)idx] = deepCopy(kv.second);
-            f.provided[(size_t)idx] = 1;
+            if (f.providedMask & (1ull << (size_t)idx))
+                throwError("argument '" + kv.first + "' given twice");
+            bindArg(f.locals[base + (size_t)idx], kv.second);
+            f.providedMask |= (1ull << (size_t)idx);
         }
     }
     for (size_t i = 0; i < nparams; i++) {
-        if (!f.provided[i] && !ch->params[i].hasDefault && (int)i != varargIdx)
+        if (!(f.providedMask & (1ull << i)) && !ch->params[i].hasDefault && (int)i != varargIdx)
             throwError("missing argument '" + ch->params[i].name + "' for '" + ch->fnName + "'");
     }
 }
@@ -524,6 +582,24 @@ static void applyRootMeta(Value& result, const Value& inst) {
     }
 }
 
+// Recycle a finished frame's local cells.  A cell that is still referenced (captured by a
+// closure, or held by the caller as `self`) is replaced by a fresh one so the pool can never
+// alias a live variable.
+void VM::recycleFrame(Frame& fr) {
+    if (fr.locals.empty()) return;
+    for (auto& c : fr.locals) {
+        if (c && c.use_count() > 1) c = std::make_shared<Value>();
+    }
+    auto& bucket = cellPool[fr.locals.size()];
+    if (bucket.size() < 64) bucket.push_back(std::move(fr.locals));
+    fr.locals.clear();
+}
+
+Value VM::emptyNamedArgs() {
+    static Value shared = Value::map({});
+    return shared;
+}
+
 void VM::pushFrame(const Value& fn, const Cell& thisCell) {
     Obj* o = fn.o.get();
     if (!o || !o->chunk) throwError("corrupt function value");
@@ -531,9 +607,20 @@ void VM::pushFrame(const Value& fn, const Cell& thisCell) {
     Frame fr;
     fr.chunk = o->chunk;
     fr.ip = 0;
-    fr.upvals = o->upvals;
-    fr.locals.resize(fr.chunk->numLocals);
-    for (auto& c : fr.locals) c = std::make_shared<Value>();
+    if (!o->upvals.empty()) fr.upvals = o->upvals;      // usually empty: skip the allocation
+    size_t need = fr.chunk->numLocals;
+    auto pool = cellPool.find(need);
+    if (pool != cellPool.end() && !pool->second.empty()) {
+        fr.locals = std::move(pool->second.back());
+        pool->second.pop_back();
+        for (auto& c : fr.locals) {
+            if (c) *c = Value::null();
+            else c = std::make_shared<Value>();
+        }
+    } else {
+        fr.locals.resize(need);
+        for (auto& c : fr.locals) c = std::make_shared<Value>();
+    }
     if (thisCell && fr.chunk->isMethod) fr.locals[0] = thisCell;
     fr.stackBase = stack.size();
     frames.push_back(std::move(fr));
@@ -583,7 +670,7 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
             pendingSelf = thisCell ? *thisCell : Value::null();
             std::vector<Value>& args = pos.o->items;
             Value r = callee.o->fn(*this, args);
-            pendingNamed = Value::map({});
+            pendingNamed = emptyNamedArgs();
             pendingSelf = Value::null();
             if (hasChildren && r.t == VT::UiNode) uiAppendChildren(r, children);
             if (r.t == VT::UiNode) applyStyle(r);
@@ -592,7 +679,36 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
         }
         case VT::Function: {
             pushFrame(callee, thisCell);
-            bindArgs(frames.back(), callee.o->chunk, pos, named);
+            Frame& fr = frames.back();
+            bindArgs(fr, callee.o->chunk, pos, named);
+            const std::shared_ptr<JitCode>& jc = callee.o->chunk->jit;
+            if (jc) {
+                // the native code works on plain int64s: check the locals it reads first
+                bool ready = true;
+                for (uint8_t s : jc->readSlots) {
+                    if (s >= fr.locals.size() || !fr.locals[s] ||
+                        fr.locals[s]->t != VT::Int) { ready = false; break; }
+                }
+                if (ready) {
+                    int64_t L[64];
+                    size_t count = std::min<size_t>(fr.locals.size(), 64);
+                    for (size_t i = 0; i < count; i++)
+                        L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
+                    JitOut out;
+                    jc->fn(L, &out);
+                    Value r = out.kind == 3 ? Value::null()
+                            : out.kind == 2 ? Value::boolean(out.value != 0)
+                            : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
+                                            : Value::integer(out.value);
+                    stack.resize(fr.stackBase);
+                    recycleFrame(fr);
+                    frames.pop_back();
+                    while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
+                        tryFrames.pop_back();
+                    push(r);
+                    return r;
+                }
+            }
             return Value::null();
         }
         case VT::Bound: {
@@ -603,7 +719,7 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
                 pendingSelf = recv;
                 std::vector<Value>& args = pos.o->items;
                 Value r = fn.o->fn(*this, args);
-                pendingNamed = Value::map({});
+                pendingNamed = emptyNamedArgs();
                 pendingSelf = Value::null();
                 if (hasChildren && r.t == VT::UiNode) uiAppendChildren(r, children);
                 if (r.t == VT::UiNode) applyStyle(r);
@@ -633,7 +749,7 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
 Value VM::callSync(const Value& callee, std::vector<Value> args) {
     size_t depth = frames.size();
     Value pos = Value::list(std::move(args));
-    Value named = Value::map({});
+    Value named = emptyNamedArgs();
     callFunction(callee, pos, named, nullptr, Value::null(), false);
     if (frames.size() > depth) return execute(depth);
     return pop();
@@ -645,7 +761,10 @@ bool VM::unwind(const Value& err) {
         TryFrame t = tryFrames.back();
         tryFrames.pop_back();
         if (t.frameIndex >= frames.size()) continue;
-        while (frames.size() > t.frameIndex + 1) frames.pop_back();
+        while (frames.size() > t.frameIndex + 1) {
+            recycleFrame(frames.back());
+            frames.pop_back();
+        }
         Frame& f = frames.back();
         f.ip = t.handler;
         stack.resize(t.stackDepth);
@@ -683,6 +802,7 @@ Value VM::execute(size_t stopDepth) {
                 if (f.ip >= code.size()) {
                     // implicit return
                     stack.resize(f.stackBase);
+                    recycleFrame(f);
                     frames.pop_back();
                     if (frames.size() == stopDepth) return Value::null();
                     push(Value::null());
@@ -853,6 +973,49 @@ Value VM::execute(size_t stopDepth) {
                         push(Value::array(buf, dims, strides, 0, ek, eltStr, dyn));
                         break;
                     }
+                    case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: {
+                        uint8_t a = code[f.ip++];
+                        uint8_t b = code[f.ip++];
+                        int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]);
+                        f.ip += 2;
+                        const Value& x = cellValue(f.locals[a]);
+                        const Value& y = cellValue(f.locals[b]);
+                        if (x.t == VT::Int && y.t == VT::Int) {
+                            if (!(x.i < y.i)) f.ip += j;
+                        } else {
+                            // a user __lt__ may run here, so re-read the frame before patching ip
+                            bool ok = truthy(binaryResult(OP_LT, x, y, "<"));
+                            if (!ok) frames.back().ip += j;
+                        }
+                        break;
+                    }
+                    case OP_JUMP_IF_NOT_LT_LOCAL_IMM: {
+                        uint8_t a = code[f.ip++];
+                        int8_t imm = (int8_t)code[f.ip++];
+                        int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]);
+                        f.ip += 2;
+                        const Value& x = cellValue(f.locals[a]);
+                        if (x.t == VT::Int) {
+                            if (!(x.i < (int64_t)imm)) f.ip += j;
+                        } else {
+                            bool ok = truthy(binaryResult(OP_LT, x, Value::integer(imm), "<"));
+                            if (!ok) frames.back().ip += j;
+                        }
+                        break;
+                    }
+                    case OP_INDEX_ADD_IMM: {
+                        uint8_t arr = code[f.ip++];
+                        uint8_t idx = code[f.ip++];
+                        int8_t imm = (int8_t)code[f.ip++];
+                        Value container = cellValue(f.locals[arr]);
+                        Value index = cellValue(f.locals[idx]);
+                        Value cur = getIndex(container, index);
+                        Value nv = cur.t == VT::Int
+                                       ? Value::integer(cur.i + imm)
+                                       : binaryResult(OP_ADD, cur, Value::integer(imm), "+");
+                        setIndex(container, index, nv);
+                        break;
+                    }
                     case OP_LOCAL_ADD_IMM: {
                         uint8_t sl = code[f.ip++];
                         int8_t imm = (int8_t)code[f.ip++];
@@ -1001,7 +1164,7 @@ Value VM::execute(size_t stopDepth) {
                     case OP_JUMP_IF_PROVIDED: {
                         uint8_t idx = code[f.ip++];
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
-                        if (idx < f.provided.size() && f.provided[idx]) f.ip += j;
+                        if (idx < 64 && ((f.providedMask >> idx) & 1ull)) f.ip += j;
                         break;
                     }
                     case OP_COLLECT_VARARGS: {
@@ -1068,6 +1231,10 @@ Value VM::execute(size_t stopDepth) {
                         uint16_t n = (uint16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
                         std::vector<Value> vals(2 * (size_t)n);
                         for (int i = (int)n * 2 - 1; i >= 0; i--) vals[(size_t)i] = pop();
+                        if (n == 0) {
+                            push(emptyNamedArgs());
+                            break;
+                        }
                         std::unordered_map<std::string, Value> m;
                         for (size_t i = 0; i < n; i++) m[toStr(vals[i * 2])] = vals[i * 2 + 1];
                         push(Value::map(std::move(m)));
@@ -1141,6 +1308,13 @@ Value VM::execute(size_t stopDepth) {
                     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_POW:
                     case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                     case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
+                        size_t sp = stack.size();
+                        Value fast;
+                        if (sp >= 2 && fastIntBinary((Op)op, stack[sp - 2], stack[sp - 1], fast)) {
+                            stack.pop_back();
+                            stack.back() = std::move(fast);
+                            break;
+                        }
                         Value b = pop();
                         Value a = pop();
                         push(binaryResult((Op)op, a, b, opName(op)));
@@ -1192,7 +1366,7 @@ Value VM::execute(size_t stopDepth) {
                     }
                     case OP_RETURN: {
                         Value r = deepCopy(pop());
-                        Frame fr = frames.back();
+                        Frame fr = std::move(frames.back());
                         frames.pop_back();
                         while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
                             tryFrames.pop_back();
@@ -1203,6 +1377,7 @@ Value VM::execute(size_t stopDepth) {
                                 pushFrame(fr.klass->buildFn, self);
                                 frames.back().klass = fr.klass;
                                 frames.back().isBuild = true;
+                                recycleFrame(fr);
 
                                 continue;
                             }
@@ -1211,16 +1386,18 @@ Value VM::execute(size_t stopDepth) {
                         if (fr.isBuild && fr.klass && fr.locals.size() && fr.locals[0])
                             applyRootMeta(r, *fr.locals[0]);
 
+                        bool done = frames.size() == stopDepth;
+                        recycleFrame(fr);
                         if (fr.discardResult) {
-                            if (frames.size() == stopDepth) return Value::null();
+                            if (done) return Value::null();
                             continue;
                         }
-                        if (frames.size() == stopDepth) return r;
+                        if (done) return r;
                         push(r);
                         break;
                     }
                     case OP_RETURN_NULL: {
-                        Frame fr = frames.back();
+                        Frame fr = std::move(frames.back());
                         frames.pop_back();
                         while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
                             tryFrames.pop_back();
@@ -1716,6 +1893,9 @@ const char* opName(uint8_t op) {
         case OP_NEW_ARRAY: return "new-array";
         case OP_GET_INDEX_FAST: return "index-fast";
         case OP_NOP: return "nop";
+        case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: return "local<local?";
+        case OP_JUMP_IF_NOT_LT_LOCAL_IMM: return "local<imm?";
+        case OP_INDEX_ADD_IMM: return "index+=";
         case OP_LOCAL_ADD_IMM: return "local+=";
         case OP_LOCAL_SUB_IMM: return "local-=";
         case OP_LOCAL_ADD_LOCAL: return "local+=local";

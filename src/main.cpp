@@ -14,6 +14,7 @@
 //     --gui-tree           print the view tree as text
 #include "parser.hpp"
 #include "module_loader.hpp"
+#include "ffi.hpp"
 #include "compiler.hpp"
 #include "vm.hpp"
 #include "builtins.hpp"
@@ -25,6 +26,7 @@
 #include <filesystem>
 #include <system_error>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -116,6 +118,29 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
                 int8_t v = (int8_t)u8();
                 extra = "slot " + formatInt(s) + (op == OP_LOCAL_ADD_IMM ? " += " : " -= ") +
                         formatInt(v);
+                break;
+            }
+            case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: {
+                uint8_t a = u8();
+                uint8_t b = u8();
+                int16_t j = s16();
+                extra = "if !(slot " + formatInt(a) + " < slot " + formatInt(b) + ") -> " +
+                        formatInt((int64_t)i + j);
+                break;
+            }
+            case OP_JUMP_IF_NOT_LT_LOCAL_IMM: {
+                uint8_t a = u8();
+                int8_t v = (int8_t)u8();
+                int16_t j = s16();
+                extra = "if !(slot " + formatInt(a) + " < " + formatInt(v) + ") -> " +
+                        formatInt((int64_t)i + j);
+                break;
+            }
+            case OP_INDEX_ADD_IMM: {
+                uint8_t a = u8();
+                uint8_t b = u8();
+                int8_t v = (int8_t)u8();
+                extra = "slot " + formatInt(a) + "[" + formatInt(b) + "] += " + formatInt(v);
                 break;
             }
             case OP_LOCAL_ADD_LOCAL: {
@@ -293,6 +318,7 @@ int main(int argc, char** argv) {
     bool contracts = false, guiWindow = false, guiShot = false, guiTree = false;
     std::vector<std::pair<int, int>> clicks;
     std::vector<std::string> keys;
+    std::vector<std::string> plugins;          // C++ modules to load before the program runs
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -302,6 +328,7 @@ int main(int argc, char** argv) {
         if (a == "--dump-bc") { dumpBc = true; continue; }
         if (a == "--dump-annotations") { dumpAnn = true; continue; }
         if (a == "--contracts") { contracts = true; continue; }
+        if (a == "--plugin" && i + 1 < argc) { plugins.push_back(argv[++i]); continue; }
         if (a == "--gui") { guiWindow = true; continue; }
         if (a == "--gui-tree") { guiTree = true; continue; }
         if (a == "--gui-shot" && i + 1 < argc) { guiOut = argv[++i]; guiShot = true; continue; }
@@ -333,6 +360,7 @@ int main(int argc, char** argv) {
                         "  --dump-bc            disassemble the bytecode\n"
                         "  --dump-annotations   print the annotation index as JSON\n"
                         "  --contracts          evaluate assert/require/ensure/invariant annotations\n"
+                        "  --plugin <file>       load a native plugin (see docs/ffi.md)\n"
                         "  --gui                open the view in a window (Qt build)\n"
                         "  --gui-shot <path>    render the view to a PNG file\n"
                         "  --gui-click X,Y      dispatch a synthetic click before --gui-shot\n"
@@ -357,6 +385,30 @@ int main(int argc, char** argv) {
     }
 
     std::string file;
+    // ---------------------------------------------------------------- native plugins
+    // A plugin is a shared library that registers functions/modules through src/ffi.hpp; the
+    // interpreter needs no knowledge of it beyond this loop.
+    {
+        if (const char* env = std::getenv("ANNOTA_PLUGIN")) {
+            std::string list = env;
+            size_t start = 0;
+            while (start <= list.size()) {
+                size_t sep = list.find_first_of(";:", start);
+                std::string one = list.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+                if (!one.empty()) plugins.push_back(one);
+                if (sep == std::string::npos) break;
+                start = sep + 1;
+            }
+        }
+        for (auto& pl : plugins) {
+            std::string err;
+            if (!ffiLoadPlugin(pl, &err)) {
+                std::fprintf(stderr, "annota: %s\n", err.c_str());
+                return 2;
+            }
+        }
+    }
+
     std::string source;
     if (!snippet.empty()) {
         file = "<eval>";

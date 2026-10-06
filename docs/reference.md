@@ -188,7 +188,43 @@ Built on top of them: `lib/time.mod`, `lib/os.mod`, `lib/thread.mod`, `lib/net.m
 The clock is also available directly as `time.now()` (seconds), `time.millis()` (wall
 milliseconds), `time.clock()` (monotonic milliseconds) and `time.sleep(ms)`.
 
-## 5. Commands
+## 5. Linked C++ modules (FFI)
+
+Contributed by C++ linked into the binary (`native/*.cpp`) or loaded as a plugin.
+Registering them is all it takes for `use <module>` to resolve and for members to be
+callable; the language core is not involved.  See `docs/ffi.md`.
+
+Module `fast`:
+
+| Member |
+|---|
+| `fast.sum` |
+| `fast.dot` |
+| `fast.prefix_sums` |
+| `fast.clamp_all` |
+| `fast.moving_average` |
+| `fast.histogram` |
+| `fast.prime_count` |
+| `fast.primes` |
+| `fast.checksum` |
+| `fast.count_if` |
+| `fast.map_call` |
+| `fast.reduce_call` |
+| `fast.time_call` |
+| `fast.version` |
+| `fast.author` |
+
+Module `seqnative`:
+
+| Member |
+|---|
+| `seqnative.sorted` |
+| `seqnative.nth` |
+| `seqnative.argsort` |
+| `seqnative.lower_bound` |
+| `seqnative.upper_bound` |
+
+## 6. Commands
 
 ```
 annota                       REPL (also the default with no arguments)

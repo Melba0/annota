@@ -1,0 +1,103 @@
+-[ jit.ant : [[jit]] 标记 —— 超指令 + 机器码后端
+
+   `[[jit]]` 只表示“这段请提前优化”。解释器在加载时先做超指令融合（比较+分支、
+   x 自增、a[i] += k 等），如果整个函数都落在整数子集里，再把它翻译成 x86-64 机器码；
+   翻译不了就照常解释执行，所以标记永远不会改变程序的含义。
+
+   下面每条都用“同一个函数，一个带标记、一个不带”来对照，结果（含 typeof）必须完全一致。
+]-
+
+use std
+use test
+
+Test.suite("jit: 机器码后端")
+
+[[jit]]
+sum_jit(n)(
+    new s = 0
+    new i = 0
+    while i < n(
+        s = s + i
+        i = i + 1
+    )
+    =s
+)
+
+sum_plain(n)(
+    new s = 0
+    new i = 0
+    while i < n(
+        s = s + i
+        i = i + 1
+    )
+    =s
+)
+
+[[jit]]
+count_jit(n)(
+    new i = 0
+    while i < n(
+        i = i + 1
+    )
+    =i
+)
+
+[[jit]]
+sum_even_jit(n)(
+    new s = 0
+    for i in 0 to n - 1(
+        if i % 2 == 0(
+            s = s + i
+        )
+    )
+    =s
+)
+
+sum_even_plain(n)(
+    new s = 0
+    for i in 0 to n - 1(
+        if i % 2 == 0(
+            s = s + i
+        )
+    )
+    =s
+)
+
+-- 递归函数不是整数直线子集（有自调用），[[jit]] 会安静地回退解释器
+[[jit]]
+fact_jit(n)(
+    if n <= 1( =1 )
+    =n * fact_jit(n - 1)
+)
+
+-- 1. 逐个输入对照：值与类型都必须和解释器一致
+new same = true
+for n in 0 to 250(
+    if sum_jit(n) != sum_plain(n)( same = false )
+    if typeof(sum_jit(n)) != typeof(sum_plain(n))( same = false )
+    if count_jit(n) != n( same = false )
+    if sum_even_jit(n) != sum_even_plain(n)( same = false )
+)
+Test.eq(same, true, "0..250 与解释器逐项一致（含 typeof）")
+Test.eq(sum_jit(1000), 499500, "1000 求和")
+Test.eq(count_jit(1000), 1000, "计数循环")
+Test.eq(sum_even_jit(100), 2450, "带 if 的循环")
+Test.eq(fact_jit(10), 3628800, "递归自动回退解释器")
+
+-- 2. 参数类型不满足整数子集时不崩溃、语义不变
+Test.eq(sum_jit(1.5), sum_plain(1.5), "浮点参数回退解释器")
+Test.eq(sum_jit(10.75), sum_plain(10.75), "浮点参数结果一致")
+
+-- 3. 性能：同一份循环，标记前后
+new n = 400000
+new t0 = _sys_clock()
+new r1 = sum_plain(n)
+new t1 = _sys_clock()
+new r2 = sum_jit(n)
+new t2 = _sys_clock()
+Test.eq(r1 == r2, true, "结果一致")
+print ""
+print "循环 40 万次 (解释器) ->", t1 - t0, "ms"
+print "循环 40 万次 ([[jit]]) ->", t2 - t1, "ms"
+
+Test.check()

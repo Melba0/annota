@@ -1,0 +1,71 @@
+-[ ffi.ant : 把 C++ 链接进来（无需改动语法核心）
+
+   `fast` 模块不是解释器自带的：它来自 native/fast.cpp，链接时把函数注册进 FFI 登记表。
+   Annota 这边只是普通的 use + 成员调用，也就是模块形态；要让标准库更快，就把热内核写成
+   C++ 放进去，核心代码一行都不用动。
+
+   用法: annota run examples/ffi.ant
+         annota run examples/ffi.ant --plugin ./mymod.dll       插件方式, 见 docs/ffi.md
+]-
+
+use std
+use test
+
+Test.suite("ffi: 链接 C++ 模块")
+
+-- 1. 模块形态：常量 + 函数，和脚本模块看起来完全一样
+Test.eq(fast.version, "1.0", "模块常量")
+new xs = [1, 2, 3, 4, 5]
+Test.eq(fast.sum(xs), 15, "原生求和")
+Test.eq(fast.sum([1.5, 2.5]), 4.0, "浮点求和")
+Test.eq(fast.dot([1, 2, 3], [4, 5, 6]), 32, "点积")
+Test.eq(fast.prefix_sums([1, 2, 3, 4]), [1, 3, 6, 10], "前缀和")
+Test.eq(fast.clamp_all([-5, 3, 99, 7], 0, 10), [0, 3, 10, 7], "区间截断")
+Test.eq(len(fast.moving_average([1, 2, 3, 4, 5], 3)), 3, "滑动平均长度")
+Test.eq(fast.histogram([1, 2, 2, 3], 2), [1, 3], "直方图")
+Test.eq(fast.checksum("annota") != 0, true, "字符串校验和")
+
+-- 2. 真内核：C++ 筛法（脚本版慢几十倍）
+Test.eq(fast.prime_count(10000), 1229, "10000 以内素数个数")
+Test.eq(fast.prime_count(100), 25, "100 以内素数个数")
+Test.eq(len(fast.primes(50)), 15, "素数列表")
+
+-- 3. 反向通信：C++ 调用 Annota 闭包（回调、比较器、计时器）
+Test.eq(fast.count_if(xs, (x)( =x % 2 == 1 )), 3, "count_if + 闭包")
+Test.eq(fast.map_call(xs, (x)( =x * x )), [1, 4, 9, 16, 25], "map_call + 闭包")
+Test.eq(fast.reduce_call(xs, (acc, x)( =acc + x ), 0), 15, "reduce_call + 闭包")
+Test.eq(fast.time_call(()( ), 3) >= 0.0, true, "C++ 侧计时")
+
+-- 4. 性能对比：脚本 vs 链接 C++
+new n = 200000
+new data = Seq.iota(1, n)
+
+new t0 = _sys_clock()
+new script_sum = 0
+for v in data(
+    script_sum = script_sum + v
+)
+new t1 = _sys_clock()
+new native_sum = fast.sum(data)
+new t2 = _sys_clock()
+Test.eq(script_sum == native_sum, true, "结果一致")
+
+new t3 = _sys_clock()
+new script_primes = len(Num.sieve(100000))
+new t4 = _sys_clock()
+new native_primes = fast.prime_count(100000)
+new t5 = _sys_clock()
+Test.eq(script_primes == native_primes, true, "筛法结果一致")
+
+new rows = [
+    ("求和 20 万 (脚本)", t1 - t0),
+    ("求和 20 万 (C++)", t2 - t1),
+    ("筛法 10 万 (脚本)", t4 - t3),
+    ("筛法 10 万 (C++)", t5 - t4),
+]
+print ""
+for r in rows(
+    print r[0], "->", r[1], "ms"
+)
+
+Test.check()

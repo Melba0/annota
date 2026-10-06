@@ -2,6 +2,12 @@
 
 # 标准库参考
 
+> **分层**：`Seq.sort` / `kth` / `median` / `dedup` / `sort_by` / `lower_bound` / `upper_bound` / `bsearch`
+> 都是薄封装，底下调用的是原生模块 **`seqnative`**（`native/seq_native.cpp`，通过
+> [FFI](ffi.md) 注册，不在语言核心内）。这些原语以前是内置函数，现在搬到了链接进来的 C++ 层，
+> 所以再往下加算法只需要加一个 `native/*.cpp`，核心代码一行都不用动。
+> 脚本实现（`merge_sort`、`kth_script` 等）仍然保留，作为参考实现和自定义比较器时的入口。
+
 语言内核只暴露 `_` 前缀的原语（时钟、文件、线程、套接字……），其余全部是 `lib/` 下用 Annota
 自己写的模块。用 `use <名字>` 单独加载，或 `use std` 一次加载全部。
 

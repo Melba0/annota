@@ -13,6 +13,11 @@ if ($Clean -and (Test-Path $outDir)) { Remove-Item -Recurse -Force $outDir }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $sources = Get-ChildItem (Join-Path $root "src") -Filter *.cpp | ForEach-Object { $_.FullName }
+# linked C++ modules (the FFI examples): drop a .cpp in native/ and it is linked in
+$nativeDir = Join-Path $root "native"
+if (Test-Path $nativeDir) {
+    $sources += Get-ChildItem $nativeDir -Filter *.cpp | ForEach-Object { $_.FullName }
+}
 $exe = Join-Path $outDir "annota.exe"
 
 $gpp = "D:\Qt\Tools\mingw1310_64\bin\g++.exe"
@@ -108,7 +113,8 @@ if ($Verify) {
     $examples = @("selfcheck.ant", "stdlib.ant", "algorithms.ant", "smoke.ant",
                   "buffer.ant", "gui_counter.ant", "modules.ant", "files.ant", "system.ant",
                   "syntax.ant", "arrays.ant", "perf.ant",
-                  "collections.ant", "strings.ant", "graphs.ant", "numerics.ant", "geometry.ant")
+                  "collections.ant", "strings.ant", "graphs.ant", "numerics.ant", "geometry.ant",
+                  "ffi.ant", "jit.ant")
     Write-Host "[verify] running $($examples.Count) examples"
     foreach ($e in $examples) {
         $path = Join-Path $root "examples\$e"

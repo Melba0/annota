@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "compiler.hpp"
+#include "jit.hpp"
 #include <algorithm>
 
 namespace annota {
@@ -582,6 +583,52 @@ void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
         for (size_t k = i + 3; k <= j; k++) code[k] = OP_NOP;
         i = j;
     }
+    // GET_LOCAL a ; GET_LOCAL b ; LT ; JUMP_IF_FALSE  ->  one compare-and-branch
+    // The jump is relative to the end of the instruction, and the fused form is 3 bytes shorter,
+    // so the encoded target moves by +3.
+    for (size_t i = 0; i + 7 < code.size(); i++) {
+        if (code[i] != OP_GET_LOCAL || code[i + 2] != OP_GET_LOCAL) continue;
+        if (code[i + 4] != OP_LT) continue;
+        if (code[i + 5] != OP_JUMP_IF_FALSE) continue;
+        int16_t target = (int16_t)((code[i + 6] << 8) | code[i + 7]);
+        int16_t moved = (int16_t)(target + 3);
+        code[i] = OP_JUMP_IF_NOT_LT_LOCAL_LOCAL;
+        code[i + 2] = code[i + 3];
+        code[i + 3] = (uint8_t)((moved >> 8) & 0xff);
+        code[i + 4] = (uint8_t)(moved & 0xff);
+        for (size_t k = i + 5; k <= i + 7; k++) code[k] = OP_NOP;
+        i += 7;
+    }
+    // GET_LOCAL a ; INT1 k ; LT ; JUMP_IF_FALSE  ->  compare against an immediate
+    for (size_t i = 0; i + 7 < code.size(); i++) {
+        if (code[i] != OP_GET_LOCAL) continue;
+        if (code[i + 2] != OP_INT1) continue;
+        if (code[i + 4] != OP_LT) continue;
+        if (code[i + 5] != OP_JUMP_IF_FALSE) continue;
+        int16_t target = (int16_t)((code[i + 6] << 8) | code[i + 7]);
+        int16_t moved = (int16_t)(target + 3);
+        code[i] = OP_JUMP_IF_NOT_LT_LOCAL_IMM;
+        code[i + 2] = code[i + 3];
+        code[i + 3] = (uint8_t)((moved >> 8) & 0xff);
+        code[i + 4] = (uint8_t)(moved & 0xff);
+        for (size_t k = i + 5; k <= i + 7; k++) code[k] = OP_NOP;
+        i += 7;
+    }
+    // GET_LOCAL arr ; GET_LOCAL idx ; GET_INDEX ; INT1 k ; ADD ; SET_INDEX -> arr[idx] += k
+    for (size_t i = 0; i + 8 < code.size(); i++) {
+        if (code[i] != OP_GET_LOCAL || code[i + 2] != OP_GET_LOCAL) continue;
+        if (code[i + 4] != OP_GET_INDEX) continue;
+        if (code[i + 5] != OP_INT1) continue;
+        if (code[i + 7] != OP_ADD) continue;
+        if (code[i + 8] != OP_SET_INDEX) continue;
+        uint8_t arr = code[i + 1], idx = code[i + 3], imm = code[i + 6];
+        code[i] = OP_INDEX_ADD_IMM;
+        code[i + 1] = arr;
+        code[i + 2] = idx;
+        code[i + 3] = imm;
+        for (size_t k = i + 4; k <= i + 8; k++) code[k] = OP_NOP;
+        i += 9;
+    }
     for (size_t i = 0; i + 6 < code.size(); i++) {
         // GET_LOCAL s ; GET_LOCAL t ; ADD ; SET_LOCAL s
         if (code[i] != OP_GET_LOCAL) continue;
@@ -1022,7 +1069,10 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
     }
     std::shared_ptr<Chunk> ch = f->chunk;
     popState();
-    if (hasAnn(anns, "jit")) optimizeChunk(ch);
+    if (hasAnn(anns, "jit")) {
+        optimizeChunk(ch);                    // superinstructions first
+        ch->jit = jitCompileX64(ch);          // then whole-function machine code
+    }
     return ch;
 }
 

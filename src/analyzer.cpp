@@ -810,7 +810,7 @@ HoverInfo hoverAt(const std::string& source, const std::string& file, int line, 
     using namespace std::string_literals;
     static const std::vector<std::string> builtins = {
         "print", "len", "str", "String", "int", "float", "bool", "Bytes", "List", "Tuple",
-        "sorted", "sum", "zip", "enumerate", "ord", "chr", "min", "max", "abs", "range", "pairs",
+        "sum", "zip", "enumerate", "ord", "chr", "min", "max", "abs", "range", "pairs",
         "alloc", "raw_copy", "Ok", "Err", "is_null", "typeof"};
     for (auto& b : builtins) if (b == name) {
         h.kind = "builtin";

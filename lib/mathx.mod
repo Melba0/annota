@@ -1,3 +1,5 @@
+use seqnative
+
 -[ mathx.mod : 常用数学工具（原生 math 模块的补充） ]-
 
 [[module: mathx]]
@@ -98,7 +100,7 @@ Mathx()=(
 
     [[static]]
     median(xs)(
-        new s = sorted(xs)
+        new s = seqnative.sorted(xs)
         new n = len(s)
         if n == 0( =null )
         if n % 2 == 1(

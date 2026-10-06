@@ -2,6 +2,7 @@
 #include "value.hpp"
 #include "analyzer.hpp"
 #include "analysis_internal.hpp"
+#include "ffi.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -1502,7 +1503,7 @@ AbsVal Flow::evalCall(const ExprP& e, Env& env) {
             v.sizeKey = "v:" + e->args[0].value->name;
         return v;
     }
-    if (isBuiltin("sorted")) {
+    if (isBuiltin("sorted") || isBuiltin("seqnative.sorted")) {
         v.type = "List";
         if (!args.empty()) v.size = args[0].size;
         return v;
@@ -2823,7 +2824,7 @@ void Flow::analyzeFunc(FuncInfo* f) {
 void Flow::run() {
     startClock_ = clock();
     for (const char* b : {"print", "len", "str", "String", "int", "float", "bool", "Bytes", "List",
-                          "Tuple", "sorted", "sum", "zip", "enumerate", "ord", "chr", "min", "max",
+                          "Tuple", "sum", "zip", "enumerate", "ord", "chr", "min", "max",
                           "abs", "range", "pairs", "alloc", "raw_copy", "Ok", "Err", "is_null",
                           "typeof",
                           // low level file / path primitives (lib/file.mod wraps them)
@@ -2848,6 +2849,11 @@ void Flow::run() {
                           // builtin module namespaces registered by the runtime
                           "math", "io", "json", "time", "net", "os", "thread", "system", "slice"})
         builtinNames_.insert(b);
+
+    // native modules and functions a linked C++ file registered through the FFI: the analyzer
+    // must know they exist, otherwise `use fast` looks like an undefined variable
+    for (auto& nm : ffiModuleNames()) builtinNames_.insert(nm);
+    for (auto& nm : ffiFunctionNames()) builtinNames_.insert(nm);
 
     collectGlobals(prog_.stmts);
     collectStmts(prog_.stmts, "", false);

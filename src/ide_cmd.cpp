@@ -5,6 +5,7 @@
 #include "lexer.hpp"
 #include "compiler.hpp"
 #include "builtins.hpp"
+#include "ffi.hpp"
 #include "analyzer.hpp"
 #include <chrono>
 #include "sys_api.hpp"
@@ -468,7 +469,28 @@ std::string markdownDocs() {
 
     out += "\n";
     out += sysPrimitivesMarkdown();
-    out += "## 5. Commands\n\n";
+    // linked C++ modules: read from the FFI registry, so this section can never go stale
+    {
+        std::vector<std::string> nativeFns = ffiFunctionNames();
+        std::vector<std::string> nativeMods = ffiModuleNames();
+        if (!nativeFns.empty() || !nativeMods.empty()) {
+            out += "## 5. Linked C++ modules (FFI)\n\n";
+            out += "Contributed by C++ linked into the binary (`native/*.cpp`) or loaded as a plugin.\n";
+            out += "Registering them is all it takes for `use <module>` to resolve and for members to be\n";
+            out += "callable; the language core is not involved.  See `docs/ffi.md`.\n\n";
+            if (!nativeFns.empty()) {
+                out += "| Global native function |\n|---|\n";
+                for (auto& f : nativeFns) out += "| `" + f + "` |\n";
+                out += "\n";
+            }
+            for (auto& m : nativeMods) {
+                out += "Module `" + m + "`:\n\n| Member |\n|---|\n";
+                for (auto& mem : ffiModuleMembers(m)) out += "| `" + m + "." + mem + "` |\n";
+                out += "\n";
+            }
+        }
+    }
+    out += "## 6. Commands\n\n";
     out += "```\n";
     out += "annota                       REPL (also the default with no arguments)\n";
     out += "annota studio [file]         graphical IDE (Qt build)\n";

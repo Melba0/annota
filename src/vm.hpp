@@ -12,7 +12,7 @@ struct Frame {
     size_t ip = 0;
     std::vector<Cell> locals;
     std::vector<Cell> upvals;
-    std::vector<uint8_t> provided;
+    uint64_t providedMask = 0;         // parameter i was supplied (i < 64)
     int argc = 0;
     size_t stackBase = 0;
     bool buildOnReturn = false;
@@ -37,6 +37,12 @@ public:
     std::vector<Frame> frames;
     std::vector<TryFrame> tryFrames;
 
+    // Frames are recycled: allocating `numLocals` shared cells (and one Value each) used to
+    // dominate call overhead.  Cells captured by a closure are detached instead of pooled.
+    std::unordered_map<size_t, std::vector<std::vector<Cell>>> cellPool;
+    void recycleFrame(Frame& fr);
+    Value emptyNamedArgs();            // one shared empty dict, instead of one per call
+
     bool contracts = false;
     std::set<std::string> stateNames;
     std::function<void(VM&)> onStateChange;
@@ -60,9 +66,10 @@ public:
 
     // ---- helpers shared with natives
     void push(const Value& v) { stack.push_back(v); }
+    void push(Value&& v) { stack.push_back(std::move(v)); }
     Value pop() {
         if (stack.empty()) throw VMError("internal: value stack underflow");
-        Value v = stack.back();
+        Value v = std::move(stack.back());
         stack.pop_back();
         return v;
     }

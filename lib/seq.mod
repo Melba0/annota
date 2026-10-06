@@ -267,29 +267,22 @@ Seq()=(
         =out
     )
 
-    -- 兼容旧签名：默认升序，reverse = true 时降序（仍是稳定的归并排序）
+    -- 默认排序走原生原语（C++ std::stable_sort，稳定）：热路径不付解释器成本。
+    -- 需要自定义比较函数时用 merge_sort。
     [[static]]
-    sort(xs, reverse = false)(
-        if reverse(
-            =Seq.merge_sort(xs, (a, b)( =a > b ))
-        )
-        =Seq.merge_sort(xs, (a, b)( =a < b ))
-    )
+    sort(xs, reverse = false)( =seqnative.sorted(xs, reverse) )
 
+    -- 按 key 排序：先用原生 argsort 得到稳定排列，再按排列重排（O(n log n)，排序在 C++ 里）
     [[static]]
     sort_by(xs, key, reverse = false)(
-        new pairs = []
+        new keys = []
         for x in xs(
-            pairs.push((key(x), x))
+            keys.push(key(x))
         )
-        if reverse(
-            pairs = Seq.merge_sort(pairs, (p, q)( =p[0] > q[0] ))
-        ) else (
-            pairs = Seq.merge_sort(pairs, (p, q)( =p[0] < q[0] ))
-        )
+        new order = seqnative.argsort(keys, reverse)
         new out = []
-        for p in pairs(
-            out.push(p[1])
+        for i in order(
+            out.push(xs[i])
         )
         =out
     )
@@ -369,7 +362,7 @@ Seq()=(
 
     -- 原生排序（C++ std::sort 支撑），性能最好，但不受稳定性保证
     [[static]]
-    sort_native(xs) = sorted(xs)
+    sort_native(xs) = seqnative.sorted(xs)
 
     -- 把 x 插入已经有序的序列，保持有序（二分定位）
     [[static]]
@@ -381,8 +374,16 @@ Seq()=(
     )
 
     -- ============================================================ 有序序列上的查找（二分）
+    -- 二分原语：直接调用 C++ 的 lower_bound / upper_bound
     [[static]]
-    lower_bound(xs, value)(
+    lower_bound(xs, value)( =seqnative.lower_bound(xs, value) )
+
+    [[static]]
+    upper_bound(xs, value)( =seqnative.upper_bound(xs, value) )
+
+    -- 脚本版二分（保留作为参考实现，与原生版语义一致）
+    [[static]]
+    lower_bound_script(xs, value)(
         new lo = 0
         new hi = len(xs)
         while lo < hi(
@@ -437,7 +438,11 @@ Seq()=(
     -- ============================================================ 选择（快速选择 O(n) 平均）
     -- 第 k 小（k 从 0 开始），平均 O(n)；Lomuto 划分保证枢轴落在最终位置
     [[static]]
-    kth(xs, k)(
+    kth(xs, k)( =seqnative.nth(xs, k) )
+
+    -- 脚本版快速选择（三数取中 + Lomuto 划分），保留作为参考实现
+    [[static]]
+    kth_script(xs, k)(
         if len(xs) == 0( =null )
         new a = Seq.copy(xs)
         new lo = 0
@@ -681,32 +686,25 @@ Seq()=(
     [[static]]
     unique(xs)( =Seq.dedup(xs) )
 
-    -- 去重：排序 (值, 首次下标) 后线性扫描，O(n log n)，并保留首次出现的顺序
-    -- 需要值支持 `<` 比较；不可比较的类型请用 unique（O(n^2) 的兜底实现）
+    -- 去重：原生 argsort 得到稳定排列（同值按下标升序），取每个值的首次出现，再按下标排序
     [[static]]
     dedup(xs)(
-        new pairs = []
-        for (i, x) in enumerate(xs)(
-            pairs.push((x, i))
-        )
-        pairs = Seq.merge_sort(pairs, (p, q)(
-            if p[0] == q[0]( =p[1] < q[1] )
-            =p[0] < q[0]
-        ))
-        new picked = []
+        new order = seqnative.argsort(xs)
+        new keep = []
         new last = null
         new have = false
-        for p in pairs(
-            if !have || p[0] != last(
-                picked.push(p)
-                last = p[0]
+        for i in order(
+            new v = xs[i]
+            if !have || v != last(
+                keep.push(i)
+                last = v
                 have = true
             )
         )
-        picked = Seq.merge_sort(picked, (p, q)( =p[1] < q[1] ))
+        keep = seqnative.sorted(keep)
         new out = []
-        for p in picked(
-            out.push(p[0])
+        for i in keep(
+            out.push(xs[i])
         )
         =out
     )

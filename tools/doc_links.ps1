@@ -15,10 +15,27 @@ if (-not $Root) { $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.M
 $files = Get-ChildItem -Path $Root -Filter *.md -Recurse -File |
     Where-Object { $_.FullName -notmatch "\\build\\" -and $_.FullName -notmatch "\\\.git\\" }
 
+# Fenced code blocks are documentation of code, not links: `[](VM& vm, ValueList& a)` is a C++
+# lambda, and a path inside a fence may well not exist.  Blank them out before matching.
+function Remove-FencedCode([string]$text) {
+    $lines = $text -split "`n"
+    $out = New-Object System.Collections.Generic.List[string]
+    $inFence = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*(```|~~~)') {
+            $inFence = -not $inFence
+            $out.Add("")
+            continue
+        }
+        $out.Add($(if ($inFence) { "" } else { $line }))
+    }
+    return ($out -join "`n")
+}
+
 $broken = @()
 $pendingHits = @()
 foreach ($f in $files) {
-    $text = Get-Content $f.FullName -Raw -Encoding UTF8
+    $text = Remove-FencedCode (Get-Content $f.FullName -Raw -Encoding UTF8)
     # the patterns are deliberately line-bound: a cross-line match would swallow prose (and
     # markdown emphasis) into the captured path and produce nonsense "illegal path" errors
     $matches = [regex]::Matches($text, '!?\[[^\]\r\n]*\]\(([^)\r\n]+)\)') +

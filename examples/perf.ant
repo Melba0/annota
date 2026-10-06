@@ -222,8 +222,8 @@ new data = make_data(sort_n)
 new expected = Seq.sort(data)
 Test.eq(Seq.heap_sort(data), expected, "堆排序结果与归并排序一致")
 Test.eq(Seq.sort_native(data), expected, "原生排序结果一致")
-bench.run("归并排序", sort_n, ()( Seq.sort(data) ))
-bench.run("堆排序", sort_n, ()( Seq.heap_sort(data) ))
+bench.run("归并排序 (脚本)", sort_n, ()( Seq.merge_sort(data, (a, b)( =a < b )) ))
+bench.run("堆排序 (脚本)", sort_n, ()( Seq.heap_sort(data) ))
 bench.run("原生 sorted()", sort_n, ()( Seq.sort_native(data) ))
 
 -- ⑥ 查找
