@@ -100,6 +100,7 @@ private:
     StmtP parseFuncDef(Ctx ctx, const std::string& name, const std::vector<Param>& params, bool isMethod);
     StmtP parseClassDef(const std::string& name, const std::vector<Param>& params, bool isView, bool isStyle);
     StmtP parseNew();
+    StmtP parseLend();
     StmtP parseSimpleDecl(SK kind, bool isConst);
     StmtP parseIf(Ctx ctx);
     StmtP parseWhile(Ctx ctx);

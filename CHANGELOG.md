@@ -11,6 +11,13 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* **References: `lend a = b`.**  Value semantics stay the default (assignment, arguments and
+  returns deep copy), and `lend` is the explicit way to share: both names then read and write the
+  same storage cell, closures capture that same cell, and the analyzer knows the two names are
+  aliases (no bogus dead-store reports, and mutating one drops what was known about the other).
+  Only a variable can be lent - an expression, a constant or an outer function's local is a
+  compile error.  See the syntax reference for the rules.
+
 * **A C++ linking interface (FFI).**  `src/ffi.hpp` lets any C++ translation unit register native
   functions and whole modules (`ANNOTA_MODULE` / `ANNOTA_FUNCTION`); `use <module>` resolves them
   and members are ordinary calls, so new native capability no longer requires a language core
@@ -33,6 +40,26 @@ major change, and a new check is a minor one.
 * `annota ide docs` gained a **Linked C++ modules (FFI)** section generated from the FFI
   registry, so the reference manual lists every linked module and member automatically.
 * `examples/ffi.ant` and `examples/jit.ant`, plus `docs/ffi.md` and `docs/jit.md`.
+
+### Fixed
+
+* **Deep copy of containers actually copies them.**  `copyRec` (the engine behind `deepCopy`)
+  had no case for `List`, `Tuple` or `Map`, so `new b = a` shared `a`'s list: `b[0] = 99` was
+  visible through `a`.  This also silently disabled the documented by-value argument semantics,
+  and several library routines only "worked" because of it.
+* Library routines that relied on the broken copy: `Seq.heap_sort` (heap sift-down ran on a
+  copy), `Seq.kth_script`/`Seq._partition`, `Seq.swap` (removed), `Graph.add_edge` (edges were
+  written into a copy of the adjacency list and lost), `Graph`'s heap helpers (now a `_Heap`
+  class holding its array in a field) and `Num.hanoi` (accumulator is now an explicit stack;
+  `hanoi_into` is gone because a by-value parameter cannot accumulate).
+* `Test.check()` now fails the process, including failures from earlier suites - previously a
+  failing example still exited 0, which is how the above stayed hidden.
+* `examples/collections.ant`'s `group_by` mutated a method result (a copy); it writes back now.
+* Stack traces from functions that came from a `use`d module now name the module file instead of
+  the program that imported it (`at kth (lib/seq.mod:442)`).
+* `Text.pad_left` / `Text.pad_right` count terminal columns, so CJK tables line up
+  (`Text.width` is the new helper); `examples/perf.ant` no longer prints a boolean as the
+  interpreter version.
 
 ### Changed
 

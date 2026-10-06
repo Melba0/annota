@@ -146,4 +146,48 @@ Test.eq(text[5:], "fg", "字符串省略起点")
 Test.eq(text[:3], "abc", "字符串省略终点")
 Test.eq(text[:], "abcdefg", "字符串全切片")
 
+Test.suite("引用（lend）")
+
+-- 默认值语义：赋值会深拷贝
+new a = [1, 2]
+new b = a
+b.push(3)
+Test.eq(len(a), 2, "普通赋值是深拷贝")
+
+-- lend：两个名字共享同一份存储
+new xs = [1, 2]
+lend r = xs
+r.push(3)
+Test.eq(len(xs), 3, "引用写入对原变量可见")
+Test.eq(xs[2], 3, "内容一致")
+
+new n = 1
+lend m = n
+m = 9
+Test.eq(n, 9, "标量引用同步")
+
+-- 引用全局变量与局部变量
+new hits = 0
+bump()( lend h = hits, h = h + 1 )
+bump()
+bump()
+Test.eq(hits, 2, "函数内引用全局变量")
+
+sum_to(n)(
+    new acc = 0
+    lend a = acc
+    for k in 1 to n( a = a + k )
+    =acc
+)
+Test.eq(sum_to(5), 15, "函数内引用局部变量")
+
+-- 闭包捕获的是同一个单元
+new bag = [1]
+lend alias = bag
+new size_seen = 0
+look()( size_seen = len(alias) )
+alias.push(2)
+look()
+Test.eq(size_seen, 2, "闭包看到引用的写入")
+
 Test.check()

@@ -124,9 +124,12 @@ count_to(limit)(
     =i
 )
 
+lend alias = xs          -- 引用是显式的：lend 共享存储，其它情况一律深拷贝
+alias.push(9)            -- xs 也变成 [3, 1, 4, 1, 5, 9]
+
 -- 顶层代码就是入口
 new xs = [3, 1, 4, 1, 5]
-for x in sorted(xs)( print x )
+for x in Seq.sort(xs)( print x )
 
 new text = "hello"
 print text.upper(), len(text)

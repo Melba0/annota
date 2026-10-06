@@ -46,8 +46,10 @@ group_by(xs, key)(
     new out = Dict()
     for x in xs(
         new k = key(x)
-        new bucket = out.get_or(k, ()( =[] ))     -- 不存在就建一个桶
+        -- 方法返回的是副本（值语义），改完必须写回
+        new bucket = out.get_or(k, ()( =[] ))
         bucket.push(x)
+        out.set(k, bucket)
     )
     =out
 )

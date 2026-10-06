@@ -147,4 +147,14 @@ odd_cycle.add_edge(3, 1)
 Test.eq(odd_cycle.is_bipartite(), false, "奇环不是二分图")
 Test.eq(odd_cycle.has_cycle(), true, "奇环有环")
 
+Test.suite("邻接表写回")
+
+new g2 = Graph(true)
+g2.add_edge("A", "B", 2)
+g2.add_edge("A", "C", 5)
+Test.eq(Seq.sort(g2.neighbors("A")), ["B", "C"], "加边进入邻接表")
+Test.eq(g2.weight_of("A", "C"), 5, "权重可读")
+Test.eq(g2.distances("A").get("C"), 5, "最短路")
+Test.eq(g2.degree("A"), 2, "出度")
+
 Test.check()

@@ -1,0 +1,9 @@
+-[ expect: uninitialized ]-
+-[ lend 只能引用已声明的变量 ]-
+
+lend ghost = not_declared
+print ghost
+
+new real = 1
+lend ok = real
+print ok

@@ -127,6 +127,7 @@ struct Stmt {
     std::vector<ExprP> typeDims;   // `T[n][m]`                   // single type
     std::string module;                 // use
     bool isConst = false;
+    bool isLend = false;        // `lend a = b`: `a` shares `b`'s storage instead of copying it
     bool isStatic = false;
     bool isPublic = false;
     bool isPrivate = false;

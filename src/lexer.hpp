@@ -8,7 +8,7 @@ enum class T : uint8_t {
     End, Newline,
     Int, Float, Str, Char, Color, Ident, MacroParam,
     // keywords
-    Kw_new, Kw_del, Kw_const, Kw_macro, Kw_use, Kw_view, Kw_state,
+    Kw_new, Kw_del, Kw_const, Kw_lend, Kw_macro, Kw_use, Kw_view, Kw_state,
     Kw_if, Kw_else, Kw_elif, Kw_for, Kw_while, Kw_in, Kw_to, Kw_step,
     Kw_break, Kw_continue, Kw_throw, Kw_except, Kw_print, Kw_input,
     Kw_true, Kw_false, Kw_null, Kw_this, Kw_super, Kw_sep,

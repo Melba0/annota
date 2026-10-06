@@ -66,18 +66,57 @@ Text()=(
     )
 
     [[static]]
+    -- 显示宽度（终端列数）：先按 UTF-8 解码出码点，全角/宽字符算两列，其余算一列。
+    -- 注意字符串是字节串，直接 for ch in s 拿到的是字节，不能用来判断宽度。
+    [[static]]
+    width(s)(
+        new n = 0
+        new i = 0
+        while i < len(s)(
+            new b = ord(s[i])
+            if b < 0x80(
+                n = n + 1
+                i = i + 1
+            ) else (
+                new cp = 0
+                new extra = 0
+                if b >= 0xF0( cp = b - 0xF0, extra = 3 )
+                elif b >= 0xE0( cp = b - 0xE0, extra = 2 )
+                else ( cp = b - 0xC0, extra = 1 )
+                i = i + 1
+                new k = 0
+                while k < extra && i < len(s)(
+                    cp = cp * 64 + (ord(s[i]) - 0x80)
+                    i = i + 1
+                    k = k + 1
+                )
+                if (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) ||
+                   (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+                   (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+                   (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x3000 && cp <= 0x303E)(
+                    n = n + 2
+                ) else (
+                    n = n + 1
+                )
+            )
+        )
+        =n
+    )
+
+    [[static]]
     pad_left(s, width, fill = " ")(
         new out = s
-        while len(out) < width(
+        while Text.width(out) < width(
             out = fill + out
         )
         =out
     )
 
     [[static]]
+    [[static]]
     pad_right(s, width, fill = " ")(
         new out = s
-        while len(out) < width(
+        while Text.width(out) < width(
             out = out + fill
         )
         =out

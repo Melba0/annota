@@ -289,13 +289,30 @@ Seq()=(
 
     -- 堆排序：原地风格的 O(n log n)，不需要递归深度
     [[static]]
+    [[static]]
     heap_sort(xs, reverse = false)(
         new a = Seq.copy(xs)
         new n = len(a)
+        -- sift down 写成闭包：闭包按引用捕获 a，所以能原地调整又不违反"实参按值传递"
+        sift(root, size)(
+            new i = root
+            while true(
+                new child = i * 2 + 1
+                if child >= size( break )
+                if child + 1 < size && a[child + 1] > a[child](
+                    child = child + 1
+                )
+                if a[i] >= a[child]( break )
+                new t = a[i]
+                a[i] = a[child]
+                a[child] = t
+                i = child
+            )
+        )
         -- 建堆（自底向上 sift down）
         new i = math.floor(n / 2) - 1
         while i >= 0(
-            Seq._sift_down(a, i, n)
+            sift(i, n)
             i = i - 1
         )
         new end = n - 1
@@ -303,7 +320,7 @@ Seq()=(
             new t = a[0]
             a[0] = a[end]
             a[end] = t
-            Seq._sift_down(a, 0, end)
+            sift(0, end)
             end = end - 1
         )
         if reverse(
@@ -313,22 +330,6 @@ Seq()=(
     )
 
     [[static]]
-    _sift_down(a, root, size)(
-        new done = false
-        while !done(
-            new child = root * 2 + 1
-            if child >= size( =true )
-            if child + 1 < size && a[child + 1] > a[child](
-                child = child + 1
-            )
-            if a[root] >= a[child]( =true )
-            new t = a[root]
-            a[root] = a[child]
-            a[child] = t
-            root = child
-        )
-        =true
-    )
 
     [[static]]
     insertion_sort(xs, less)(
@@ -442,16 +443,50 @@ Seq()=(
 
     -- 脚本版快速选择（三数取中 + Lomuto 划分），保留作为参考实现
     [[static]]
+    [[static]]
     kth_script(xs, k)(
         if len(xs) == 0( =null )
         new a = Seq.copy(xs)
+        -- 划分写成闭包，按引用捕获 a（三数取中 + Lomuto）
+        partition(lo, hi)(
+            new mid = math.floor((lo + hi) / 2)
+            if a[mid] < a[lo](
+                new t = a[lo]
+                a[lo] = a[mid]
+                a[mid] = t
+            )
+            if a[hi] < a[lo](
+                new t2 = a[lo]
+                a[lo] = a[hi]
+                a[hi] = t2
+            )
+            if a[hi] < a[mid](
+                new t3 = a[mid]
+                a[mid] = a[hi]
+                a[hi] = t3
+            )
+            new pivot = a[hi]
+            new i = lo
+            for j in lo to hi - 1(
+                if a[j] < pivot(
+                    new t4 = a[i]
+                    a[i] = a[j]
+                    a[j] = t4
+                    i = i + 1
+                )
+            )
+            new t5 = a[i]
+            a[i] = a[hi]
+            a[hi] = t5
+            =i
+        )
         new lo = 0
         new hi = len(a) - 1
         new want = k
         if want < 0( want = 0 )
         if want > hi( want = hi )
         while lo < hi(
-            new p = Seq._partition(a, lo, hi)
+            new p = partition(lo, hi)
             if p == want( =a[p] )
             if want < p(
                 hi = p - 1
@@ -463,39 +498,6 @@ Seq()=(
     )
 
     [[static]]
-    _partition(a, lo, hi)(
-        -- 三数取中，避免有序输入退化成 O(n^2)
-        new mid = math.floor((lo + hi) / 2)
-        if a[mid] < a[lo](
-            new t = a[lo]
-            a[lo] = a[mid]
-            a[mid] = t
-        )
-        if a[hi] < a[lo](
-            new t = a[lo]
-            a[lo] = a[hi]
-            a[hi] = t
-        )
-        if a[hi] < a[mid](
-            new t = a[mid]
-            a[mid] = a[hi]
-            a[hi] = t
-        )
-        new pivot = a[hi]
-        new i = lo
-        for j in lo to hi - 1(
-            if a[j] < pivot(
-                new t = a[i]
-                a[i] = a[j]
-                a[j] = t
-                i = i + 1
-            )
-        )
-        new t = a[i]
-        a[i] = a[hi]
-        a[hi] = t
-        =i
-    )
 
     [[static]]
     median(xs)(
@@ -983,13 +985,6 @@ Seq()=(
     )
 
     [[static]]
-    swap(xs, i, j)(
-        if i < 0 || j < 0 || i >= len(xs) || j >= len(xs)( =false )
-        new t = xs[i]
-        xs[i] = xs[j]
-        xs[j] = t
-        =true
-    )
 
     [[static]]
     delete_at(xs, at)(

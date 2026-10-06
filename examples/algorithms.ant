@@ -268,4 +268,12 @@ Test.eq(m1.pow(3).to_lists(), [[37, 54], [81, 118]], "矩阵快速幂")
 Test.eq(Matrix.identity(3).trace(), 3, "迹")
 Test.eq(m1.transpose().to_lists(), [[1, 3], [2, 4]], "转置")
 
+Test.suite("脚本版与原生版一致")
+
+new mix = [9, 4, 7, 1, 8, 2, 6, 3, 5, 0]
+Test.eq(Seq.heap_sort(mix), Seq.sort(mix), "堆排序 = 归并排序")
+Test.eq(Seq.kth_script(mix, 3), Seq.kth(mix, 3), "脚本版快速选择 = 原生 nth")
+Test.eq(Seq.insertion_sort(mix, (a, b)( =a < b )), Seq.sort(mix), "插入排序一致")
+Test.eq(mix, [9, 4, 7, 1, 8, 2, 6, 3, 5, 0], "排序函数不改实参")
+
 Test.check()

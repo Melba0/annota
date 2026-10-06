@@ -537,18 +537,25 @@ Num()=(
 
     -- 汉诺塔：把移动序列写进 out，返回总步数（2^n - 1）
     [[static]]
-    hanoi_into(n, from, to, via, out)(
-        if n <= 0( =0 )
-        Num.hanoi_into(n - 1, from, via, to, out)
-        out.push((from, to))
-        Num.hanoi_into(n - 1, via, to, from, out)
-        =len(out)
-    )
 
+    [[static]]
     [[static]]
     hanoi(n)(
         new out = []
-        Num.hanoi_into(n, 1, 3, 2, out)
+        if n <= 0( =out )
+        -- 显式栈（LIFO）：先压"后做"的，弹出顺序就是合法移动序列
+        new stack = [(n, 1, 3, 2)]
+        while len(stack) > 0(
+            new frame = stack.pop()
+            new k = frame[0]
+            if k == 1(
+                out.push((frame[1], frame[2]))
+            ) else (
+                stack.push((k - 1, frame[3], frame[2], frame[1]))   -- via→to：最后做
+                stack.push((1, frame[1], frame[2], frame[3]))       -- from→to
+                stack.push((k - 1, frame[1], frame[3], frame[2]))   -- from→via：先做
+            )
+        )
         =out
     )
 

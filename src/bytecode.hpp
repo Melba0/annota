@@ -71,6 +71,7 @@ enum Op : uint8_t {
     OP_LOCAL_ADD_IMM,     // u8 slot, i8 imm   : slot = slot + imm        (fused under [[jit]])
     OP_LOCAL_SUB_IMM,     // u8 slot, i8 imm   : slot = slot - imm
     OP_LOCAL_ADD_LOCAL,   // u8 slot, u8 src   : slot = slot + src
+    OP_LEND,                        // u8 dstG, u16 dst, u8 srcG, u16 src : share storage
     OP_JUMP_IF_NOT_LT_LOCAL_LOCAL,  // u8 a, u8 b, s16 target : if !(locals[a] < locals[b]) jump
     OP_JUMP_IF_NOT_LT_LOCAL_IMM,    // u8 a, i8 imm, s16 target: if !(locals[a] < imm) jump
     OP_INDEX_ADD_IMM,               // u8 arr, u8 idx, i8 imm   : arr[idx] = arr[idx] + imm

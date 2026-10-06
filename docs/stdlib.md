@@ -82,8 +82,8 @@ Heap.from_list(xs).drain()   -- [1, 3, 5, 9]（二叉堆，O(n log n)）
 
 | 函数 | 说明 |
 |---|---|
-| `lower_bound(xs, v)` / `upper_bound(xs, v)` | 第一个 ≥ v / 第一个 > v 的下标 |
-| `bsearch(xs, v)` / `bsearch_by(xs, v, key)` | 二分查找，未命中返回 -1 |
+| `Seq.lower_bound(xs, v)` / `Seq.upper_bound(xs, v)` | 第一个 ≥ v / 第一个 > v 的下标 |
+| `Seq.bsearch(xs, v)` / `Seq.bsearch_by(xs, v, key)` | 二分查找，未命中返回 -1 |
 
 ### 统计（不含矩阵/相关性，见 stats）
 
@@ -167,7 +167,7 @@ index.get_or("bob", ()( =0 ))   -- 0，并且写回
 | 因数 | `prime_factors` `distinct_prime_factors` `divisors` `divisor_count` `divisor_sum` `is_perfect` |
 | 欧拉与组合 | `totient` `goldbach` `binomial` `pascal_row` `pascal_triangle` `catalan` `triangular` `is_triangular` |
 | 模运算 | `mod_pow`（O(log e)） `mod_inverse` `gcd_ext` `gcd` `lcm` `gcd_of_list` `lcm_of_list` |
-| 序列 | `fib` / `fib_pair`（快速倍增 O(log n)） `collatz_length` `collatz_path` `longest_collatz` `hanoi` `hanoi_into` |
+| 序列 | `fib` / `fib_pair`（快速倍增 O(log n)） `collatz_length` `collatz_path` `longest_collatz` `hanoi` |
 | 整数工具 | `integer_sqrt` `integer_root` `is_perfect_square` `pow_int` `digits` `from_digits` `digit_sum` `digital_root` `reverse_number` `is_palindrome_number` `is_armstrong` |
 | 进制 | `base_str(n, base)` `parse_base(s, base)`（2..36） |
 | 通用二分 | `binary_search_monotone(lo, hi, pred)` —— 返回满足 pred 的最小值 |

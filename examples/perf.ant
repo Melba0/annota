@@ -191,7 +191,8 @@ dijkstra_once(g)( =g.distances("0,0").size() )
 Test.suite("perf")
 new bench = Bench()
 print "== Annota 性能基准 =="
-print "解释器版本：" + str(_sys_clock() >= 0)
+print "运行环境：" + _sys_info("platform") + "/" + _sys_info("arch") + "  " +
+      str(_sys_info("cpus")) + " 核"
 
 -- ① 主循环
 new loop_n = 400000
@@ -224,7 +225,7 @@ Test.eq(Seq.heap_sort(data), expected, "堆排序结果与归并排序一致")
 Test.eq(Seq.sort_native(data), expected, "原生排序结果一致")
 bench.run("归并排序 (脚本)", sort_n, ()( Seq.merge_sort(data, (a, b)( =a < b )) ))
 bench.run("堆排序 (脚本)", sort_n, ()( Seq.heap_sort(data) ))
-bench.run("原生 sorted()", sort_n, ()( Seq.sort_native(data) ))
+bench.run("原生排序 (seqnative)", sort_n, ()( Seq.sort_native(data) ))
 
 -- ⑥ 查找
 new sorted_data = build_sorted(4000)
@@ -297,4 +298,24 @@ print ""
 bench.report()
 print Text.repeat("-", 60)
 print "基准总耗时: " + Time.describe_ms(bench.total_ms())
+-- ⑨ 引用（lend）：就地更新，省掉"取出—改—写回"的整份拷贝
+new bag_direct = []
+lend bag_ref = bag_direct
+add_direct(v)( lend b = bag_direct, b.push(v) )
+
+new bag_copy = []
+add_via_copy(xs, v)(
+    new out = xs                 -- 值语义：这里是一份拷贝
+    out.push(v)
+    =out                         -- 返回时再拷贝一次
+)
+
+new lend_n = 2000
+bench.run("追加 (lend 就地)", lend_n, ()( add_direct(1) ))
+bench.run("追加 (值语义拷贝)", lend_n, ()( bag_copy = add_via_copy(bag_copy, 1) ))
+
+Test.eq(len(bag_direct) == len(bag_copy), true, "两种写法的结果一致（次数由基准框架决定）")
+Test.eq(len(bag_direct) > 0, true, "确实追加了元素")
+Test.eq(bag_ref, bag_direct, "引用与原变量是同一份数据")
+
 Test.check()

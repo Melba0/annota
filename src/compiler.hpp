@@ -52,6 +52,7 @@ private:
         int tryDepth = 0;
         std::vector<LoopCtx> loops;
         bool isTopLevel = false;
+        std::string origin;           // module file, when the chunk came from `use`
         bool hasResult = false;
         int resultSlot = -1;
         std::vector<ExprP> ensures;
@@ -61,6 +62,7 @@ private:
 
     Program prog_;
     std::string file_;
+    std::string stmtOrigin_;          // source file of the statement being compiled
     bool contracts_ = false;
     FuncState* fs_ = nullptr;
     std::vector<std::unique_ptr<FuncState>> pool_;
@@ -101,6 +103,7 @@ private:
     void stmtWhile(const StmtP& s);
     void stmtFor(const StmtP& s);
     void stmtNew(const StmtP& s);
+    void emitLend(const StmtP& s);
     void stmtAssign(const StmtP& s);
     void stmtCompound(const StmtP& s);
     void stmtFuncDef(const StmtP& s);

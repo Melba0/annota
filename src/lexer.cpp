@@ -18,6 +18,7 @@ const char* tokenName(T t) {
         case T::Ident: return "identifier";
         case T::MacroParam: return "macro parameter";
         case T::Kw_new: return "'new'";
+        case T::Kw_lend: return "'lend'";
         case T::Kw_del: return "'del'";
         case T::Kw_const: return "'const'";
         case T::Kw_macro: return "'macro'";
@@ -96,6 +97,7 @@ namespace {
 const std::unordered_map<std::string, T>& keywords() {
     static const std::unordered_map<std::string, T> kw = {
         {"new", T::Kw_new}, {"del", T::Kw_del}, {"const", T::Kw_const},
+        {"lend", T::Kw_lend},
         {"macro", T::Kw_macro}, {"use", T::Kw_use}, {"view", T::Kw_view},
         {"state", T::Kw_state}, {"if", T::Kw_if}, {"else", T::Kw_else}, {"elif", T::Kw_elif},
         {"for", T::Kw_for}, {"while", T::Kw_while}, {"in", T::Kw_in},

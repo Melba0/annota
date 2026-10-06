@@ -111,4 +111,13 @@ Test.eq(moves[0], (1, 3), "第一步")
 Test.eq(moves[6], (1, 3), "最后一步")
 Test.eq(len(Num.hanoi(10)), 1023, "2^10 - 1 步")
 
+Test.suite("汉诺塔（按值传参下的累加）")
+
+new moves3 = Num.hanoi(3)
+Test.eq(len(moves3), 7, "2^3 - 1 步")
+Test.eq(moves3[0], (1, 3), "第一步 1→3")
+Test.eq(moves3[6], (1, 3), "最后一步 1→3")
+Test.eq(len(Num.hanoi(0)), 0, "0 层没有移动")
+Test.eq(len(Num.hanoi(10)), 1023, "2^10 - 1 步")
+
 Test.check()

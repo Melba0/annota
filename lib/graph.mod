@@ -10,6 +10,53 @@ use math
 use seq
 use dict
 
+-- 最小堆（按 (距离, 顶点) 对的第一个分量比较）。
+-- 堆数组放在实例字段里：Annota 的实参按值传递，把数组当参数改是改不动调用者的，
+-- 早先那版 _push(heap, ...) / _pop(heap) 就是靠深拷贝失效才"能跑"，这里改成实例方法。
+_Heap()=(
+    data:List = []
+
+    size() = len(data)
+
+    is_empty() = len(data) == 0
+
+    push(item)(
+        data.push(item)
+        new i = len(data) - 1
+        while i > 0(
+            new parent = math.floor((i - 1) / 2)
+            if data[parent][0] <= data[i][0]( break )
+            new t = data[parent]
+            data[parent] = data[i]
+            data[i] = t
+            i = parent
+        )
+        =item
+    )
+
+    pop()(
+        new top = data[0]
+        new last = data.pop()
+        if len(data) > 0(
+            data[0] = last
+            new i = 0
+            while true(
+                new l = i * 2 + 1
+                new r = i * 2 + 2
+                new small = i
+                if l < len(data) && data[l][0] < data[small][0]( small = l )
+                if r < len(data) && data[r][0] < data[small][0]( small = r )
+                if small == i( break )
+                new t = data[i]
+                data[i] = data[small]
+                data[small] = t
+                i = small
+            )
+        )
+        =top
+    )
+)
+
 Graph(directed = false)=(
     _adj = Dict()                 -- 顶点 -> [(邻居, 权重), ...]
     _directed:bool = false
@@ -30,11 +77,15 @@ Graph(directed = false)=(
     add_edge(u, v, w = 1)(
         add_vertex(u)
         add_vertex(v)
+        -- _adj.get 返回的是副本（Annota 的值语义：赋值/返回都会深拷贝），
+        -- 所以就地改完必须写回，否则边不会进入邻接表
         new au = _adj.get(u)
         au.push((v, w))
+        _adj.set(u, au)
         if !_directed(
             new av = _adj.get(v)
             av.push((u, w))
+            _adj.set(v, av)
         )
         _edge_list.push((u, v, w))
         =w
@@ -155,11 +206,11 @@ Graph(directed = false)=(
             index_of.set(v, i)
         )
         new n = len(names)
-        new heap = []                       -- [(距离, 下标)]，手工维护最小堆
-        Graph._push(heap, (0, index_of.get(start)))
+        new heap = _Heap()                  -- [(距离, 下标)]，最小堆
+        heap.push((0, index_of.get(start)))
         new done = Set()
-        while len(heap) > 0(
-            new top = Graph._pop(heap)
+        while !heap.is_empty()(
+            new top = heap.pop()
             new d = top[0]
             new v = names[top[1]]
             if done.has(v)( continue )
@@ -171,7 +222,7 @@ Graph(directed = false)=(
                 new cur = dist.get(u, -1)
                 if cur < 0 || nd < cur(
                     dist.set(u, nd)
-                    Graph._push(heap, (nd, index_of.get(u)))
+                    heap.push((nd, index_of.get(u)))
                 )
             )
         )
@@ -187,11 +238,11 @@ Graph(directed = false)=(
         )
         if !_adj.has(a)( =null )
         dist.set(a, 0)
-        new heap = []
-        Graph._push(heap, (0, a))
+        new heap = _Heap()
+        heap.push((0, a))
         new done = Set()
-        while len(heap) > 0(
-            new top = Graph._pop(heap)
+        while !heap.is_empty()(
+            new top = heap.pop()
             new d = top[0]
             new v = top[1]
             if done.has(v)( continue )
@@ -204,7 +255,7 @@ Graph(directed = false)=(
                 if cur < 0 || nd < cur(
                     dist.set(u, nd)
                     prev.set(u, v)
-                    Graph._push(heap, (nd, u))
+                    heap.push((nd, u))
                 )
             )
         )
@@ -386,42 +437,8 @@ Graph(directed = false)=(
 
     -- ---------------------------------------------------------- 堆（(距离, 顶点) 对）
     [[static]]
-    _push(heap, item)(
-        heap.push(item)
-        new i = len(heap) - 1
-        while i > 0(
-            new parent = math.floor((i - 1) / 2)
-            if heap[parent][0] <= heap[i][0]( break )
-            new t = heap[parent]
-            heap[parent] = heap[i]
-            heap[i] = t
-            i = parent
-        )
-        =item
-    )
 
     [[static]]
-    _pop(heap)(
-        new top = heap[0]
-        new last = heap.pop()
-        if len(heap) > 0(
-            heap[0] = last
-            new i = 0
-            while true(
-                new l = i * 2 + 1
-                new r = i * 2 + 2
-                new small = i
-                if l < len(heap) && heap[l][0] < heap[small][0]( small = l )
-                if r < len(heap) && heap[r][0] < heap[small][0]( small = r )
-                if small == i( break )
-                new t = heap[i]
-                heap[i] = heap[small]
-                heap[small] = t
-                i = small
-            )
-        )
-        =top
-    )
 
     -- 最小生成树：Kruskal（按权重排序 + 并查集）O(E log E)
     [[static]]
@@ -499,6 +516,7 @@ DSU(n)=(
             )
             new g = by_root.get(r)
             g.push(i)
+            by_root.set(r, g)
         )
         =by_root.values_list()
     )

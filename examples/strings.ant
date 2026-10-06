@@ -90,4 +90,12 @@ for w in Text.words("the cat sat on the mat the cat ran")(
 Test.eq(counts.get("the"), 3, "the 出现 3 次")
 Test.eq(counts.keys_sorted(), ["cat", "mat", "on", "ran", "sat", "the"], "词表有序")
 
+Test.suite("终端宽度与对齐")
+
+Test.eq(Text.width("中"), 2, "全角算两列")
+Test.eq(Text.width("ab"), 2, "半角算一列")
+Test.eq(Text.width(Text.pad_right("中", 4)), 4, "pad_right 对齐显示宽度")
+Test.eq(Text.width(Text.pad_left("中", 4)), 4, "pad_left 对齐显示宽度")
+Test.eq(Text.width(Text.pad_right("abc", 5)), 5, "纯 ASCII 不变")
+
 Test.check()

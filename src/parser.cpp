@@ -590,6 +590,7 @@ StmtP Parser::statementCore(Ctx ctx) {
     int line = cur().line;
     switch (cur().type) {
         case T::Kw_new:    return parseNew();
+        case T::Kw_lend:   return parseLend();
         case T::Kw_const:  return parseSimpleDecl(SK::Const, true);
         case T::Kw_state:  return parseState();
         case T::Kw_use:    return parseUse();
@@ -895,6 +896,28 @@ StmtP Parser::parseNew() {
         skipNL();
     }
     return first;
+}
+
+// `lend a = b` -- `a` becomes another name for `b`'s storage (no copy).  Only a variable can be
+// lent: a value expression has nothing to share.
+StmtP Parser::parseLend() {
+    int line = cur().line;
+    expect(T::Kw_lend);
+    StmtP s = std::make_shared<Stmt>();
+    s->kind = SK::New;                 // a declaration with the lend flag
+    s->isLend = true;
+    s->line = line;
+    Token nm = expect(T::Ident, "a variable name");
+    s->name = nm.text;
+    s->names.push_back(nm.text);
+    expect(T::Assign, "'=' in a lend declaration");
+    Token src = expect(T::Ident, "要引用的变量名（lend a = b 的 b）");
+    ExprP id = std::make_shared<Expr>();
+    id->kind = EK::Ident;
+    id->name = src.text;
+    id->line = line;
+    s->initExpr = id;
+    return s;
 }
 
 StmtP Parser::parseSimpleDecl(SK kind, bool requireInit) {

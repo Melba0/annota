@@ -68,7 +68,8 @@ int Compiler::addString(const std::string& s) {
 Compiler::FuncState* Compiler::pushState(const std::string& fnName, bool isTopLevel) {
     auto f = std::make_unique<FuncState>();
     f->chunk = std::make_shared<Chunk>();
-    f->chunk->file = file_;
+    f->chunk->file = stmtOrigin_.empty() ? file_ : stmtOrigin_;
+    f->origin = stmtOrigin_;
     f->chunk->fnName = fnName;
     f->parent = fs_;
     f->isTopLevel = isTopLevel;
@@ -234,6 +235,7 @@ void Compiler::compileContracts(const std::vector<Annotation>& anns, const char*
 }
 
 void Compiler::stmt(const StmtP& s) {
+    stmtOrigin_ = s->origin;          // "" for the main program, the module path for `use`d code
     stmtUnsafe_ = s && hasAnn(s->annotations, "unsafe");
     if (!s) return;
     switch (s->kind) {
@@ -663,7 +665,44 @@ void Compiler::emitNewArray(const StmtP& s) {
     emitByte(info, s->line);
 }
 
+// `lend a = b`: bind `a` to the very same storage cell as `b`.  Both names then read and write
+// the same value, and a closure that captured either name sees the other's writes.
+void Compiler::emitLend(const StmtP& s) {
+    if (s->names.size() != 1 || !s->initExpr || s->initExpr->kind != EK::Ident)
+        error("lend 只能写成 `lend a = b`", s->line);
+    const std::string& srcName = s->initExpr->name;
+    if (!s->type.empty() || !s->typeDims.empty())
+        error("lend 不能声明类型：被引用的变量已经有类型了", s->line);
+    // the source must be a variable of this function or a global (an outer function's local
+    // would need a different binding mechanism)
+    int srcSlot = -1;
+    for (size_t i = fs_->locals.size(); i-- > 0;)
+        if (fs_->locals[i].name == srcName) { srcSlot = (int)i; break; }
+    bool srcGlobal = srcSlot < 0;
+    if (srcGlobal && resolveLocal(fs_, srcName) >= 0)
+        error("lend 不能引用外层函数的局部变量 '" + srcName + "'", s->line);
+    if (srcGlobal && constGlobals_.count(srcName))
+        error("lend 不能引用常量 '" + srcName + "'", s->line);
+
+    bool dstGlobal = isGlobalScope();
+    uint16_t dst = 0, src = 0;
+    if (dstGlobal) dst = (uint16_t)addString(s->names[0]);
+    else {
+        int fresh = declareLocal(s->names[0], false);
+        dst = (uint16_t)fresh;
+    }
+    if (srcGlobal) src = (uint16_t)addString(srcName);
+    else src = (uint16_t)srcSlot;
+
+    emit(OP_LEND, s->line);
+    emitByte(dstGlobal ? 1 : 0, s->line);
+    emitU16(dst, s->line);
+    emitByte(srcGlobal ? 1 : 0, s->line);
+    emitU16(src, s->line);
+}
+
 void Compiler::stmtNew(const StmtP& s) {
+    if (s->isLend) { emitLend(s); return; }
     bool isConst = (s->kind == SK::Const);
     if (!s->typeDims.empty() && s->names.size() == 1) {
         emitNewArray(s);
@@ -1068,6 +1107,9 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
         emit(OP_RETURN_NULL, 0);
     }
     std::shared_ptr<Chunk> ch = f->chunk;
+    // a function that came from a `use`d module keeps the module's file name, so stack traces
+    // point at the module instead of at whoever wrote `use`
+    if (!f->origin.empty()) ch->file = f->origin;
     popState();
     if (hasAnn(anns, "jit")) {
         optimizeChunk(ch);                    // superinstructions first

@@ -120,6 +120,18 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
                         formatInt(v);
                 break;
             }
+            case OP_LEND: {
+                uint8_t dstG = u8();
+                uint16_t dst = u16();
+                uint8_t srcG = u8();
+                uint16_t src = u16();
+                const Value& dn = constAt(dst);
+                const Value& sn = constAt(src);
+                extra = std::string(dstG ? "global " : "slot ") +
+                        (dstG ? (dn.o ? dn.o->str : std::string("?")) : formatInt(dst)) + " := " +
+                        (srcG ? (sn.o ? sn.o->str : std::string("?")) : formatInt(src));
+                break;
+            }
             case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: {
                 uint8_t a = u8();
                 uint8_t b = u8();

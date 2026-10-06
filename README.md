@@ -124,7 +124,10 @@ count_to(limit)(
 
 -- top level code: this *is* the entry point
 new xs = [3, 1, 4, 1, 5]
-for x in sorted(xs)( print x )
+for x in Seq.sort(xs)( print x )
+
+lend alias = xs          -- references are explicit: `lend` shares storage, everything else copies
+alias.push(9)            -- xs is now [3, 1, 4, 1, 5, 9]
 
 new text = "hello"
 print text.upper(), len(text)
@@ -629,8 +632,8 @@ How to read this:
 * **Script-level algorithms land at 0.01%-1%** of C++ (sorting, DP, graphs), because each
   algorithmic step expands into many VM instructions and allocations.  `KMP` (5.3%) and fixed
   arrays (1.0%) are the good cases: long tight loops over cheap operations.
-* **Native primitives run at C++ speed**: `sorted()`, `len`, `sum`, string methods and file I/O are
-  single C++ calls (the `原生 sorted()` row measures 0 ms - it is one `std::sort`).
+* **Native primitives run at C++ speed**: `Seq.sort` (the native `seqnative` module), `len`, `sum`, string methods and file I/O are
+  single C++ calls (the `原生排序 (seqnative)` row measures 0 ms - it is one `std::stable_sort`).
 * For calibration, this is **CPython-class on dispatch** (CPython's simple int loop is ~20-35 ns per
   iteration, the fused Annota loop is 65 ns) and **~12x slower than CPython on function calls**
   (~1075 ns vs ~50-90 ns), which is the clearest remaining target.

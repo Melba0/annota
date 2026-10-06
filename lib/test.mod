@@ -25,6 +25,9 @@ Test()=(
     grand_failed = 0
 
     [[static]]
+    grand_failures = []
+
+    [[static]]
     suite(name)(
         Test.subject = name
         Test.total = 0
@@ -41,6 +44,7 @@ Test()=(
             Test.failed = Test.failed + 1
             Test.grand_failed = Test.grand_failed + 1
             Test.failures.push(msg)
+            Test.grand_failures.push(msg)
             print "  [FAIL] " + msg
         )
         =cond
@@ -99,13 +103,20 @@ Test()=(
         =Test.failed == 0
     )
 
+    -- 打印汇总；只要有失败就以非零退出码结束，跑测试的脚本/CI 才不会漏掉
+    -- 打印汇总；只要有失败（包括前几个套件里失败的）就以非零退出码结束，
+    -- 这样 CI 和验证脚本不会漏掉失败。
     [[static]]
     check()(
-        Test.report()
-        if Test.failed > 0(
-            for f in Test.failures(
+        new ok = Test.report()
+        if Test.failed > 0 || Test.grand_failed > 0(
+            new list = Test.failures
+            if len(list) == 0( list = Test.grand_failures )
+            for f in list(
                 print "   * " + f
             )
+            throw "测试失败: " + Test.grand_failed + "/" + Test.grand_total + " 项未通过"
         )
+        =ok
     )
 )

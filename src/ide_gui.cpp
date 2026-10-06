@@ -326,7 +326,7 @@ public:
         QTextCharFormat kw;
         kw.setForeground(QColor(0x00, 0x5C, 0xC5));
         kw.setFontWeight(QFont::Bold);
-        for (const char* k : {"new", "del", "const", "if", "elif", "else", "while", "for", "in", "to", "step",
+        for (const char* k : {"new", "del", "const", "lend", "if", "elif", "else", "while", "for", "in", "to", "step",
                               "break", "continue", "throw", "except", "print", "input", "use", "macro",
                               "view", "state", "true", "false", "null"})
             add(QStringLiteral("\\b%1\\b").arg(k), kw);

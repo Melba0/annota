@@ -458,6 +458,14 @@ void VM::applyStyle(Value& node) {
     node.o->map.erase("style");
 }
 
+// Value semantics without a pointless copy: if the frame holds the only reference to an
+// object, it cannot be observed from anywhere else, so it can be stored or returned as is.
+// Anything still referenced elsewhere (a global, an upvalue, a closure, the caller) is copied.
+static inline Value copyIfShared(const Value& v) {
+    if (!v.o || v.o.use_count() <= 1) return v;
+    return deepCopy(v);
+}
+
 // Reading a local without copying it: a null cell behaves like null.
 static inline const Value& cellValue(const Cell& c) {
     static const Value kNull;
@@ -849,13 +857,13 @@ Value VM::execute(size_t stopDepth) {
                         Value v = pop();
                         Cell& c = f.locals[s];
                         if (!c) c = std::make_shared<Value>();
-                        *c = deepCopy(v);
+                        *c = copyIfShared(v);
                         break;
                     }
                     case OP_INIT_LOCAL: {
                         uint8_t s = code[f.ip++];
                         Value v = pop();
-                        f.locals[s] = std::make_shared<Value>(deepCopy(v));
+                        f.locals[s] = std::make_shared<Value>(copyIfShared(v));
                         break;
                     }
                     case OP_DEL_LOCAL: {
@@ -871,7 +879,7 @@ Value VM::execute(size_t stopDepth) {
                     case OP_SET_UPVAL: {
                         uint8_t s = code[f.ip++];
                         Value v = pop();
-                        *f.upvals[s] = deepCopy(v);
+                        *f.upvals[s] = copyIfShared(v);
                         break;
                     }
                     case OP_GET_GLOBAL: {
@@ -901,7 +909,7 @@ Value VM::execute(size_t stopDepth) {
                         Value v = pop();
                         auto it = globals.find(name);
                         if (it != globals.end() && it->second) {
-                            *it->second = deepCopy(v);
+                            *it->second = copyIfShared(v);
                             if (stateNames.count(name) && onStateChange) onStateChange(*this);
                             break;
                         }
@@ -971,6 +979,30 @@ Value VM::execute(size_t stopDepth) {
                         for (int i = (int)nd - 2; i >= 0; i--)
                             strides[(size_t)i] = strides[(size_t)i + 1] * dims[(size_t)i + 1];
                         push(Value::array(buf, dims, strides, 0, ek, eltStr, dyn));
+                        break;
+                    }
+                    case OP_LEND: {
+                        uint8_t dstG = code[f.ip++];
+                        uint16_t dst = (uint16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
+                        uint8_t srcG = code[f.ip++];
+                        uint16_t src = (uint16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
+                        Cell shared;
+                        if (srcG) {
+                            const std::string& n = f.chunk->consts[src].o->str;
+                            auto it = globals.find(n);
+                            if (it == globals.end() || !it->second)
+                                throwError("lend: 未声明的变量 '" + n + "'（只能引用同一函数的局部变量或全局变量）");
+                            shared = it->second;
+                        } else {
+                            if (src >= f.locals.size() || !f.locals[src])
+                                throwError("lend: 未初始化的局部变量");
+                            shared = f.locals[src];
+                        }
+                        if (dstG) globals[f.chunk->consts[dst].o->str] = shared;
+                        else {
+                            if (dst >= f.locals.size()) throwError("internal: lend slot out of range");
+                            f.locals[dst] = shared;
+                        }
                         break;
                     }
                     case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: {
@@ -1365,7 +1397,7 @@ Value VM::execute(size_t stopDepth) {
                         continue;
                     }
                     case OP_RETURN: {
-                        Value r = deepCopy(pop());
+                        Value r = copyIfShared(pop());
                         Frame fr = std::move(frames.back());
                         frames.pop_back();
                         while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
@@ -1893,6 +1925,7 @@ const char* opName(uint8_t op) {
         case OP_NEW_ARRAY: return "new-array";
         case OP_GET_INDEX_FAST: return "index-fast";
         case OP_NOP: return "nop";
+        case OP_LEND: return "lend";
         case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: return "local<local?";
         case OP_JUMP_IF_NOT_LT_LOCAL_IMM: return "local<imm?";
         case OP_INDEX_ADD_IMM: return "index+=";

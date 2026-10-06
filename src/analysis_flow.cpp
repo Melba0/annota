@@ -590,6 +590,62 @@ private:
     void checkReachability(FuncInfo* f);
     void checkDeadStores(FuncInfo* f);
     std::map<std::string, Lin> subst_;   // CAS equalities
+
+// `lend a = b` makes two names share one storage cell.  The analyzer cannot follow the aliasing
+// through arbitrary code, but it must not draw wrong conclusions:
+//   * a read of either name counts as a read of the other (no bogus "dead store");
+//   * a write through either name drops what was known about the other (same storage!).
+std::map<std::string, int> lendGroup_;                  // name -> group id
+std::map<int, std::vector<std::string>> lendMembers_;   // group id -> members
+int lendNext_ = 0;
+
+void lendRegister(const std::string& target, const std::string& source) {
+    int gid;
+    auto it = lendGroup_.find(source);
+    if (it != lendGroup_.end()) {
+        gid = it->second;
+    } else {
+        gid = ++lendNext_;
+        lendGroup_[source] = gid;
+        lendMembers_[gid].push_back(source);
+    }
+    lendGroup_[target] = gid;
+    lendMembers_[gid].push_back(target);
+}
+
+void lendTouchRead(const std::string& name, Env& env) {
+    auto it = lendGroup_.find(name);
+    if (it == lendGroup_.end()) return;
+    for (auto& m : lendMembers_[it->second]) {
+        if (m == name) continue;
+        if (AbsVal* v = env.find(m)) { v->read = true; v->readSinceAssign = true; }
+        auto g = globalsEnv_.vars.find(m);
+        if (g != globalsEnv_.vars.end()) g->second.read = true;
+    }
+}
+
+void lendTouchWrite(const std::string& name, Env& env, int line) {
+    auto it = lendGroup_.find(name);
+    if (it == lendGroup_.end()) return;
+    for (auto& m : lendMembers_[it->second]) {
+        if (m == name) continue;
+        AbsVal* v = env.find(m);
+        if (!v) {
+            auto g = globalsEnv_.vars.find(m);
+            if (g == globalsEnv_.vars.end()) continue;
+            v = &g->second;
+        }
+        AbsVal fresh;
+        fresh.type = v->type;
+        fresh.declLine = v->declLine ? v->declLine : line;
+        fresh.assignLine = line;
+        fresh.isLocal = v->isLocal;
+        fresh.init = v->init;
+        fresh.read = true;
+        fresh.readSinceAssign = true;
+        *v = fresh;
+    }
+}
     std::map<std::string, Lin> loBnd_, hiBnd_;   // CAS linear lower/upper bounds
     // Fold the linear bounds that turn out to be constants back into the abstract ranges, so the
     // overflow/index checks see them too (`[[assume: n <= 1000 && i < n]]` gives i <= 999).
@@ -966,6 +1022,7 @@ void Flow::assignTo(const ExprP& target, const AbsVal& v, Env& env, int line, bo
     if (!target) return;
     if (target->kind == EK::Ident) {
         const std::string& name = target->name;
+        if (!declare) lendTouchWrite(name, env, line);
         if (declare) {
             AbsVal nv = v;
             nv.declLine = line;
@@ -1000,6 +1057,11 @@ void Flow::assignTo(const ExprP& target, const AbsVal& v, Env& env, int line, bo
         found->readSinceAssign = false;
         if (found->declLine == 0) found->declLine = line;
         return;
+    }
+    if (target->kind == EK::Index) {
+        // `xs[0] = v` changes the storage that `lend` aliases share
+        ExprP base = target->a;
+        if (base && base->kind == EK::Ident) lendTouchWrite(base->name, env, line);
     }
     if (target->kind == EK::Field) {
         AbsVal base = eval(target->a, env);
@@ -1137,12 +1199,14 @@ AbsVal Flow::eval(const ExprP& e, Env& env, bool iterablePosition) {
                                "声明时没有给出初始值", "在声明处赋值，例如 new " + e->name + " = ...");
                 found->read = true;
                 found->readSinceAssign = true;
+                lendTouchRead(e->name, env);
                 return *found;
             }
             if (globals_.count(e->name) || builtinNames_.count(e->name)) {
                 auto g = globalsEnv_.vars.find(e->name);
                 if (g != globalsEnv_.vars.end()) {
                     g->second.read = true;
+                    lendTouchRead(e->name, env);
                     return g->second;
                 }
                 v.type = builtinNames_.count(e->name) ? "Fn" : "unknown";
@@ -1438,6 +1502,7 @@ AbsVal Flow::evalCall(const ExprP& e, Env& env) {
                 recvPtr->sizeKey.clear();
                 recvPtr->read = true;
             }
+            if (e->a->a && e->a->a->kind == EK::Ident) lendTouchWrite(e->a->a->name, env, e->line);
             if (m == "pop" || m == "remove") {
                 v.type = "unknown";
                 return v;
@@ -1921,15 +1986,27 @@ void Flow::block(const BlockP& b, Env& env, bool newScope) {
         const StmtP& s = b->stmts[i];
         if (!s) continue;
         if (!skip(s) && s->kind != SK::Annot) {
+            // remember lend aliases in statement order, so a read of one name counts as a read
+            // of the other even before the main pass reaches the declaration
+            if (s->kind == SK::New && s->isLend && s->initExpr &&
+                s->initExpr->kind == EK::Ident)
+                lendRegister(s->names[0], s->initExpr->name);
             std::set<std::string> u, d;
-            stmtDirectUseDef(s.get(), u, d);
+            stmtUseDef(s.get(), u, d);
             for (auto& x : u) pendingStore.erase(x);
+            // a `lend` alias is the same storage: reading either name counts as reading both
+            for (auto& x : u) {
+                auto gi = lendGroup_.find(x);
+                if (gi == lendGroup_.end()) continue;
+                for (auto& m : lendMembers_[gi->second]) pendingStore.erase(m);
+            }
             std::set<std::string> stored;
             if (s->kind == SK::Assign && s->target && s->target->kind == EK::Ident) stored.insert(s->target->name);
             else if (s->kind == SK::CompoundAssign && s->target && s->target->kind == EK::Ident) stored.insert(s->target->name);
             else if ((s->kind == SK::New || s->kind == SK::Const) && s->initExpr)
                 for (auto& x : s->names) stored.insert(x);
             for (auto& x : stored) {
+                if (lendGroup_.count(x)) continue;          // aliased storage: not provably dead
                 auto it = pendingStore.find(x);
                 if (it != pendingStore.end() && !deadReported_.count(x)) {
                     int dl = it->second;
@@ -2058,6 +2135,8 @@ void Flow::stmt(const StmtP& s, Env& env) {
             break;
         }
         case SK::New: case SK::Const: {
+            if (s->isLend && s->initExpr && s->initExpr->kind == EK::Ident)
+                lendRegister(s->names[0], s->initExpr->name);
             AbsVal v;
             if (!s->typeDims.empty()) {
                 // `T[n]` / `T[]` / `T[m][n]`: an Array of the element type, with a statically
@@ -2562,10 +2641,35 @@ void Flow::checkDeadStores(FuncInfo* f) {
         if (s->body && s->body->exceptBody) for (auto& x : s->body->exceptBody->stmts) decls(x);
     };
     for (auto& s : f->def->body->stmts) decls(s);
+    // `lend` aliases are one storage: give liveness a consistent view, otherwise writing through
+    // one name looks like a dead store for the other
+    {
+        std::function<void(const StmtP&)> regLend = [&](const StmtP& s) {
+            if (!s) return;
+            if (s->kind == SK::New && s->isLend && s->initExpr && s->initExpr->kind == EK::Ident)
+                lendRegister(s->names[0], s->initExpr->name);
+            if (s->kind == SK::FuncDef) return;
+            if (s->body) for (auto& x : s->body->stmts) regLend(x);
+            if (s->elseBody) for (auto& x : s->elseBody->stmts) regLend(x);
+            if (s->body && s->body->exceptBody) for (auto& x : s->body->exceptBody->stmts) regLend(x);
+        };
+        for (auto& s : f->def->body->stmts) regLend(s);
+    }
+    auto lendExpand = [&](std::set<std::string>& set) {
+        std::set<std::string> extra;
+        for (auto& x : set) {
+            auto gi = lendGroup_.find(x);
+            if (gi == lendGroup_.end()) continue;
+            for (auto& m : lendMembers_[gi->second]) extra.insert(m);
+        }
+        set.insert(extra.begin(), extra.end());
+    };
     for (size_t i = 0; i < n; i++) {
         std::set<std::string> u2, d2;
         for (auto& x : use[i]) if (locals.count(x)) u2.insert(x);
         for (auto& x : def[i]) if (locals.count(x)) d2.insert(x);
+        lendExpand(u2);
+        lendExpand(d2);
         use[i] = u2;
         def[i] = d2;
     }
@@ -2607,6 +2711,7 @@ void Flow::checkDeadStores(FuncInfo* f) {
             if (!usedAnywhere) continue;
             if (deadReported_.count(x)) continue;
             if (x.empty() || x[0] == '_') continue;
+            if (lendGroup_.count(x)) continue;              // aliased storage: not provably dead
             col_.info("dead-store", st->line, "死存储：'" + x + "' 的值之后再未被读取",
                       "该赋值的结果不会影响任何后续计算", "删除该赋值，或检查是否漏用了这个变量");
             deadReported_.insert(x);

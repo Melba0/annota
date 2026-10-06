@@ -444,6 +444,26 @@ static Value copyRec(const Value& v, std::unordered_map<const Obj*, Value>& memo
             Value out = Value::bytes(v.o ? v.o->bytes : std::vector<uint8_t>{});
             return out;
         }
+        case VT::List:
+        case VT::Tuple: {
+            if (!v.o) return v;
+            auto it = memo.find(v.o.get());
+            if (it != memo.end()) return it->second;          // shared/cyclic structures
+            Value out = v.t == VT::List ? Value::list({}) : Value::tuple({});
+            memo[v.o.get()] = out;
+            out.o->items.reserve(v.o->items.size());
+            for (auto& x : v.o->items) out.o->items.push_back(copyRec(x, memo, depth + 1));
+            return out;
+        }
+        case VT::Map: {
+            if (!v.o) return v;
+            auto it = memo.find(v.o.get());
+            if (it != memo.end()) return it->second;
+            Value out = Value::map({});
+            memo[v.o.get()] = out;
+            for (auto& kv : v.o->map) out.o->map[kv.first] = copyRec(kv.second, memo, depth + 1);
+            return out;
+        }
         case VT::Instance: {
             if (!v.o) return v;
             auto it = memo.find(v.o.get());

@@ -208,4 +208,29 @@ Test.eq(dict_.get("k"), 1, "Dict.get")
 Test.eq(len(dict_), 1, "Dict __len__")
 Test.eq(arr[2:4].size(), 2, "SliceView.size")
 
+Test.suite("值语义与拷贝")
+
+new src = [1, 2, 3]
+new dst = src
+dst[0] = 99
+Test.eq(src[0], 1, "赋值是深拷贝")
+
+new box = [1]
+take_arg(a)(
+    a.push(2)
+    =len(a)
+)
+Test.eq(take_arg(box), 2, "函数内看到的是自己的副本")
+Test.eq(len(box), 1, "函数内改实参不影响调用者")
+
+new d0 = Dict()
+d0.set("k", [1])
+new got = d0.get("k")
+got.push(2)
+Test.eq(len(d0.get("k")), 1, "方法返回值是副本，改它不影响容器")
+
+new nested = [[1], [2]]
+nested[0].push(9)
+Test.eq(len(nested[0]), 2, "下标取值共享元素对象，可以就地改")
+
 Test.check()

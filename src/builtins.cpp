@@ -151,15 +151,6 @@ static Value convertTo(VM& vm, const std::string& type, const Value& v) {
     vm.throwError("unknown type '" + type + "'");
 }
 
-static bool asLess(const Value& a, const Value& b, bool& ok) {
-    ok = true;
-    if (a.isNumber() && b.isNumber()) return a.asFloat() < b.asFloat();
-    if (a.t == VT::Str && b.t == VT::Str) return a.o->str < b.o->str;
-    if (a.t == VT::Bool && b.t == VT::Bool) return (int)a.b < (int)b.b;
-    if (a.t == VT::Color && b.t == VT::Color) return a.o->color < b.o->color;
-    ok = false;
-    return false;
-}
 
 static std::vector<Value> itemsOf(VM& vm, const Value& v) {
     if (v.t == VT::List || v.t == VT::Tuple) return v.o->items;
