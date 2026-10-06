@@ -1,0 +1,250 @@
+# Publish a release: pushing a tag like v1.0.0 builds both bundles, smoke-tests them and creates
+# the GitHub Release.  Can also be started by hand (workflow_dispatch) with an existing tag.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Bundles:
+#   annota-vX.Y.Z-windows-x64.zip    annota.exe + Qt DLLs + platforms/ + lib/ + src/ + docs/
+#   annota-vX.Y.Z-linux-x86_64.tar.gz  annota + lib/ + src/ + docs/
+# Both ship `lib/` next to the executable, so the standard library resolves without any setup,
+# and `src/` + the import library, so `annota plugin build` works out of the extracted folder.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 bundle (MinGW + Qt 6)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          cache: true
+
+      - name: Make Qt's MinGW available
+        shell: pwsh
+        run: |
+          # install-qt-action also installs the matching MinGW toolchain next to Qt
+          $mingw = Join-Path $env:RUNNER_WORKSPACE "Qt" "Tools"
+          if (Test-Path $mingw) { Get-ChildItem $mingw -Directory | ForEach-Object {
+            $bin = Join-Path $_.FullName "bin"
+            if (Test-Path $bin) { Add-Content $env:GITHUB_PATH $bin } } }
+
+      - name: Build and verify
+        shell: pwsh
+        # -Verify runs the examples, the analyzer fixtures, the plugin round-trip, the benchmark,
+        # the LSP smoke test and (when a Qt platform is available) the IDE checks.  A release is
+        # therefore never built from a commit that has not passed the suite.
+        run: powershell -ExecutionPolicy Bypass -File build.ps1 -QtRoot "$env:QT_ROOT_DIR" -Verify
+
+      - name: Assemble and smoke-test the bundle
+        shell: pwsh
+        run: |
+          $ver = '${{ github.event.inputs.tag }}'
+          if (-not $ver) { $ver = '${{ github.ref_name }}' }
+          $name = "annota-$ver-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # the interpreter, its Qt runtime, the import library for plugins
+          Copy-Item build\annota.exe $stage
+          Copy-Item build\*.dll $stage
+          if (Test-Path build\libannota.dll.a) { Copy-Item build\libannota.dll.a $stage }
+          if (Test-Path build\qt.conf) { Copy-Item build\qt.conf $stage }
+          if (Test-Path build\platforms) { Copy-Item build\platforms $stage -Recurse }
+
+          # standard library, examples, headers for plugins, docs, build files
+          foreach ($d in @("lib", "examples", "docs", "src", "native", "plugins")) {
+            if (Test-Path $d) { Copy-Item $d $stage -Recurse }
+          }
+          foreach ($f in @("README.md", "README_zh.md", "CHANGELOG.md", "CONTRIBUTING.md",
+                           "LICENSE", "build.ps1", "CMakeLists.txt")) {
+            if (Test-Path $f) { Copy-Item $f $stage }
+          }
+
+          # a release must work on its own: run the self-check from inside the bundle, with no
+          # repository around it and no environment variables
+          Push-Location $stage
+          & "$stage\annota.exe" --features
+          $check = & "$stage\annota.exe" examples\selfcheck.ant 2>&1 | Out-String
+          Pop-Location
+          $check -split "`n" | Select-Object -Last 3
+          if ($check -notmatch "0 failures") {
+            Write-Error "bundle self-check failed:`n$check"
+            exit 1
+          }
+
+          Compress-Archive -Path $stage -DestinationPath (Join-Path $env:RUNNER_TEMP "$name.zip") -Force
+          Write-Host "bundle: $name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: ${{ runner.temp }}/annota-*-windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 bundle (g++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a compiler
+        run: sudo apt-get update && sudo apt-get install -y g++
+
+      - name: Build
+        run: |
+          # native/*.cpp are the FFI kernels the standard library calls (`seqnative`);
+          # -rdynamic lets a separately built plugin resolve the interpreter's symbols.
+          g++ -std=c++17 -O2 -pthread -rdynamic -Isrc src/*.cpp native/*.cpp -o annota
+
+      - name: Analyzer fixtures and benchmark
+        run: |
+          ./annota analyze-suite examples/analysis
+          ./annota bench
+
+      - name: Assemble and smoke-test the bundle
+        run: |
+          set -euo pipefail
+          ver="${{ github.event.inputs.tag }}"
+          if [ -z "$ver" ]; then ver="${GITHUB_REF_NAME}"; fi
+          name="annota-${ver}-linux-x86_64"
+          stage="${RUNNER_TEMP}/${name}"
+          mkdir -p "$stage"
+
+          cp annota "$stage/"
+          for d in lib examples docs src native plugins; do
+            if [ -d "$d" ]; then cp -r "$d" "$stage/"; fi
+          done
+          for f in README.md README_zh.md CHANGELOG.md CONTRIBUTING.md LICENSE build.ps1 CMakeLists.txt; do
+            if [ -f "$f" ]; then cp "$f" "$stage/"; fi
+          done
+
+          # a release must work on its own: run the self-check inside the bundle
+          ( cd "$stage" && ./annota --features )
+          out="$(cd "$stage" && ./annota examples/selfcheck.ant 2>&1 || true)"
+          echo "$out" | tail -3
+          case "$out" in *"0 failures"*) ;; *) echo "bundle self-check failed"; exit 1;; esac
+
+          tar -C "$RUNNER_TEMP" -czf "${RUNNER_TEMP}/${name}.tar.gz" "$name"
+          echo "bundle: ${name}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ runner.temp }}/annota-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub Release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4      # for CHANGELOG.md, used as the release body
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -lh
+          sha256sum annota-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ]; then tag="${GITHUB_REF_NAME}"; fi
+          if [ -z "$tag" ]; then echo "no tag: push a v* tag or pass one to workflow_dispatch"; exit 1; fi
+
+          # pre-release for tags that carry a suffix such as v1.1.0-rc1
+          pre=""
+          case "$tag" in *-*) pre="--prerelease";; esac
+
+          # the release body: the changelog section for this version (when there is one), then
+          # what is inside the bundles, how to run them and how they were verified
+          ver="${tag#v}"
+          : > changes.md
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$ver" '
+              $0 ~ "^## \\[" v "\\]" { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md > changes.md
+          fi
+
+          cat > bundle-notes.md <<EOF
+          Prebuilt **$tag** bundles for Windows x64 (MinGW + Qt 6) and Linux x86_64 (g++).
+
+          ### What is inside
+
+          | Bundle | Contents |
+          |---|---|
+          | \`annota-$tag-windows-x64.zip\` | \`annota.exe\`, the Qt 6 runtime, \`platforms/\` (offscreen included), \`lib/\`, \`src/\`, \`native/\`, \`plugins/\`, \`docs/\`, \`examples/\`, \`libannota.dll.a\` |
+          | \`annota-$tag-linux-x86_64.tar.gz\` | \`annota\`, \`lib/\`, \`src/\`, \`native/\`, \`plugins/\`, \`docs/\`, \`examples/\` |
+
+          Each bundle keeps \`lib/\` next to the executable, so the standard library resolves with no
+          setup, and ships \`src/\` plus (on Windows) the import library, so a plugin can be built
+          from the extracted folder:
+
+          \`\`\`powershell
+          .\annota.exe examples\selfcheck.ant            # language self-check
+          .\annota.exe examples\perf.ant                 # benchmark
+          .\annota.exe plugin build plugins\hello.cpp    # build a plugin, then use hello
+          \`\`\`
+
+          ### Verification
+
+          CI built each bundle, then ran \`annota examples/selfcheck.ant\` **from inside the extracted
+          bundle** with no repository and no environment variables; the job fails if that does not
+          report \`0 failures\`.  The full suite (\`build.ps1 -Verify\`) runs on every push.
+
+          Documentation: [syntax](docs/syntax.md) · [standard library](docs/stdlib.md) ·
+          [tools & plugins](docs/tools.md) · [JIT](docs/jit.md) · [FFI](docs/ffi.md).
+
+          SHA-256 checksums are in \`SHA256SUMS\`.
+          EOF
+
+          if [ -s changes.md ]; then
+            echo "## What changed"
+            echo
+            cat changes.md
+            echo
+            cat bundle-notes.md
+          else
+            cat bundle-notes.md
+          fi > release-notes.md
+          wc -l release-notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --notes-file release-notes.md
+          else
+            gh release create "$tag" dist/* --title "$tag" --notes-file release-notes.md $pre
+          fi
+          echo "published: $tag"

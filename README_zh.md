@@ -7,6 +7,7 @@
 [English](README.md) | [简体中文](README_zh.md)
 
 [![build](https://github.com/Melba0/annota/actions/workflows/build.yml/badge.svg)](https://github.com/Melba0/annota/actions/workflows/build.yml)
+[![release](https://github.com/Melba0/annota/actions/workflows/release.yml/badge.svg)](https://github.com/Melba0/annota/releases/latest)
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-blue.svg)](#构建)
 [![GUI](https://img.shields.io/badge/GUI-Qt%206-green.svg)](#图形化-ide)
 [![Tests](https://img.shields.io/badge/verification-build.ps1%20--Verify-success.svg)](#验证)
@@ -82,6 +83,19 @@ Annota 是一门"标注即规范"的小语言：`[[require]]`、`[[ensure]]`、`
 ---
 
 ## 快速开始
+
+每个 [Release](https://github.com/Melba0/annota/releases/latest) 都带**预编译压缩包**（不需要编译器、也不用装 Qt）：
+解压后直接运行
+
+```powershell
+.\annota.exe examples\selfcheck.ant      # Windows x64 包
+./annota examples/selfcheck.ant          # Linux x86_64 包
+```
+
+`lib/` 就在可执行文件旁边，`src/` 也一并打包，所以标准库开箱可用，`annota plugin build`
+在解压目录里就能编译插件。
+
+从源码构建：
 
 ```powershell
 git clone https://github.com/Melba0/annota.git

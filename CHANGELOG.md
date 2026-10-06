@@ -11,6 +11,14 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* **Automatic releases.**  `.github/workflows/release.yml` publishes a GitHub Release whenever a
+  `v*` tag is pushed (or on demand via `workflow_dispatch`): it builds the interpreter on Windows
+  (MinGW + Qt 6) and Linux, assembles a self-contained bundle for each (`lib/` next to the
+  executable, plus `src/`, `native/`, `plugins/`, `docs/`, `examples/` and the plugin import
+  library on Windows), **smoke-tests the extracted bundle** with `annota examples/selfcheck.ant`
+  and fails if it does not report `0 failures`, then uploads both archives with `SHA256SUMS` and
+  generated notes.  Tags with a suffix (`v1.2.0-rc1`) become pre-releases.  See the Releasing
+  section of CONTRIBUTING.md.
 * **Automatic JIT.**  The interpreter counts backward jumps per chunk and, once a loop is hot
   (default 4000 iterations, `ANNOTA_JIT_THRESHOLD`), compiles that function with the x86-64
   backend and switches to it *in place* through a loop-header entry point (on-stack replacement),

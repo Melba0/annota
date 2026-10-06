@@ -12,6 +12,7 @@ the project so that a pull request can be reviewed quickly.
 - [Adding a standard library function](#adding-a-standard-library-function)
 - [Adding native code (FFI, kernels and plugins)](#adding-native-code-ffi-kernels-and-plugins)
 - [Documentation](#documentation)
+- [Releasing](#releasing)
 - [Commit and pull request style](#commit-and-pull-request-style)
 
 ## Ground rules
@@ -195,6 +196,38 @@ Rules for anything in `native/` or `plugins/`:
   `build\annota.exe studio <file> --run --shot docs/images/ide-problems.png`.
 * After moving files around, run `powershell -ExecutionPolicy Bypass -File tools/doc_links.ps1`
   (also part of `-Verify`): a broken relative link fails CI.
+
+## Releasing
+
+Releases are cut from tags and built by `.github/workflows/release.yml` — there is no manual
+packaging step:
+
+1. Move the `Unreleased` entries of `CHANGELOG.md` into a new `## [x.y.z] - YYYY-MM-DD` section
+   (the language and the diagnostic codes are the public API, so follow semantic versioning).
+2. Make sure `main` is green: `build.ps1 -Verify` must pass.
+3. Tag and push:
+   ```powershell
+   git tag v1.2.0
+   git push origin v1.2.0
+   ```
+4. The workflow then, for both platforms:
+   * builds the interpreter (Windows: MinGW + Qt 6; Linux: g++ with `native/*.cpp` and `-rdynamic`),
+   * assembles the bundle — `annota(.exe)`, the Qt runtime and `platforms/` on Windows, plus
+     `lib/`, `src/`, `native/`, `plugins/`, `docs/`, `examples/` and (on Windows) the plugin import
+     library `libannota.dll.a`,
+   * **smoke-tests the bundle from inside itself** (`annota examples/selfcheck.ant` with no
+     repository and no environment variables) and fails the job if it does not report `0 failures`,
+   * creates the GitHub Release, uploads both archives plus `SHA256SUMS`, and uses the auto-generated
+     notes with the changelog as an introduction.
+
+A tag with a suffix (`v1.2.0-rc1`) is published as a pre-release.  To re-publish or repair an
+existing release, run the `release` workflow by hand (`workflow_dispatch`) and pass the tag; it
+re-uploads the assets and updates the notes instead of failing on "release already exists".
+
+What a bundle guarantees, and why it is tested that way: the executable finds `lib/` next to
+itself, so `use seq` and friends resolve with no setup, and `src/` ships alongside, so
+`annota plugin build` works from the extracted folder.  The smoke test runs exactly that path, so a
+bundle that cannot run its own standard library never reaches users.
 
 ## Commit and pull request style
 

@@ -30,6 +30,18 @@ build\annota.exe --features
 
 要求：C++17 编译器（MinGW-w64 g++ 13 或 MSVC 2022）。**Qt 6 是可选的**，没有它只是没有窗口。
 
+不想自己编译的话，每个 Release 都带预编译包（见 README 的快速开始）：
+
+| 包 | 内容 |
+| --- | --- |
+| `annota-vX.Y.Z-windows-x64.zip` | `annota.exe` + Qt 运行时 + `platforms/` + `lib/` + `src/` + `native/` + `plugins/` + `docs/` + `examples/` + `libannota.dll.a` |
+| `annota-vX.Y.Z-linux-x86_64.tar.gz` | `annota` + `lib/` + `src/` + `native/` + `plugins/` + `docs/` + `examples/` |
+
+`lib/` 与可执行文件同级，所以 `use seq` 之类开箱可用；`src/` 与（Windows 上的）导入库也在包里，
+因此解压后可以直接 `annota plugin build`。CI 会在**解压出来的包里**跑一遍
+`annota examples/selfcheck.ant`，不通过就不发布。发布流程见 [CONTRIBUTING.md](../CONTRIBUTING.md)
+的 Releasing 一节。
+
 ## 2. 运行程序
 
 ```powershell
@@ -141,6 +153,9 @@ g++ -std=c++17 -O2 -shared -I src plugins\hello.cpp -o build\plugins\hello.dll `
 # Linux / macOS
 g++ -std=c++17 -O2 -shared -fPIC -I src plugins/hello.cpp -o build/plugins/libhello.so
 ```
+
+Linux/macOS 上解释器需要**导出自己的符号**，插件才能解析宿主函数：`build.ps1`、`CMakeLists.txt`
+（`ENABLE_EXPORTS`）以及 CI 的 `g++` 命令都带了 `-rdynamic`；自己手写编译命令时请一并带上。
 
 ## 7. 性能：自动 JIT 与基准
 

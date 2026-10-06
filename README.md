@@ -7,6 +7,7 @@
 [English](README.md) | [简体中文](README_zh.md)
 
 [![build](https://github.com/Melba0/annota/actions/workflows/build.yml/badge.svg)](https://github.com/Melba0/annota/actions/workflows/build.yml)
+[![release](https://github.com/Melba0/annota/actions/workflows/release.yml/badge.svg)](https://github.com/Melba0/annota/releases/latest)
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-blue.svg)](#quick-start)
 [![GUI](https://img.shields.io/badge/GUI-Qt%206-green.svg)](#the-graphical-ide)
 [![Tests](https://img.shields.io/badge/verification-build.ps1%20--Verify-success.svg)](#verification)
@@ -81,13 +82,25 @@ the analyzer reads, so "what the tool tells you" and "what the program does" can
 
 ## Quick start
 
+**Prebuilt bundles** (no toolchain, no Qt install) are attached to every
+[release](https://github.com/Melba0/annota/releases/latest): unzip, then
+
+```powershell
+.\annota.exe examples\selfcheck.ant      # Windows x64 bundle
+./annota examples/selfcheck.ant          # Linux x86_64 bundle
+```
+
+`lib/` sits next to the executable and `src/` ships with it, so the standard library works out of
+the box and `annota plugin build` works from the extracted folder.
+
+Building from source:
+
 ```powershell
 git clone https://github.com/Melba0/annota.git
 cd annota
 
 # build (auto-detects Qt 6 in D:\Qt, C:\Qt, %USERPROFILE%\Qt)
 powershell -ExecutionPolicy Bypass -File build.ps1
-
 # build and run every check (examples, analyzer fixtures, benchmark, LSP, IDE)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
