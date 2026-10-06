@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project are documented in this file.
 
@@ -120,6 +120,29 @@ major change, and a new check is a minor one.
   now guards this in CI.
 
 ### Changed
+
+* **`lend` parameters are writable now - with a warning.**  Writing through a borrowed parameter is
+  the point of borrowing (the write lands in the caller's container), so the compiler only warns:
+  `lend 参数 'xs' 被当作方法接收者调用（该方法可能修改它）`.  Annotate the function with
+  `[[lend_write]]` when the write is intended and the warning goes away.  The old behaviour (a hard
+  error) made every write through a borrowed container impossible.
+* **`[[jit]]` requires an integer type hint on every parameter** (`int8/int16/int32/int64` - `int`
+  is int32, `long` is int64); without one the compiler reports exactly which parameter is missing
+  it.  The hint pins the parameter's kind, which is what lets the backend emit wrapping arithmetic
+  (`wrapRax`), check the exact kind at entry (`JitCode::slotKind`) and know a call's result kind.
+  Values whose kind set has no single wrapping rule (a parameter of unknown width mixed with a
+  narrow one) are not compiled.
+* The machine-code backend now decodes and lowers the parameter conversion prologue (`OP_CONVERT`),
+  which the compiler emits for every typed parameter: the entry check already guarantees the
+  declared kind, so it is the identity.  Together with ignoring the dead trailing `return_null`
+  (returns no longer propagate to the fall-through) this restores machine code for typed `[[jit]]`
+  functions - `annota bench` shows **1.2 ns/iteration** for the `[[jit]]` loop.
+* Fixes along the way: `jitLocalsOk` no longer accepts narrow integer kinds (the native code works
+  on raw int64s, so `int8`/`int32` arithmetic would not wrap), `--dump-bc` reads `OP_CONVERT`'s
+  operand, and the JIT's failure diagnostics name the offending opcode and function.
+* **Known gap:** the native `call` between compiled functions still needs debugging - it can hang,
+  so it is disabled unless `ANNOTA_JIT_CALLS=1` is set.  Until that lands, a call from compiled code
+  goes back through the interpreter.
 
 * **Direct calls.**  A call to a top-level function or a `[[static]]` class method that the program
   defines is now compiled to `OP_CALL_DIRECT <name> <argc>`: there is no callee value and no
@@ -298,6 +321,29 @@ major change, and a new check is a minor one.
 
 ### Changed
 
+* **`lend` parameters are writable now - with a warning.**  Writing through a borrowed parameter is
+  the point of borrowing (the write lands in the caller's container), so the compiler only warns:
+  `lend 参数 'xs' 被当作方法接收者调用（该方法可能修改它）`.  Annotate the function with
+  `[[lend_write]]` when the write is intended and the warning goes away.  The old behaviour (a hard
+  error) made every write through a borrowed container impossible.
+* **`[[jit]]` requires an integer type hint on every parameter** (`int8/int16/int32/int64` - `int`
+  is int32, `long` is int64); without one the compiler reports exactly which parameter is missing
+  it.  The hint pins the parameter's kind, which is what lets the backend emit wrapping arithmetic
+  (`wrapRax`), check the exact kind at entry (`JitCode::slotKind`) and know a call's result kind.
+  Values whose kind set has no single wrapping rule (a parameter of unknown width mixed with a
+  narrow one) are not compiled.
+* The machine-code backend now decodes and lowers the parameter conversion prologue (`OP_CONVERT`),
+  which the compiler emits for every typed parameter: the entry check already guarantees the
+  declared kind, so it is the identity.  Together with ignoring the dead trailing `return_null`
+  (returns no longer propagate to the fall-through) this restores machine code for typed `[[jit]]`
+  functions - `annota bench` shows **1.2 ns/iteration** for the `[[jit]]` loop.
+* Fixes along the way: `jitLocalsOk` no longer accepts narrow integer kinds (the native code works
+  on raw int64s, so `int8`/`int32` arithmetic would not wrap), `--dump-bc` reads `OP_CONVERT`'s
+  operand, and the JIT's failure diagnostics name the offending opcode and function.
+* **Known gap:** the native `call` between compiled functions still needs debugging - it can hang,
+  so it is disabled unless `ANNOTA_JIT_CALLS=1` is set.  Until that lands, a call from compiled code
+  goes back through the interpreter.
+
 * **Fewer type aliases**: one spelling per type - `int`, `long`, `longlong`, `uint`, `ulong`,
   `ulonglong`, `int8/16/32/64`, `uint8/16/32/64`, `float` (32 bit), `double` (64 bit),
   `longdouble`. The `i8`/`u64`/`f32`/`byte`/`short`/`int128`/`uint128`/`ld` style aliases are gone;
@@ -378,6 +424,29 @@ around them.
 * JSON diagnostics report for editor and CI integration.
 
 ### Changed
+
+* **`lend` parameters are writable now - with a warning.**  Writing through a borrowed parameter is
+  the point of borrowing (the write lands in the caller's container), so the compiler only warns:
+  `lend 参数 'xs' 被当作方法接收者调用（该方法可能修改它）`.  Annotate the function with
+  `[[lend_write]]` when the write is intended and the warning goes away.  The old behaviour (a hard
+  error) made every write through a borrowed container impossible.
+* **`[[jit]]` requires an integer type hint on every parameter** (`int8/int16/int32/int64` - `int`
+  is int32, `long` is int64); without one the compiler reports exactly which parameter is missing
+  it.  The hint pins the parameter's kind, which is what lets the backend emit wrapping arithmetic
+  (`wrapRax`), check the exact kind at entry (`JitCode::slotKind`) and know a call's result kind.
+  Values whose kind set has no single wrapping rule (a parameter of unknown width mixed with a
+  narrow one) are not compiled.
+* The machine-code backend now decodes and lowers the parameter conversion prologue (`OP_CONVERT`),
+  which the compiler emits for every typed parameter: the entry check already guarantees the
+  declared kind, so it is the identity.  Together with ignoring the dead trailing `return_null`
+  (returns no longer propagate to the fall-through) this restores machine code for typed `[[jit]]`
+  functions - `annota bench` shows **1.2 ns/iteration** for the `[[jit]]` loop.
+* Fixes along the way: `jitLocalsOk` no longer accepts narrow integer kinds (the native code works
+  on raw int64s, so `int8`/`int32` arithmetic would not wrap), `--dump-bc` reads `OP_CONVERT`'s
+  operand, and the JIT's failure diagnostics name the offending opcode and function.
+* **Known gap:** the native `call` between compiled functions still needs debugging - it can hang,
+  so it is disabled unless `ANNOTA_JIT_CALLS=1` is set.  Until that lands, a call from compiled code
+  goes back through the interpreter.
 
 * `to` and `step` became soft keywords, so they are usable as ordinary parameter names
   (`File.copy(from, to)`).

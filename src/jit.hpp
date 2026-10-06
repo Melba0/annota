@@ -32,6 +32,16 @@ namespace annota {
 
 using JitFn = int64_t (*)(const int64_t*, void*);
 
+// Machine code cannot raise an Annota error by itself, so the two conditions it can still detect
+// (an out-of-range array index, a failed allocation) are reported through `JitOut::kind`:
+// 3 = null, 4 = runtime error to be raised by the VM after the native call returns.
+constexpr int64_t kJitOutError = 4;
+
+// Backing store for arrays created inside compiled code.  The code calls this function while it
+// runs; the VM frees everything it handed out once the outermost native invocation returns.
+int64_t* annotaJitArrayAlloc(int64_t bytes);   // implemented by the VM
+void jitArenaReset();
+
 // The native code writes the returned value here.  `kind`: 0 = int (untyped), 1 = int64,
 // 2 = bool, 3 = null - the same Value the interpreter would have produced.
 struct JitOut {
@@ -149,10 +159,11 @@ public:
     size_t kindBase = 0;                     // byte offset of the per-local kind slots
 
     void storeKindByte(size_t byteOff, int kind) {
-        u8(0xC6); u8(0x44); u8(0x24); u8((uint8_t)byteOff); u8((uint8_t)kind);
+        u8(0xC6); u8(0x84); u8(0x24); u32((uint32_t)byteOff); u8((uint8_t)kind);   // mov byte [rsp+off], imm8
     }
     void loadKindByteToR8(size_t byteOff) {
-        u8(0x44); u8(0x0F); u8(0xB6); u8(0x44); u8(0x24); u8((uint8_t)byteOff);  // movzx r8d,[rsp+off]
+        u8(0x44); u8(0x0F); u8(0xB6); u8(0x84); u8(0x24);
+        u32((uint32_t)byteOff);                                                    // movzx r8d,[rsp+off]
     }
     // out->value = rax (the value stays intact), out->kind = r8
     void storeResultWithKindInR8() {
@@ -203,13 +214,19 @@ public:
 
     // --- the operand stack lives in the native stack frame ---
     void storeRaxToVr(int vr) {
-        u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8((uint8_t)(vr * 8));
+        u8(0x48); u8(0x89);
+        if (vr * 8 < 128) { u8(0x44); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x84); u8(0x24); u32((uint32_t)(vr * 8)); }
     }
     void loadVrToRax(int vr) {
-        u8(0x48); u8(0x8B); u8(0x44); u8(0x24); u8((uint8_t)(vr * 8));
+        u8(0x48); u8(0x8B);
+        if (vr * 8 < 128) { u8(0x44); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x84); u8(0x24); u32((uint32_t)(vr * 8)); }
     }
     void loadVrToR8(int vr) {
-        u8(0x4C); u8(0x8B); u8(0x44); u8(0x24); u8((uint8_t)(vr * 8));
+        u8(0x4C); u8(0x8B);
+        if (vr * 8 < 128) { u8(0x44); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x84); u8(0x24); u32((uint32_t)(vr * 8)); }
     }
 
     void movRaxImm(int32_t v) { u8(0x48); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
@@ -253,6 +270,48 @@ public:
     void epilogue() {
         u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)frameBytes);   // add rsp, frameBytes
         u8(0xC3);                                                  // ret
+    }
+    void loadVrToR11(int vr) {
+        u8(0x4C); u8(0x8B);
+        if (vr * 8 < 128) { u8(0x5C); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x9C); u8(0x24); u32((uint32_t)(vr * 8)); }
+    }
+    void storeR11ToVr(int vr) {
+        u8(0x4C); u8(0x89);
+        if (vr * 8 < 128) { u8(0x5C); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x9C); u8(0x24); u32((uint32_t)(vr * 8)); }
+    }
+    // a short conditional jump whose displacement is filled in once the target offset is known
+    size_t jccRel8(uint8_t cc) { u8(cc); size_t p = c.size(); u8(0); return p; }
+    size_t jmpRel8() { u8(0xEB); size_t p = c.size(); u8(0); return p; }   // short jmp, patched later
+    void patchRel8(size_t at, size_t target) {
+        c[at] = (uint8_t)(int8_t)((int)target - (int)(at + 1));
+    }
+    // Machine code cannot raise an Annota error itself: it reports one through JitOut and returns,
+    // and the VM raises it once the native call is over.
+    void errorReturn() { movRaxImm(0); storeResult((int)kJitOutError); epilogue(); }
+    // Call a C helper.  `setArgs` fills the first integer argument (rcx/rdi) - it runs inside the
+    // call frame, so it must not read virtual registers by stack offset.  The two registers the
+    // backend keeps live (kBase, kOut) are saved around the call, and 32 bytes of shadow space are
+    // reserved because the callee is ordinary C.
+    void callC(uint64_t addr, const std::function<void()>& setArgs) {
+        const int savedBase = 32, savedOut = 40;
+        int N = 48;
+        if ((N % 16) != 8) N += 8 - (N % 16);
+        u8(0x48); u8(0x81); u8(0xEC); u32((uint32_t)N);                       // sub rsp, N
+        u8(0x48); u8(0x89); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // save kBase
+        u8(0x48); u8(0x89); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // save kOut
+        setArgs();
+        u8(0x49); u8(0xBB);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // mov r11, addr
+        u8(0x41); u8(0xFF); u8(0xD3);                                         // call r11
+        u8(0x48); u8(0x8B); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // restore kBase
+        u8(0x48); u8(0x8B); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
+        u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
     }
     void nullReturn() {
         u8(0x48); u8(0xC7); u8(0xC0); u32(0);                      // mov rax, 0
@@ -305,6 +364,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_INT1: x.next = ip + 2; x.imm = (int8_t)code[ip + 1]; break;
             case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_INIT_LOCAL:
                 x.next = ip + 2; x.a = code[ip + 1]; break;
+            case OP_GET_INDEX: case OP_SET_INDEX:
+                x.next = ip + 1; break;
+            case OP_NEW_ARRAY:
+                x.next = ip + 3; x.a = code[ip + 1]; x.b = code[ip + 2]; break;
             case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_NE:
             case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 x.next = ip + 1; break;
@@ -336,6 +399,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 x.imm = code[ip + 3];                            // argument count
                 break;
             default: return jitFail(__LINE__);                       // not translatable: keep interpreting
+
         }
         if (x.next > code.size()) return jitFail(__LINE__);
         if (std::getenv("ANNOTA_JIT_DEBUG"))
@@ -343,6 +407,45 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         indexOf[x.at] = ins.size();
         ins.push_back(x);
         ip = x.next;
+    }
+    // ---- arrays: only a 1-D numeric array that this chunk creates itself, stores straight into a
+    // local and uses exclusively as `a[simple index]` may be compiled.  The machine code keeps such
+    // an array in a private raw-int buffer (allocated while it runs, freed when the call returns),
+    // so nothing else may ever see it; every other use stays interpreted.
+    std::vector<uint8_t> jitArrayLocal(ch->numLocals, 0);
+    std::vector<NumKind> jitArrayKind(ch->numLocals, NumKind::None);
+    bool hasJitArrays = false;
+    // The array support below is new and still has an open wrong-value case (returning a literal
+    // index load), so it stays off unless ANNOTA_JIT_ARRAYS=1 asks for it.
+    static const bool arraysEnabled = std::getenv("ANNOTA_JIT_ARRAYS") != nullptr;
+    for (size_t i = 0; i < ins.size(); i++) {
+        if (ins[i].op != OP_NEW_ARRAY) continue;
+        uint8_t nd = (uint8_t)ins[i].a, info = (uint8_t)ins[i].b;
+        int kc = info >> 3;
+        NumKind ek = kc > 0 ? (NumKind)(kc - 1) : NumKind::None;
+        bool plainInt = ek == NumKind::None || ek == NumKind::I8 || ek == NumKind::I16 ||
+                         ek == NumKind::I32 || ek == NumKind::I64 || ek == NumKind::U8 ||
+                         ek == NumKind::U16 || ek == NumKind::U32 || ek == NumKind::U64;
+        if (nd != 1 || (info & 3) != 0 || !plainInt) return jitFail(__LINE__);
+        if (i + 1 >= ins.size() ||
+            (ins[i + 1].op != OP_SET_LOCAL && ins[i + 1].op != OP_INIT_LOCAL))
+            return jitFail(__LINE__);                  // must go straight into a local
+        jitArrayKind[ins[i + 1].a] = ek;
+        jitArrayLocal[ins[i + 1].a] = 1;
+        hasJitArrays = true;
+    }
+    if (hasJitArrays) {
+    if (hasJitArrays && !arraysEnabled) return jitFail(__LINE__);
+        for (size_t i = 0; i < ins.size(); i++)
+            if ((ins[i].op == OP_SET_LOCAL || ins[i].op == OP_INIT_LOCAL) && jitArrayLocal[ins[i].a] &&
+                !(i > 0 && ins[i - 1].op == OP_NEW_ARRAY))
+                return jitFail(__LINE__);              // overwritten with something else
+        for (size_t i = 0; i < ins.size(); i++)
+            if ((ins[i].op == OP_LOCAL_ADD_IMM || ins[i].op == OP_LOCAL_SUB_IMM ||
+                 ins[i].op == OP_LOCAL_ADD_LOCAL || ins[i].op == OP_LEND) &&
+                ((ins[i].a < jitArrayLocal.size() && jitArrayLocal[ins[i].a]) ||
+                 (ins[i].b < jitArrayLocal.size() && jitArrayLocal[ins[i].b])))
+                return jitFail(__LINE__);
     }
     if (ins.empty()) return jitFail(__LINE__);
     if (ch->isMethod) {
@@ -354,16 +457,20 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         }
     }
 
-    // ---- forward analysis: stack depth, local kinds, definite assignment, ceiling on stack
-    // a direct call site is only usable when the callee has machine code and takes exactly these
-    // arguments as plain ints; otherwise the whole chunk stays interpreted
     auto resolveCall = [&](const JitIns& x) -> JitCallTarget {
         JitCallTarget none;
         if (!resolve || (size_t)x.a >= ch->consts.size() || ch->consts[(size_t)x.a].t != VT::Str)
             return none;
-        JitCallTarget t = resolve(ch->consts[(size_t)x.a].o->str);
+        const std::string nm = ch->consts[(size_t)x.a].o->str;
+        JitCallTarget t = resolve(nm);
+        if (std::getenv("ANNOTA_JIT_DEBUG") && (!t.code || !t.chunk || !t.code->fn))
+            std::fprintf(stderr, "[jit] call target %s not compiled\n", nm.c_str());
         if (!t.code || !t.chunk || !t.code->fn) return none;
+        if (std::getenv("ANNOTA_JIT_DEBUG") && (t.code->retByte < 0 || t.code->retByte > 2))
+            std::fprintf(stderr, "[jit] call target %s retByte %d\n", nm.c_str(), t.code->retByte);
         if (t.code->retByte < 0 || t.code->retByte > 2) return none;
+        if (std::getenv("ANNOTA_JIT_DEBUG") && (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm))
+            std::fprintf(stderr, "[jit] call target %s arity %zu vs %d (method %d)\n", nm.c_str(), t.chunk->params.size(), x.imm, (int)t.chunk->isMethod);
         if (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm) return none;
         if (t.chunk->numLocals > 64) return none;
         return t;
@@ -416,6 +523,31 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_NOP: break;
                 case OP_INT1: pushKind(kJitNone); break;
                 case OP_GET_LOCAL: pushKind(kindOfLocal(x.a)); break;
+                case OP_NEW_ARRAY:
+                    // 1-D numeric array: the dimension on the stack becomes a raw buffer pointer
+                    if (d < (int)x.a) return jitFail(__LINE__);
+                    for (int k = 0; k < (int)x.a; k++) vk.pop_back();
+                    pushKind(jitBit(NumKind::I64));
+                    break;
+                case OP_GET_INDEX: {
+                    if (d < 2) return jitFail(__LINE__);
+                    int gObj = d - 2;
+                    int gEk = -1;
+                    for (size_t k = i; k-- > 0;) {
+                        if (depth[k] != gObj) continue;
+                        if (ins[k].op == OP_GET_LOCAL && jitArrayLocal[ins[k].a])
+                            gEk = (int)jitArrayKind[ins[k].a];
+                        break;
+                    }
+                    if (gEk < 0) return jitFail(__LINE__);      // only JIT arrays may be indexed
+                    vk.pop_back(); vk.pop_back();
+                    pushKind(jitBit((NumKind)gEk));             // the element kind is exact
+                    break;
+                }
+                case OP_SET_INDEX:
+                    if (d < 3) return jitFail(__LINE__);
+                    vk.pop_back(); vk.pop_back(); vk.pop_back();
+                    break;
                 case OP_SET_LOCAL: case OP_INIT_LOCAL:
                     if (d < 1) return jitFail(__LINE__);
                     vk.pop_back();
@@ -456,11 +588,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_CALL_DIRECT: {
                     JitCallTarget t = resolveCall(x);
                     if (!t.code || (int)vk.size() < x.imm) return jitFail(__LINE__);
+                    // the callee accepts only what its entry check allows: untyped or int64
+                    const JitKindSet kArgOk = jitBit(NumKind::None) | jitBit(NumKind::I64);
                     for (int k = 0; k < x.imm; k++) {
-                        // the callee's native code only accepts plain ints
                         JitKindSet ks = vk[(size_t)((int)vk.size() - x.imm + k)];
-                        int sole = jitSoleKind(ks);
-                        if (sole < 0 || sole > (int)NumKind::U64) return jitFail(__LINE__);
+                        if (ks == 0 || (ks & ~kArgOk) != 0) return jitFail(__LINE__);
                     }
                     for (int k = 0; k < x.imm; k++) vk.pop_back();
                     pushKind(t.code->retByte == 2 ? kJitBool
@@ -471,12 +603,18 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     if (d < 1) return jitFail(__LINE__);
                     break;                                   // exact kind handled at emit time
                 case OP_RETURN_NULL: break;
-                default: return jitFail(__LINE__);
+                default:
+                    if (std::getenv("ANNOTA_JIT_DEBUG"))
+                        std::fprintf(stderr, "[jit] analyze: unsupported op %d at ip %zu in %s\n",
+                                     (int)x.op, x.at, ch->fnName.c_str());
+                    return jitFail(__LINE__);
             }
             maxDepth = std::max(maxDepth, (int)vk.size());
             // propagate to the fallthrough
-            size_t to = i + 1;
+            bool noFall = (x.op == OP_RETURN || x.op == OP_RETURN_NULL);   // returns do not fall through
             bool jumpOnly = (x.op == OP_JUMP || x.op == OP_LOOP);
+            size_t to = i + 1;
+            if (noFall) to = n;                                         // nothing after a return is reachable
             // local updates along the fallthrough
             auto applyLocals = [&](std::vector<JitKindSet>& k, std::vector<uint8_t>& asg) {
                 switch (x.op) {
@@ -562,6 +700,22 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         }
     }
     if (maxDepth > 48) return jitFail(__LINE__);
+    // ---- every use of a JIT array must be an index access on the array itself: the value pushed by
+    // `get_local a` has to still be on the virtual stack (at the exact depth the index op expects)
+    // when `get_index`/`set_index` runs, so nothing can have consumed or copied it in between.
+    if (hasJitArrays) {
+        for (size_t k = 0; k < ins.size(); k++) {
+            if (ins[k].op != OP_GET_LOCAL || !jitArrayLocal[ins[k].a] || depth[k] == kUnset) continue;
+            bool ok = false;
+            for (size_t j = k + 1; j < ins.size(); j++) {
+                if (depth[j] != kUnset && depth[j] < depth[k] + 1) break;     // the array was used up
+                if (ins[j].op == OP_GET_INDEX && depth[j] == depth[k] + 2) { ok = true; break; }
+                if (ins[j].op == OP_SET_INDEX && depth[j] == depth[k] + 3) { ok = true; break; }
+            }
+            if (!ok) return jitFail(__LINE__);                               // the array escapes
+        }
+    }
+
     // a kind set that is not a single kind may only contain the 64 bit ones: wrapping a narrowed
     // value is only correct when the width is unambiguous
     for (size_t i = 0; i < n; i++) {
@@ -640,15 +794,30 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         else if (seenRetByte != b) seenRetByte = -2;
     };
     JitEmitter e;
-    size_t kindSlots = 0;
-    for (size_t i = 0; i < ch->numLocals; i++) if (tracked[i]) kindSlots++;
+    // one kind byte per local slot (they are addressed by slot number, so the area must cover
+    // every slot, not just the tracked ones)
+    size_t kindSlots = (size_t)ch->numLocals;
     e.kindBase = (size_t)std::max(1, maxDepth + 1) * 8;
     e.frameBytes = (size_t)std::max(16, ((int)(e.kindBase + kindSlots + 15)) / 16 * 16);
     e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);      // sub rsp, frameBytes
+    // The analysis proved that the only instruction which can have produced the array in a virtual
+    // register is the `get_local` of a JIT array local: find it and report its element kind.
+    auto jitArrayKindOf = [&](size_t at, int objVr) -> int {
+        for (size_t k = at; k-- > 0;) {
+            if (depth[k] != objVr) continue;
+            if (ins[k].op == OP_GET_LOCAL && jitArrayLocal[ins[k].a]) return (int)jitArrayKind[ins[k].a];
+            return -1;
+        }
+        return -1;
+    };
+
     for (size_t i = 0; i < n; i++) {
         const JitIns& x = ins[i];
         e.labelAt[x.at] = e.c.size();
-        if (depth[i] == kUnset) { e.nullReturn(); continue; }
+        if (depth[i] == kUnset) {
+            if (std::getenv("ANNOTA_JIT_DEBUG"))
+                std::fprintf(stderr, "[jit]   unreachable ip %zu op %d in %s\n", x.at, (int)x.op, ch->fnName.c_str());
+            e.nullReturn(); continue; }
         int d = depth[i];
         switch (x.op) {
             case OP_NOP: break;
@@ -734,37 +903,112 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.cmpRaxImm(x.imm);
                 e.jccPlaceholder(0x8D, (size_t)x.target);
                 break;
+            case OP_NEW_ARRAY: {
+                // 1-D numeric array: allocate [len][data...] in the per-invocation arena; the
+                // pointer replaces the dimension on the virtual stack
+                int sizeVr = d - 1;
+                e.loadVrToRax(sizeVr);
+                e.callC((uint64_t)(uintptr_t)&annotaJitArrayAlloc, [&] {
+                    e.u8(0x48); e.u8(0x8D); e.u8(0x0C); e.u8(0xC5); e.u32(8);   // lea rcx, [rax*8+8]
+                });
+                e.u8(0x48); e.u8(0x85); e.u8(0xC0);                          // test rax, rax
+                size_t oom = e.jccRel8(0x74);                                // jz -> error
+                e.u8(0x49); e.u8(0x89); e.u8(0xC3);                          // mov r11, rax
+                e.loadVrToRax(sizeVr);                                       // the length
+                e.u8(0x49); e.u8(0x89); e.u8(0x03);                          // mov [r11], rax
+                e.storeR11ToVr(sizeVr);                                      // keep the pointer
+                size_t afterNew = e.c.size();
+                size_t skipNew = e.jmpRel8();
+                e.errorReturn();
+                e.patchRel8(skipNew, e.c.size());
+                e.patchRel8(oom, afterNew);
+                break;
+            }
+            case OP_GET_INDEX: {
+                int objVr = d - 2, idxVr = d - 1;
+                int ek = jitArrayKindOf(i, objVr);
+                if (ek < 0) return jitFail(__LINE__);
+                e.loadVrToR11(objVr);                                        // r11 = buffer
+                e.loadVrToR8(idxVr);                                         // r8  = index
+                e.u8(0x4D); e.u8(0x3B); e.u8(0x03);                          // cmp r8, [r11]  (len)
+                size_t badGet = e.jccRel8(0x73);                             // jae -> error
+                e.u8(0x4B); e.u8(0x8B); e.u8(0x44); e.u8(0xCB); e.u8(8);     // mov rax,[r11+r8*8+8]
+                e.wrapRax(ek);                                               // widen to 64 bit
+                e.storeRaxToVr(objVr);
+                size_t afterGet = e.c.size();
+                size_t skipGet = e.jmpRel8();
+                e.errorReturn();
+                e.patchRel8(skipGet, e.c.size());
+                e.patchRel8(badGet, afterGet);
+                break;
+            }
+            case OP_SET_INDEX: {
+                int objVr = d - 3, idxVr = d - 2, valVr = d - 1;
+                int ek = jitArrayKindOf(i, objVr);
+                if (ek < 0) return jitFail(__LINE__);
+                e.loadVrToR11(objVr);                                        // r11 = buffer
+                e.loadVrToR8(idxVr);                                         // r8  = index
+                e.u8(0x4D); e.u8(0x3B); e.u8(0x03);                          // cmp r8, [r11]
+                size_t badSet = e.jccRel8(0x73);                             // jae -> error
+                e.loadVrToRax(valVr);
+                e.wrapRax(ek);                                               // wrap to the element width
+                e.u8(0x4B); e.u8(0x89); e.u8(0x44); e.u8(0xCB); e.u8(8);     // mov [r11+r8*8+8], rax
+                size_t afterSet = e.c.size();
+                size_t skipSet = e.jmpRel8();
+                e.errorReturn();
+                e.patchRel8(skipSet, e.c.size());
+                e.patchRel8(badSet, afterSet);
+                break;
+            }
             case OP_CALL_DIRECT: {
-                // a native call to another compiled function: allocate its L[] and JitOut on this
-                // native frame (so recursion works), marshal the arguments that are already in the
-                // virtual registers, call its entry, and take the value it wrote
+                // A native call to another compiled function: its L[] and JitOut live on this native
+                // frame (so recursion works) and the arguments are copied out of the virtual
+                // registers.  The layout is [L[]][JitOut][saved kBase][saved kOut]: `kBase` (this
+                // function's L[] pointer, used by every local access) and `kOut` (where this
+                // function writes its own result) are caller-saved, so the call would destroy them.
+                // No Windows shadow space is reserved: the callee is machine code from this same
+                // backend and never uses one.
                 JitCallTarget t = resolveCall(x);
                 if (!t.code) return jitFail(__LINE__);
                 const int Lbytes = (int)t.chunk->numLocals * 8;
-                int N = 32 + Lbytes + 16;                  // shadow space + L[] + JitOut
-                if ((N % 16) != 8) N += 8 - (N % 16);      // keep rsp 16-aligned at the call
+                const int savedBase = Lbytes + 16;                     // saved kBase
+                const int savedOut = savedBase + 8;                    // saved kOut
+                int N = savedOut + 8;                                  // L[] + JitOut + 2 saves
+                if ((N % 16) != 8) N += 8 - (N % 16);                  // keep rsp 16-aligned at the call
                 e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)N);       // sub rsp, N
+                e.u8(0x48); e.u8(0x89);
+                e.u8(JitEmitter::kBase == 0x01 ? 0x8C : 0xBC);                 // mov [rsp+savedBase], rcx/rdi
+                e.u8(0x24); e.u32((uint32_t)savedBase);
+                e.u8(0x48); e.u8(0x89);
+                e.u8(JitEmitter::kOut == 0x02 ? 0x94 : 0xB4);                  // mov [rsp+savedOut], rdx/rsi
+                e.u8(0x24); e.u32((uint32_t)savedOut);
                 for (int k = 0; k < x.imm; k++) {
                     int src = N + (d - x.imm + k) * 8;                        // the argument's VR
                     e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)src);
-                    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(32 + k * 8));
+                    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(k * 8));
                 }
-                if (JitEmitter::kBase == 0x01) { e.u8(0x48); e.u8(0x89); e.u8(0xE1); }   // mov rcx, rsp
-                else { e.u8(0x48); e.u8(0x89); e.u8(0xE7); }                            // mov rdi, rsp
+                if (JitEmitter::kBase == 0x01) { e.u8(0x48); e.u8(0x89); e.u8(0xE1); }   // mov rcx, rsp (L)
+                else { e.u8(0x48); e.u8(0x89); e.u8(0xE7); }                            // mov rdi, rsp (L)
                 e.u8(0x48); e.u8(0x8D);
                 e.u8(JitEmitter::kOut == 0x02 ? 0x94 : 0xB4);
-                e.u8(0x24); e.u32((uint32_t)(32 + Lbytes));                             // lea rdx/rsi, out
+                e.u8(0x24); e.u32((uint32_t)Lbytes);                                    // lea rdx/rsi, out
                 e.u8(0x49); e.u8(0xBB);
                 uint64_t fnAddr = (uint64_t)(uintptr_t)&t.code->fn;
                 for (int b = 0; b < 8; b++) e.u8((uint8_t)((fnAddr >> (8 * b)) & 0xff));  // mov r11, &fn
                 e.u8(0x4D); e.u8(0x8B); e.u8(0x1B);                                      // mov r11, [r11]
                 e.u8(0x41); e.u8(0xFF); e.u8(0xD3);                                      // call r11
                 e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24);
-                e.u32((uint32_t)(32 + Lbytes));                                          // mov rax, out.value
+                e.u32((uint32_t)Lbytes);                                                 // mov rax, out.value
+                e.u8(0x48); e.u8(0x8B);
+                e.u8(JitEmitter::kBase == 0x01 ? 0x8C : 0xBC);                           // restore kBase
+                e.u8(0x24); e.u32((uint32_t)savedBase);
+                e.u8(0x48); e.u8(0x8B);
+                e.u8(JitEmitter::kOut == 0x02 ? 0x94 : 0xB4);                            // restore kOut
+                e.u8(0x24); e.u32((uint32_t)savedOut);
                 e.u8(0x48); e.u8(0x81); e.u8(0xC4); e.u32((uint32_t)N);                  // add rsp, N
                 int resVr = d - x.imm;
                 e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(resVr * 8));
-                if (tracked[(size_t)resVr]) e.storeKindByte(e.kindBase + (size_t)resVr, t.code->retByte == 2 ? 2 : t.code->retByte);
+                // the kind byte of the destination local is written by the SET_LOCAL that follows
                 break;
             }
             case OP_RETURN: {
@@ -786,17 +1030,29 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.epilogue();
                 break;
             }
+            case OP_CONVERT:
+                // identity conversion only (proved by the analysis): nothing to emit
+                break;
             case OP_RETURN_NULL:
                 e.nullReturn();
                 noteRetByte(3);
                 break;
             default:
+                if (std::getenv("ANNOTA_JIT_DEBUG"))
+                    std::fprintf(stderr, "[jit] emit: unsupported op %d at ip %zu in %s\n",
+                                 (int)x.op, x.at, ch->fnName.c_str());
                 return jitFail(__LINE__);
         }
     }
     e.labelAt[code.size()] = e.c.size();
     e.nullReturn();
-    noteRetByte(3);
+    // only a reachable fall-through can return null: an explicit `= expr` body ends in a
+    // RETURN, so its trailing nullReturn is dead code and must not spoil the return kind
+    {   int lastReachable = -1;
+        for (size_t i2 = n; i2-- > 0;) if (depth[i2] != kUnset) { lastReachable = (int)i2; break; }
+        if (lastReachable < 0) noteRetByte(3);
+        else { uint8_t o = ins[(size_t)lastReachable].op;
+               if (o != OP_JUMP && o != OP_LOOP && o != OP_RETURN && o != OP_RETURN_NULL) noteRetByte(3); } }
 
     if (e.pending.size() > 0 && !e.finish()) return jitFail(__LINE__);
     if (e.c.size() > 60000) return jitFail(__LINE__);
@@ -806,8 +1062,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                      (void*)ch.get(), e.c.size());
     // Hot loops can be entered directly: for every backward jump target with an empty operand
     // stack the interpreter may switch to this native code mid-function.  A trampoline runs the
+    std::vector<std::pair<size_t, size_t>> tramp;     // (target ip, patch position)
     // prologue (so the epilogue stays balanced) and jumps to the loop header.
-    std::vector<std::pair<size_t, size_t>> tramp;      // (target ip, patch position)
+    // A chunk that builds its own arrays keeps them in a private buffer that exists only while the
+    // native code runs, so it must not be entered in the middle of a loop: on-stack replacement
+    // would hand it the interpreter's array object, which the machine code cannot use.
+    if (!hasJitArrays) {
     for (auto& kv : e.labelAt) {
         size_t ip = kv.first;
         if (ip >= code.size()) continue;
@@ -829,6 +1089,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         tramp.push_back({ip, off});
     }
 
+    }
     auto jc = std::make_shared<JitCode>();
     jc->bytes = e.c;
     void* mem = jitAllocExec(jc->bytes.size());

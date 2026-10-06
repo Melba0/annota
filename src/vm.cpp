@@ -1,12 +1,38 @@
-﻿// Annota - vm.cpp : the bytecode virtual machine.
+﻿// Annota - vm.cpp
 #include "vm.hpp"
 #include "jit.hpp"
 #include "ffi.hpp"
 #include "builtins.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
+
+namespace annota {
+namespace {
+// Arrays that compiled code creates live for exactly one native invocation: the VM frees every
+// block when the outermost native call returns, so nothing the machine code handed out can dangle.
+std::vector<void*>& jitArena() {
+    static std::vector<void*> arena;
+    return arena;
+}
+} // namespace
+
+int64_t* annotaJitArrayAlloc(int64_t bytes) {
+    if (bytes < 8) bytes = 8;
+    void* p = std::calloc((size_t)bytes, 1);
+    if (!p) return nullptr;
+    jitArena().push_back(p);
+    return (int64_t*)p;
+}
+
+void jitArenaReset() {
+    for (void* p : jitArena()) std::free(p);
+    jitArena().clear();
+}
+} // namespace annota
 namespace annota {
 
 // numeric width conversion (defined below, used by OP_CONVERT)
@@ -550,7 +576,7 @@ static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
 }
 
 // how many backward jumps a loop needs before the interpreter compiles it (0 disables)
-static uint32_t jitHotThreshold() {
+static inline uint32_t jitHotThreshold() {
     static uint32_t t = [] {
         if (const char* e = std::getenv("ANNOTA_JIT_THRESHOLD")) {
             long v = std::strtol(e, nullptr, 10);
@@ -724,15 +750,39 @@ Value VM::directCallee(Chunk& ch, uint16_t nameIdx, Cell& selfOut) {
 // result is pushed and the frame is recycled.  Returns false when the interpreter must run it.
 bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     if (fn.t != VT::Function || !fn.o->chunk) return false;
+    Chunk* ch = fn.o->chunk.get();
+    // A function that is called often but has no hot loop of its own still deserves machine code:
+    // compile it here, before the body runs, so the whole call - arguments in, result out - is
+    // native (no on-stack replacement involved).
+    // A function that is called often but has no hot loop of its own still deserves machine code:
+    // compile it here, before the body runs, so the whole call - arguments in, result out - is
+    // native (no on-stack replacement involved).  The switch is read once: a getenv per call would
+    // dominate the call cost.
+    static const bool callHotEnabled = std::getenv("ANNOTA_JIT_CALLC") != nullptr;
+    if (callHotEnabled && !ch->jit && !ch->jitTried && !ch->jitBusy) {
+        uint32_t threshold = jitHotThreshold();
+        if (threshold > 0 && ++ch->callTicks >= threshold) {
+            ch->jitTried = true;
+            ch->jit = jitCompileX64(fn.o->chunk, jitResolver());
+        }
+    }
     const std::shared_ptr<JitCode>& jc = fn.o->chunk->jit;
     if (!jc) return false;
     if (!jitLocalsOk(jc, fr)) return false;
+    static const bool dbgNative = std::getenv("ANNOTA_JIT_DEBUG") != nullptr;
+    if (dbgNative) {
+        static std::set<std::string> logged;
+        if (logged.insert(ch->fnName).second)
+            std::fprintf(stderr, "[jit] native run: %s\n", ch->fnName.c_str());
+    }
     int64_t L[64];
     size_t count = std::min<size_t>(fr.locals.size(), 64);
     for (size_t i = 0; i < count; i++)
         L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
     JitOut out;
     jc->fn(L, &out);
+    jitArenaReset();
+    if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
     Value r = out.kind == 3 ? Value::null()
             : out.kind == 2 ? Value::boolean(out.value != 0)
             : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
@@ -1384,10 +1434,17 @@ Value VM::execute(size_t stopDepth) {
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
                         // a `while` loop may compile to a backward jump instead of OP_LOOP
                         if (j < 0 && !f.chunk->jit && !f.chunk->jitTried) {
-                            uint32_t threshold = jitHotThreshold();
-                            if (threshold > 0 && ++f.chunk->hotTicks >= threshold) {
+                            // the cheap tests come first: this runs on every backward jump
+                            if (!f.chunk->jit && !f.chunk->jitTried && f.chunk->code.size() <= 96 &&
+                                jitHotThreshold() > 0 && ++f.chunk->hotTicks >= jitHotThreshold()) {
                                 f.chunk->jitTried = true;
+                                auto _jt0 = std::chrono::steady_clock::now();
                                 f.chunk->jit = jitCompileX64(f.chunk, jitResolver());
+                                if (std::getenv("ANNOTA_JIT_DEBUG"))
+                                    std::fprintf(stderr, "[jit] attempt %s %.2f ms -> %s\\n",
+                                                 f.chunk->fnName.c_str(),
+                                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _jt0).count(),
+                                                 f.chunk->jit ? "native" : "no");
                             }
                         }
                         f.ip += j;
@@ -1413,15 +1470,17 @@ Value VM::execute(size_t stopDepth) {
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
                         // ---- automatic JIT: a loop that keeps running compiles itself, no
                         // marker needed; the machine code can even take over from here.
-                        uint32_t threshold = jitHotThreshold();
-                        if (!f.chunk->jit && !f.chunk->jitTried && threshold > 0 &&
-                            ++f.chunk->hotTicks >= threshold) {
+                        // the cheap tests come first: this runs on every backward jump
+                        if (!f.chunk->jit && !f.chunk->jitTried && f.chunk->code.size() <= 96 &&
+                            jitHotThreshold() > 0 && ++f.chunk->hotTicks >= jitHotThreshold()) {
                             f.chunk->jitTried = true;
+                            auto _jt0 = std::chrono::steady_clock::now();
                             f.chunk->jit = jitCompileX64(f.chunk, jitResolver());
                             if (std::getenv("ANNOTA_JIT_DEBUG"))
-                                std::fprintf(stderr, "[jit] 自动编译 %s%s\n",
+                                std::fprintf(stderr, "[jit] attempt(loop) %s %.2f ms -> %s\n",
                                              f.chunk->fnName.c_str(),
-                                             f.chunk->jit ? "（机器码）" : "（不可翻译，继续解释）");
+                                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _jt0).count(),
+                                             f.chunk->jit ? "native" : "no");
                         }
                         size_t back = f.ip + (size_t)(int64_t)j;
                         if (f.chunk->jit) {
@@ -1437,6 +1496,8 @@ Value VM::execute(size_t stopDepth) {
                                 bool discard = f.discardResult;
                                 JitOut out;
                                 entry->second(L, &out);
+                                jitArenaReset();
+                                if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
                                 Value r = out.kind == 3 ? Value::null()
                                         : out.kind == 2 ? Value::boolean(out.value != 0)
                                         : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)

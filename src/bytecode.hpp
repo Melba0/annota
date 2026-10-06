@@ -1,4 +1,4 @@
-// Annota - bytecode.hpp : opcodes and code chunks.
+﻿// Annota - bytecode.hpp : opcodes and code chunks.
 #pragma once
 #include "value.hpp"
 #include <functional>
@@ -102,6 +102,7 @@ struct ParamInfo {
 struct Chunk {
     std::shared_ptr<JitCode> jit;       // non-null when the function was translated to machine code
     uint32_t hotTicks = 0;              // backward jumps seen in the interpreter (hot-loop meter)
+    uint32_t callTicks = 0;             // calls seen in the interpreter (hot-function meter)
     bool jitTried = false;              // do not retry a function the backend rejected
     bool jitBusy = false;               // set while the backend compiles it (breaks resolver cycles)
     std::string file;
