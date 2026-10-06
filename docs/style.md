@@ -190,8 +190,18 @@ Account(owner:String, balance:int = 0)=(
 | 网络 | `Net` / `Tcp`（明文 HTTP；https 需自带 TLS） |
 | 测试 | `Test`（见 §10） |
 
-需要新能力时，**先在 `lib/*.mod` 里用 Annota 写**，只有必须碰操作系统时才加一个
-`_sys_*` 原语（见 CONTRIBUTING）。
+需要新能力时，**先在 `lib/*.mod` 里用 Annota 写**，只有必须碰操作系统、或者这段逻辑确实是
+热路径（排序、筛法、矩阵、字符串扫描之类）时才下沉到 C++：
+
+| 情形 | 用什么 |
+|---|---|
+| 热循环在 Annota 里 | 什么都不用写：热到阈值会**自动**编译成机器码；只想提前可用 `[[jit]]` |
+| 算法内核（排序、筛法、矩阵……） | 加一个 `native/*.cpp`，通过 [FFI](ffi.md) 注册；见 `native/seq_native.cpp` |
+| 想不改解释器就加原生能力 | `annota plugin build <文件.cpp>` 编成插件，程序里 `use` 它（见 [tools.md](tools.md)） |
+| 需要操作系统能力 | 才加一个 `_sys_*` 原语（见 CONTRIBUTING） |
+
+值和引用也要按语义写：**默认就是深拷贝**，函数想"改调用者的容器"必须靠返回值或全局 +
+`lend`（见 [syntax.md](syntax.md) §4.1.2）；不要写"改形参期望影响调用者"的代码。
 
 ## 9. 切片、续行与其它习惯
 
@@ -233,3 +243,8 @@ build\annota.exe analyze --json 你的文件.ant                     # CI / 编�
 - [ ] 没直接用 `_` 前缀原语（除非你在写 `lib/`）
 - [ ] `annota <file>` 能跑通，输出符合预期
 - [ ] 文档/注释与行为一致（尤其是契约：改了实现就改 `[[ensure]]`）
+- [ ] 改了文件头的 `-[ ... ]-` 块注释后，跑一次
+      `annota studio <file> --check-highlight`（防止后面整段被当成注释）
+- [ ] 改了标注、检查码、原语或子命令后，重新生成参考手册：
+      `annota ide docs --out=docs/reference.md`（`reference.md` 是生成物，不要手改）
+- [ ] 动了文档就确认链接：`tools/doc_links.ps1`（`build.ps1 -Verify` 已包含）

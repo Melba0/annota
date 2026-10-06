@@ -9,6 +9,8 @@ namespace annota {
 struct ModuleLoader {
     virtual ~ModuleLoader() = default;
     virtual bool loadModule(const std::string& spec, std::vector<Token>& toks, std::string& file) = 0;
+    // optional: load a native plugin that provides the module (`use <plugin>` - see docs/ffi.md)
+    virtual bool ensureModule(const std::string& name) { (void)name; return false; }
     // extra text for a "cannot find module" error: where we looked, what exists, a suggestion
     virtual std::string searchHint(const std::string& spec) { (void)spec; return ""; }
 };

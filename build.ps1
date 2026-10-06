@@ -67,11 +67,15 @@ if ($gpp) {
         Write-Host "[build]       install Qt 6 or pass -QtRoot <path\to\6.x\mingw_64>, then rebuild." -ForegroundColor Yellow
         Write-Host "[build]       (pass -NoQt to silence this notice)" -ForegroundColor Yellow
     }
-    & $gpp @flags @sources "-o" $exe @qtLib "-lws2_32"
+    # export the interpreter's symbols and emit an import library: that is what lets a C++
+    # plugin be built separately and loaded with `use` (see docs/ffi.md)
+    $implib = Join-Path $outDir "libannota.dll.a"
+    & $gpp @flags @sources "-o" $exe @qtLib "-lws2_32" `
+        "-Wl,--export-all-symbols" "-Wl,--out-implib,$implib"
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
     # remember what this binary can do, so `--features` / `--gui` can give exact advice
     Set-Content -Path (Join-Path $outDir "build-info.txt") -Encoding UTF8 `
-        -Value ("qt=" + $(if ($useQt) { "yes" } else { "no" }) + "`nqtRoot=" + $QtRoot + "`nconfig=" + $Config)
+        -Value ("qt=" + $(if ($useQt) { "yes" } else { "no" }) + "`nqtRoot=" + $QtRoot + "`nconfig=" + $Config + "`ncxx=" + $gpp)
 
     # make the Qt runtime available next to the executable (a self-contained build/)
     if ($useQt) {
@@ -122,6 +126,29 @@ if ($Verify) {
         & $exe $path > $null 2>&1
         if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL $e (exit $LASTEXITCODE)"; $failed++ } else { Write-Host "  ok   $e" }
     }
+    Write-Host "[verify] plugin: build one and use it (no interpreter rebuild)"
+    # `annota plugin build <src>` is the user facing command; some sandboxes forbid a spawned
+    # child from running a compiler outside the workspace, so compile it directly here (the
+    # command it prints is exactly this one).
+    $plugDir = Join-Path $outDir "plugins"
+    New-Item -ItemType Directory -Force -Path $plugDir | Out-Null
+    $plugSrc = Join-Path $root "plugins\hello.cpp"
+    $implib = Join-Path $outDir "libannota.dll.a"
+    & $gpp -std=c++17 -O2 -shared -I (Join-Path $root "src") $plugSrc `
+        "-o" (Join-Path $plugDir "hello.dll") -static-libgcc -static-libstdc++ `
+        $implib 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL plugin compile"; $failed++ }
+    else {
+        $plug = & $exe (Join-Path $root "examples\plugin.ant") 2>&1 | Out-String
+        if ($plug -notmatch "0 failures") { Write-Host "  FAIL plugin example :: $plug"; $failed++ }
+        else { Write-Host "  ok   plugin module loaded through use" }
+        # and from a different working directory, like a GUI launch
+        Push-Location $env:SystemDrive
+        $far = & $exe (Join-Path $root "examples\plugin.ant") 2>&1 | Out-String
+        Pop-Location
+        if ($far -notmatch "0 failures") { Write-Host "  FAIL plugin from another cwd :: $far"; $failed++ }
+        else { Write-Host "  ok   plugin from another working directory" }
+    }
     Write-Host "[verify] analysis fixtures"
     & $exe analyze-suite (Join-Path $root "examples\analysis")
     if ($LASTEXITCODE -ne 0) { $failed++ }
@@ -152,6 +179,14 @@ if ($Verify) {
         if ($gui -notmatch "hello") { Write-Host "  FAIL input through the GUI provider"; $failed++ }
         else { Write-Host "  ok   input through the GUI provider" }
     }
+    Write-Host "[verify] syntax highlighter: no file ends inside a block comment"
+    $hlBad = 0
+    foreach ($e in $examples) {
+        $path = Join-Path $root "examples\$e"
+        & $exe studio $path --check-highlight *> $null
+        if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL $e (highlight)"; $hlBad++ }
+    }
+    if ($hlBad -eq 0) { Write-Host "  ok   $($examples.Count) files" } else { $failed += $hlBad }
     Write-Host "[verify] documentation links"
     & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\doc_links.ps1") -Root $root
     if ($LASTEXITCODE -ne 0) { $failed++ }

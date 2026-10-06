@@ -38,17 +38,37 @@ print fast.sum([1, 2, 3])     -- 6
 
 ## 2. 插件方式：不重新编译解释器
 
-同一个文件可以编成动态库，用 `--plugin` 或环境变量加载：
+一条命令把 C++ 文件变成插件，然后程序里 `use` 它就行——**不需要重新构建解释器**：
 
 ```powershell
-g++ -std=c++17 -O2 -shared -o fast.dll native/fast.cpp `
-    -I src -static-libgcc -static-libstdc++
-annota run program.ant --plugin ./fast.dll
-$env:ANNOTA_PLUGIN = "a.dll;b.dll"     # 多个用 ; 或 : 分隔
+annota plugin build plugins/hello.cpp      # -> build/plugins/hello.dll
+annota run examples/plugin.ant             # `use hello` 自动加载它
+```
+
+* 插件默认写到 `<exe 目录>/plugins/`，这个目录会被自动搜索，所以 `use hello` 直接可用；
+* 也可以放别处：`annota run x.ant --plugin ./hello.dll`，或设 `ANNOTA_PLUGIN=hello.dll;other.dll`；
+* 构建器会自己找编译器（`CXX` → 解释器构建时记录的编译器 → `g++`/`clang++`），并自动带上
+  `src/ffi.hpp` 的包含路径、链接解释器的导入库；
+* Linux/macOS 同样是一句 `annota plugin build`（生成 `lib<name>.so`）；
+* 静态分析器也会加载同一个插件，所以 `use hello` 在 IDE 里不会报"未定义"。
+
+它替你拼出的就是下面这条命令（想手工编译、或者把它写进自己的 CMake 时照抄即可）：
+
+```powershell
+# Windows / MinGW：注意最后那句导入库，插件要链接回解释器
+g++ -std=c++17 -O2 -shared -I src plugins\hello.cpp -o build\plugins\hello.dll `
+    -static-libgcc -static-libstdc++ build\libannota.dll.a
+
+# Linux / macOS
+g++ -std=c++17 -O2 -shared -fPIC -I src plugins/hello.cpp -o build/plugins/libhello.so
+
+annota run examples/plugin.ant                       # 或者用 --plugin 指定路径
+$env:ANNOTA_PLUGIN = "a.dll;b.dll"                   # 多个用 ; 或 : 分隔
 ```
 
 插件从静态初始化器注册即可；如果需要显式入口，导出一个
 `extern "C" void annota_plugin_init()`，加载后会被调用。
+工作流与排错见 [使用手册](tools.md) §6。
 
 ## 3. 接口一览
 
@@ -65,9 +85,9 @@ $env:ANNOTA_PLUGIN = "a.dll;b.dll"     # 多个用 ; 或 : 分隔
 | 报错 | `vm.throwError("消息")`（带 Annota 栈回溯） |
 | 回调 Annota | `vm.callSync(fn, {参数...})`，真值判断用 `vm.truthy(r)` |
 
-原生函数签名是 `Value(VM&, ValueList&)`（`ValueList` 即 `ValueList` 的别名）：
-和核心内置函数完全一致，
-所以一旦某段逻辑值得下沉到 C++，不需要发明新语法。
+原生函数签名是 `Value(VM&, ValueList&)`，其中 `ValueList` 是 `std::vector` 的别名（元素类型
+`Value`）：与核心内置函数完全一致，所以一旦某段逻辑值得下沉到 C++，不需要发明新语法。
+参数按值语义传入的是**副本**，直接遍历、排序都不会影响调用者。
 
 ## 4. 双向通信
 
@@ -96,13 +116,13 @@ Test.eq(fast.reduce_call([1,2,3], (a, b)( =a + b ), 0), 6)
 | 求和 20 万个整数 | 41 ms | 3 ms |
 | 10 万以内素数个数（筛法） | 125 ms | < 1 ms |
 
-标准库已经这样做了：`sorted` / `nth` / `argsort` / `lower_bound` / `upper_bound`
-这类热原语在 C++ 侧（`src/builtins.cpp`），`lib/seq.mod` 只做薄封装；
-再往下如果还需要新算法，按本文档加一个 `native/*.cpp` 即可，不必动核心。
+标准库已经这样做了：排序、`nth`、`argsort`、`lower_bound` / `upper_bound` 这些热原语都在 C++ 侧
+（`native/seq_native.cpp`，注册成 `seqnative` 模块），`lib/seq.mod` 只做薄封装；再往下如果还需要
+新算法，按本文档加一个 `native/*.cpp` 即可，不必动核心。
 
 ## 6. 相关文档
 
-- [语法参考](syntax.md)
-- [`[[jit]]` 机器码后端](jit.md)
+- [使用手册](tools.md)（`annota plugin build`、插件目录、环境变量、排错）
+- [语法参考](syntax.md)（模块一节说明了 `use` 如何找到插件）
+- [机器码与 `[[jit]]`](jit.md)
 - [标准库参考](stdlib.md)
-- [模块与 `use`](syntax.md#9-模块与-use)

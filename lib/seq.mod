@@ -399,7 +399,7 @@ Seq()=(
     )
 
     [[static]]
-    upper_bound(xs, value)(
+    upper_bound_script(xs, value)(
         new lo = 0
         new hi = len(xs)
         while lo < hi(

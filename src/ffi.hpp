@@ -42,11 +42,9 @@ struct FfiRegistry {
     std::map<std::string, std::vector<std::pair<std::string, Value>>> constants;
 };
 
-// Meyers singleton: a static registrar may run before any other global, but this is always ready
-inline FfiRegistry& ffiRegistry() {
-    static FfiRegistry r;
-    return r;
-}
+// Meyers singleton, defined once in src/ffi.cpp: an inline definition would give every plugin
+// its own registry, and then a plugin's registration would never reach the interpreter.
+FfiRegistry& ffiRegistry();
 
 // ---------------------------------------------------------------- registration
 inline void ffiFunction(const std::string& name, FfiFn fn) {
@@ -106,27 +104,35 @@ inline std::vector<std::string> ffiModuleNames() {
 // ---------------------------------------------------------------- installation
 // Every registered global/module lands in the VM's globals, so `use <module>` resolves and
 // `<module>.<member>(...)` is an ordinary field call.
-inline void ffiInstallAll(VM& vm) {
+// install a single registered module/function (used for plugins loaded on demand)
+inline void ffiInstallNamed(VM& vm, const std::string& name) {
     FfiRegistry& r = ffiRegistry();
-    for (auto& kv : r.functions) {
-        vm.globals[kv.first] = std::make_shared<Value>(vm.makeNative(kv.first, kv.second));
+    auto f = r.functions.find(name);
+    if (f != r.functions.end() && !vm.globals.count(name))
+        vm.globals[name] = std::make_shared<Value>(vm.makeNative(name, f->second));
+    auto m = r.modules.find(name);
+    if (m != r.modules.end() && !vm.globals.count(name)) {
+        Value mod = Value::module(name);
+        for (auto& p : m->second) mod.o->map[p.first] = vm.makeNative(name + "." + p.first, p.second);
+        auto c = r.constants.find(name);
+        if (c != r.constants.end())
+            for (auto& p : c->second) mod.o->map[p.first] = p.second;
+        vm.globals[name] = std::make_shared<Value>(mod);
     }
-    for (auto& kv : r.modules) {
-        Value m = Value::module(kv.first);
-        for (auto& p : kv.second) {
-            m.o->map[p.first] = vm.makeNative(kv.first + "." + p.first, p.second);
-        }
-        vm.globals[kv.first] = std::make_shared<Value>(m);
-    }
-    for (auto& kv : r.constants) {
-        Value* mod = nullptr;
-        auto it = vm.globals.find(kv.first);
-        if (it != vm.globals.end() && it->second->t == VT::Module) mod = it->second.get();
-        for (auto& p : kv.second) {
-            if (mod) mod->o->map[p.first] = p.second;
-            else vm.globals[kv.first + "." + p.first] = std::make_shared<Value>(p.second);
-        }
-    }
+    // constants may arrive after the module object (or without one)
+    auto it = vm.globals.find(name);
+    auto c = r.constants.find(name);
+    if (it != vm.globals.end() && it->second && it->second->t == VT::Module && c != r.constants.end())
+        for (auto& p : c->second) it->second->o->map[p.first] = p.second;
+}
+
+inline bool ffiHasAny(const std::string& name) {
+    return ffiHasModule(name) || ffiHasFunction(name);
+}
+
+inline void ffiInstallAll(VM& vm) {
+    for (auto& n : ffiModuleNames()) ffiInstallNamed(vm, n);
+    for (auto& n : ffiFunctionNames()) ffiInstallNamed(vm, n);
 }
 
 // A convenient registration handle used by the ANNOTA_MODULE macro.
@@ -144,8 +150,9 @@ struct FfiModule {
 };
 
 // ---------------------------------------------------------------- plugins
-// Build a shared library that registers itself; load it at start-up with `--plugin <file>` or
-// `ANNOTA_PLUGIN=<file>`.  Nothing in the core needs to know about it - see docs/ffi.md.
+// Build a shared library that registers itself; `annota plugin build` produces one, and it is
+// loaded automatically by `use <module>` (or explicitly with `--plugin` / `ANNOTA_PLUGIN`).
+// Nothing in the core needs to know about it - see docs/ffi.md.
 #ifdef _WIN32
 inline int ffiLoadPlugin(const std::string& path, std::string* error = nullptr) {
     HMODULE h = LoadLibraryA(path.c_str());
@@ -170,6 +177,40 @@ inline int ffiLoadPlugin(const std::string& path, std::string* error = nullptr) 
     return 1;
 }
 #endif
+
+// Look for a plugin that provides `name` and load it.  `dirs` are tried in order; on Windows
+// `<name>.dll`, elsewhere `lib<name>.so` (with and without a `plugins/` subdirectory).
+inline bool ffiLoadPluginFor(const std::string& name, const std::vector<std::string>& dirs,
+                             std::string* tried = nullptr) {
+#ifdef _WIN32
+    const char* exts[] = {".dll"};
+#else
+    const char* exts[] = {".so"};
+#endif
+    std::vector<std::string> cands;
+    for (auto& d : dirs) {
+        for (const char* e : exts) {
+            // accept both spellings: `name.so` and the conventional `libname.so`
+            for (const char* p : {"", "lib"}) {
+                cands.push_back(d + "/" + p + name + e);
+                cands.push_back(d + "/plugins/" + p + name + e);
+            }
+        }
+    }
+    for (auto& c : cands) {
+        std::FILE* f = std::fopen(c.c_str(), "rb");
+        if (!f) continue;
+        std::fclose(f);
+        std::string err;
+        if (!ffiLoadPlugin(c, &err)) {
+            if (tried) *tried = err;
+            continue;
+        }
+        if (ffiHasAny(name)) return true;          // the plugin registered what we asked for
+        if (tried) *tried = "插件 " + c + " 没有注册模块 '" + name + "'";
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------- small helpers for authors
 inline const Value& ffiArg(std::vector<Value>& a, size_t i) {

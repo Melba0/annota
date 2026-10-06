@@ -68,21 +68,26 @@ Heap.from_list(xs).drain()   -- [1, 3, 5, 9]（二叉堆，O(n log n)）
 
 | 函数 | 复杂度 | 说明 |
 |---|---|---|
-| `merge_sort(xs, less)` | O(n log n) | 稳定，用比较函数 |
-| `sort(xs, reverse)` | O(n log n) | 稳定，默认升序 |
-| `sort_by(xs, key, reverse)` | O(n log n) | 稳定，按 key（多关键字可自己写 less） |
-| `heap_sort(xs, reverse)` | O(n log n) | 原地风格，无递归 |
+| `sort(xs, reverse)` | O(n log n) | **稳定**，默认升序；底层是原生 `seqnative.sorted` |
+| `sort_by(xs, key, reverse)` | O(n log n) | 稳定，按 key；用原生 `seqnative.argsort` 求排列 |
+| `merge_sort(xs, less)` | O(n log n) | 脚本版稳定归并，需要自定义比较函数时用它 |
+| `heap_sort(xs, reverse)` | O(n log n) | 脚本版堆排序，原地风格、无递归 |
 | `insertion_sort(xs, less)` | O(n²) | 小数组更快 |
-| `sort_native(xs)` | C++ `std::sort` | 最快，但不保证稳定 |
+| `sort_native(xs)` | O(n log n) | 直接调 `seqnative.sorted`（原生 `std::stable_sort`） |
 | `is_sorted(xs, less)` `insert_sorted(xs, x)` `merge_sorted(a, b, less)` | | 有序性、插入、归并 |
-| `kth(xs, k)` | 平均 O(n) | 第 k 小（三数取中，Lomuto 划分） |
+| `kth(xs, k)` | 平均 O(n) | 第 k 小（0 起）；原生 `seqnative.nth`（`std::nth_element`） |
+| `kth_script(xs, k)` | 平均 O(n) | 脚本版快速选择（三数取中 + Lomuto），参考实现 |
 | `median(xs)` `median_sorted(xs)` `quantile(xs, q)` | 平均 O(n) | 中位数与分位数 |
+
+> 这些 `sort*` / `kth` / `median` 都不修改传入的序列（值语义），返回新列表；
+> 需要就地更新请用 `lend` 或自己维护容器（见 [syntax.md](syntax.md) §4.1.2）。
 
 ### 有序序列查找
 
 | 函数 | 说明 |
 |---|---|
-| `Seq.lower_bound(xs, v)` / `Seq.upper_bound(xs, v)` | 第一个 ≥ v / 第一个 > v 的下标 |
+| `Seq.lower_bound(xs, v)` / `Seq.upper_bound(xs, v)` | 第一个 ≥ v / 第一个 > v 的下标（原生二分） |
+| `Seq.lower_bound_script(xs, v)` / `Seq.upper_bound_script(xs, v)` | 脚本版参考实现 |
 | `Seq.bsearch(xs, v)` / `Seq.bsearch_by(xs, v, key)` | 二分查找，未命中返回 -1 |
 
 ### 统计（不含矩阵/相关性，见 stats）

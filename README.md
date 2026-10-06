@@ -35,16 +35,25 @@ the analyzer reads, so "what the tool tells you" and "what the program does" can
   integer division truncates toward zero.
 * 🧱 **Fixed size typed arrays** — `int[5]`, `int[3][4]`, `int[]` with contiguous storage, auto
   padding, O(1) row views, static bounds proofs and a `[[unsafe]]` opt-out from the runtime check.
-* ⚡ **`[[jit]]` marker** — the one annotation that asks for load-time optimisation (constant folding
-  + superinstruction fusion) of a function; measured on the loop benchmark.
+* ⚡ **Machine code, with or without a marker** — the interpreter compiles hot integer loops to
+  x86-64 by itself (in place, mid-function); `[[jit]]` is the one annotation that asks for the same
+  backend at load time. Semantics never change: anything that cannot be translated keeps running
+  interpreted. See [docs/jit.md](docs/jit.md).
+* 🔌 **Hot-pluggable native code** — `annota plugin build mycode.cpp` turns one C++ file into a
+  plugin that `use mycode` loads at run time; the hot standard-library kernels live that way too,
+  so extending the library needs no core change and no interpreter rebuild.
+* 🤝 **Explicit sharing when you want it** — values deep copy on assignment, argument passing and
+  return (predictable, no spooky action); `lend a = b` is the opt-in reference that makes two names
+  share one storage cell.
 * 🧭 **Case analysis and `elif`**: `if` / `elif` / `else` chains, where each path learns its own
   facts (`if i < 1 ( i = 1 )` then proves `i >= 1`), a branch that returns does not pollute the
   join, and every diagnostic says which branch it came from.
 * 🧠 **The IDE knows the types**: hovering `int` / `long` / `longlong` / `double` ... reports the
   type (width, signedness, how to declare and convert), completion offers them as `type` items and
   the editor highlights them - all from one registry the parser, analyzer and highlighter share.
-* 📁 **Batteries included, in the language itself** — C++ only exposes _-prefixed primitives (clock, env, threads, sockets, files); Seq / Str / Dict / Mathx / File / Path / Time / Os / Thread / Net / Test are .mod files written in Annota. New capabilities are new modules, not rebuilds.
-* ✅ **Self-checking** — `build.ps1 -Verify` runs 8 example programs, 12 analyzer fixtures, a performance benchmark, an LSP end-to-end test and a headless IDE render.
+* 📁 **Batteries included, in the language itself** — C++ only exposes _-prefixed primitives (clock, env, threads, sockets, files) plus the hot kernels behind [FFI](docs/ffi.md); Seq / Str / Dict / Mathx / File / Path / Time / Os / Thread / Net / Test are .mod files written in Annota. New capabilities are new modules — or a plugin you build with one command, without rebuilding the interpreter.
+* ⚡ **Fast where it matters** — hot integer loops are compiled to x86-64 automatically (no annotation needed; `[[jit]]` only asks for it at load time), and the hot library kernels are native, so sorting/median/`argsort` are single C++ calls.
+* ✅ **Self-checking** — `build.ps1 -Verify` runs 19 example programs (600+ assertions), 16 analyzer fixtures, a plugin round-trip, a performance benchmark, an LSP end-to-end test, a highlighter check and a headless IDE render.
 
 ---
 
@@ -53,6 +62,7 @@ the analyzer reads, so "what the tool tells you" and "what the program does" can
 - [Quick start](#quick-start)
 - [The language in 30 lines](#the-language-in-30-lines)
 - [Command line](#command-line)
+- [Tools and native plugins](#tools-and-native-plugins)
 - [The REPL](#the-repl)
 - [The graphical IDE](#the-graphical-ide)
 - [Static analysis](#static-analysis)
@@ -81,8 +91,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 # build and run every check (examples, analyzer fixtures, benchmark, LSP, IDE)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
-build\annota.exe examples\selfcheck.ant    # 72 assertions covering the language
+build\annota.exe examples\selfcheck.ant    # 78 assertions covering the language
 build\annota.exe studio                    # the graphical IDE
+build\annota.exe plugin build plugins\hello.cpp   # C++ plugin, no rebuild (docs/tools.md)
 ```
 
 Requirements: a C++17 compiler (MinGW-w64 g++ 13 or MSVC 2022). **Qt 6 Widgets is optional** —
@@ -240,14 +251,21 @@ new t = "a"
         + "b"        -- ✗ `+ "b"` is parsed as a new statement
 ```
 
-📘 **[Syntax reference](docs/syntax.md)** — every statement, operator and literal, plus the
-exact rules for line continuation and `else` placement.
+📘 **[Syntax reference](docs/syntax.md)** — every statement, operator and literal, plus value and
+reference semantics (`lend`), line continuation and `else` placement.
 📘 **[Coding style](docs/style.md)** — how to lay out a file, name things and use annotations.
+📘 **[Tools and native plugins](docs/tools.md)** — build flags, every subcommand and option, all
+environment variables, the plugin workflow and troubleshooting.
 📘 **[`[[jit]]`](docs/jit.md)** — what the optimisation marker does: superinstructions plus a
-x86-64 machine-code backend for integer code, with automatic fallback.
+x86-64 machine-code backend for integer code, with automatic hot-loop promotion and fallback.
 📘 **[Linking C++ (FFI)](docs/ffi.md)** — register native functions and modules from C++, either
 linked into the binary or loaded as a plugin; the way to make the standard library faster
 without touching the language core.
+
+Native code is hot-pluggable: `annota plugin build mycode.cpp` produces a plugin and `use mycode`
+loads it - the interpreter does not need to be rebuilt (see `plugins/hello.cpp`).  Hot loops in
+Annota itself are compiled to machine code automatically; `[[jit]]` only says "compile at load
+time".
 
 The standard library is layered accordingly: the language core is lexer / parser / compiler / VM,
 `lib/*.mod` is the readable script layer, and the hot kernels live in C++ registered through the
@@ -268,6 +286,7 @@ annota ide <query> <file> ...   hover, definition, rename, complete, inline,
                                 checks, annotations, docs
 annota bench                    analysis performance benchmark
 annota lsp                      language server (stdio, JSON-RPC)
+annota plugin build <file.cpp>  turn one C++ file into a plugin   (docs/tools.md)
 
   -e <code>            evaluate a snippet
   --dump-tokens        print the token stream
@@ -275,11 +294,40 @@ annota lsp                      language server (stdio, JSON-RPC)
   --dump-bc            disassemble the bytecode
   --dump-annotations   print the annotation index as JSON
   --contracts          evaluate assert/require/ensure/invariant at run time
+  --plugin <file>      load a native plugin (repeatable)   (docs/tools.md)
   --gui                show the program's view in a window   (Qt build)
   --gui-tree           print the view tree as text           (no Qt needed)
   --gui-shot <png>     render the view to a PNG without opening a window
   --features           report the capabilities of this binary
 ```
+
+`annota analyze` also takes `--level N`, `--modules` and `--json`; `annota studio` takes
+`--run`, `--preview`, `--echo`, `--shot <png>`, `--tab=<name>` and `--check-highlight` for
+headless use.  Every option, environment variable and workflow is documented in
+**[docs/tools.md](docs/tools.md)**.
+
+## Tools and native plugins
+
+Extend the standard library with C++ **without rebuilding the interpreter**: one command builds a
+plugin, and a program picks it up with a plain `use`:
+
+```powershell
+build\annota.exe plugin build plugins\hello.cpp     # -> build\plugins\hello.dll
+build\annota.exe examples\plugin.ant                # the script says `use hello`
+```
+
+Hot loops inside Annota are compiled to machine code automatically (see
+[docs/jit.md](docs/jit.md)); `[[jit]]` only asks for it to happen at load time.
+
+| Environment variable | Effect |
+|---|---|
+| `ANNOTA_PLUGIN` | plugins to load at start-up, separated by `;` (Windows) or `:` |
+| `ANNOTA_JIT_THRESHOLD` | backward jumps before a loop compiles itself (default 4000, `0` = off) |
+| `ANNOTA_NO_JIT` | disable the machine-code backend entirely (fusion stays on) |
+| `ANNOTA_JIT_DEBUG` | print what is compiled automatically and what is not translatable |
+| `CXX` | compiler used by `annota plugin build` |
+
+Full details: [docs/tools.md](docs/tools.md) · [docs/ffi.md](docs/ffi.md) · [docs/jit.md](docs/jit.md).
 
 ## The REPL
 
@@ -555,18 +603,24 @@ normalised to `\n` on read. The complete list of primitives is in
 ## Project layout
 
 ```
-src/                    ~13k lines of C++17
-  lexer, parser          tokens, macros, annotations, module loading
-  ast, compiler, vm      bytecode compiler and stack VM (deep-copy semantics)
-  builtins               natives, pseudo methods, GUI components, native modules
+src/                    ~14k lines of C++17
+  lexer, parser          tokens, macros, annotations, module loading (one loader for CLI+IDE)
+  ast, compiler, vm      bytecode compiler and stack VM (value semantics, automatic JIT hooks)
+  jit                    x86-64 backend: superinstructions, hot-loop promotion, OSR entries
+  ffi                    the C++ linking interface (registry, plugins)  ← native/*.cpp uses it
+  builtins               natives, pseudo methods, GUI components, built-in native modules
   gui_qt / gui           Qt view renderer / textual tree + no-Qt stubs
   repl                   interactive session (persistent VM)
-  analyzer, analysis_flow  annotation registry, CFG, abstract interpretation, checks
-  ide_cmd, ide_gui, lsp  CLI queries, graphical IDE, language server
+  analyzer, analysis_flow  annotation registry, CFG, abstract interpretation, checks, CAS
+  ide_cmd, ide_gui, lsp  CLI queries, graphical IDE (incl. syntax highlighter), language server
+native/                 C++ linked into the interpreter: seq kernels, `fast` example module
+plugins/                sources for separately built plugins (see `annota plugin build`)
 lib/                    standard library modules (*.mod)
 examples/               example programs, including examples/analysis/ fixtures
-docs/                   reference manual (generated) and screenshots
+docs/                   syntax / stdlib / tools / jit / ffi / style, reference (generated), images
 tools/lsp_smoke.ps1     LSP end-to-end test
+tools/doc_links.ps1     checks every relative documentation link
+tools/cpp_baseline.cpp  the perf workloads in C++, for comparison
 build.ps1               one-command build + verification
 ```
 
@@ -578,12 +632,15 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
 | Step | What it proves |
 |---|---|
-| 8 example programs | the language semantics still work (`selfcheck.ant` alone has 72 assertions) |
-| 12 analyzer fixtures | each check fires when it should and stays silent when it should |
+| 19 example programs | the language semantics still work (`selfcheck.ant` alone has 78 assertions) |
+| 16 analyzer fixtures | each check fires when it should and stays silent when it should |
 | analyzer over the examples | **zero false positives** on real, correct code |
+| a plugin is built, then loaded by `use` | native code is genuinely hot-pluggable (also from another working directory) |
 | `annota bench` | the three latency budgets are met |
 | LSP smoke test | a full editor session (open → hover → rename → save → diagnostics) |
-| `studio --shot` | the IDE builds its window and renders headlessly |
+| syntax highlighter over the examples | no file is painted as a comment because of a missed `]-` |
+| `studio --shot` and `studio --run --echo` | the IDE builds its window and runs programs headlessly |
+| `tools/doc_links.ps1` | every relative documentation link resolves |
 
 ## Performance
 
@@ -598,46 +655,41 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
 ### Runtime speed vs C++
 
-`examples/perf.ant` is a self-timing benchmark (`annota examples/perf.ant`), and
-`tools/cpp_baseline.cpp` runs the same workloads in C++ (`g++ -O2 tools/cpp_baseline.cpp -o cpp_baseline`).
-On one machine (MinGW-w64 g++ 13.1, `-O2`, one core), comparing **total time per workload**:
+`examples/perf.ant` is a self-timing benchmark with correctness assertions
+(`annota examples/perf.ant`), and `tools/cpp_baseline.cpp` runs the same workloads in C++
+(`g++ -O2 tools/cpp_baseline.cpp -o cpp_baseline`).  Numbers below are from one machine
+(MinGW-w64 g++ 13.1, `-O2`, one core) and move with the toolchain — re-run them to compare:
 
-| Workload | Annota | C++ | Ratio | % of C++ |
-|---|---|---|---|---|
-| int loop, no `[[jit]]` | 62 ms | 0.085 ms | 729x | 0.14% |
-| int loop with `[[jit]]` | 26 ms | 0.085 ms | 306x | 0.33% |
-| function call (40k) | 43 ms | 0.056 ms | 768x | 0.13% |
-| fixed array `int[n]` | 23 ms | 0.232 ms | 99x | 1.0% |
-| list push | 69 ms | 0.508 ms | 136x | 0.74% |
-| merge sort (2000) | 207 ms | 0.087 ms | 2379x | 0.04% |
-| heap sort (2000) | 25 ms | 0.078 ms | 321x | 0.31% |
-| binary search (4k x4k) | 67 ms | 0.185 ms | 362x | 0.28% |
-| hash lookup (4k keys) | 147 ms | 0.239 ms | 615x | 0.16% |
-| median by sorting | 1455 ms | 0.142 ms | 10246x | 0.01% |
-| median by quickselect | 59 ms | 0.058 ms | 1017x | 0.10% |
-| sieve of Eratosthenes | 54 ms | 0.107 ms | 505x | 0.20% |
-| KMP search (2000 chars) | 4 ms | 0.211 ms | 19x | 5.3% |
-| edit distance (80x80) | 665 ms | 0.428 ms | 1554x | 0.06% |
-| matrix multiply (30x30) | 128 ms | 0.010 ms | 12800x | 0.01% |
-| Dijkstra (14x14 grid) | 149 ms | 0.065 ms | 2292x | 0.04% |
-| **total** | **3183 ms** | **2.58 ms** | **1236x** | **0.081%** |
+| Workload | Annota | C++ | Notes |
+|---|---|---|---|
+| int loop (no marker) | ~1 ms / 400k iters | 0.085 ms | automatic JIT promotes it; ≈2 ns per iteration |
+| int loop with `[[jit]]` | < 1 ms | 0.085 ms | compiled at load time |
+| function call (40k) | 21–25 ms | 0.056 ms | ≈550 ns per call |
+| `Seq.sort` / median / `argsort` | 0–2 ms | 0.08–0.14 ms | one native call into `seqnative` |
+| KMP search (2000 chars) | ~2 ms | 0.211 ms | ~10% of C++ |
+| edit distance (80×80) | ~470 ms | 0.424 ms | script DP: ~0.1% of C++ |
+| Dijkstra (14×14 grid) | ~50 ms | 0.065 ms | script algorithm |
+| matrix multiply (30×30) | ~18 ms | 0.010 ms | script algorithm |
+| **total** | **1.1–1.8 s** | **3.22 ms** | **≈350–550x, i.e. 0.2–0.3% of C++** |
 
 How to read this:
 
-* **Dispatch costs ~30 ns per VM instruction**: the plain loop is 155 ns per iteration (about
-  five instructions: add, store, increment, store, compare/branch) and the `[[jit]]`-fused loop is
-  65 ns for two instructions - the same ~30 ns either way.  A *scalar* C++ loop is ~0.5-1 ns per
-  operation, so instruction dispatch is roughly **2-3% of scalar C++**; the 0.14% above is against
-  a vectorized C++ loop.
-* **Script-level algorithms land at 0.01%-1%** of C++ (sorting, DP, graphs), because each
-  algorithmic step expands into many VM instructions and allocations.  `KMP` (5.3%) and fixed
-  arrays (1.0%) are the good cases: long tight loops over cheap operations.
-* **Native primitives run at C++ speed**: `Seq.sort` (the native `seqnative` module), `len`, `sum`, string methods and file I/O are
-  single C++ calls (the `原生排序 (seqnative)` row measures 0 ms - it is one `std::stable_sort`).
-* For calibration, this is **CPython-class on dispatch** (CPython's simple int loop is ~20-35 ns per
-  iteration, the fused Annota loop is 65 ns) and **~12x slower than CPython on function calls**
-  (~1075 ns vs ~50-90 ns), which is the clearest remaining target.
-* Algorithm choice still matters more than the interpreter: quickselect is 25x faster than
+* **Dispatch costs ≈13 ns per VM instruction.**  The plain `while` loop is about 12
+  instructions/iteration; superinstructions cut that, and the machine-code backend removes the
+  dispatch entirely, which is why a hot integer loop lands at 1–2 ns per iteration (single-digit
+  multiples of C++ rather than hundreds).
+* **What is left is mostly script-level algorithms**: sorting, DP, graph and matrix code expand
+  into many VM instructions and allocations, so they land at 0.01%–1% of C++.  Moving such a
+  kernel into C++ through [FFI](docs/ffi.md) is a one-command, no-rebuild change.
+* **Container operations follow the language's value semantics** — arguments, assignment and
+  returns deep copy — so list-heavy workloads pay for those copies by design; `lend` (§4.1.2 of
+  [syntax.md](docs/syntax.md)) is the explicit way to share storage instead.
+* **Native primitives run at C++ speed**: `Seq.sort`, `nth`, `median`, `argsort`,
+  `lower_bound`/`upper_bound`, `len`, `sum`, string methods and file I/O are single C++ calls.
+* **Calls are the clearest remaining interpreter target** (~550 ns each, CPython-class or a bit
+  worse); per-instruction dispatch is already comparable to CPython, and the JIT covers the
+  integer subset.
+* Algorithm choice still matters more than the interpreter: quickselect is far faster than
   "sort then take the middle" *inside Annota*, exactly as `nth_element` beats `sort` in C++.
 
 ## FAQ & troubleshooting
@@ -713,7 +765,49 @@ Use `use file` (`File` / `Dir` / `Path`) or the `_file_*` primitives — both co
 wide-character API. Opening a path with `io.read_file` on a non-UTF-8 codepage may not.
 </details>
 
-More in [docs/reference.md](docs/reference.md) and in the Chinese README's FAQ section.
+<details>
+<summary><b><code>cannot find module 'test'</code> (or any standard-library module)</b></summary>
+
+Modules are searched next to the program, in its `lib/` and `../lib/`, next to **the executable**
+and in its `lib/` and `../lib/`, then in the current directory — so a GUI launch, a shortcut or a
+different working directory all resolve the standard library.  The error message lists every
+directory it looked in; `annota analyze <file> --modules` shows what the checker resolved.
+More: [docs/tools.md](docs/tools.md).
+</details>
+
+<details>
+<summary><b>A C++ plugin is not picked up by <code>use</code></b></summary>
+
+`annota plugin build <file.cpp>` writes to `<exe dir>/plugins/`, which is searched automatically;
+plugins elsewhere need `--plugin <file>` or `ANNOTA_PLUGIN`.  If the build says "no C++ compiler
+found", point `CXX` at one.  Full workflow and the manual compile command:
+[docs/ffi.md](docs/ffi.md) and [docs/tools.md](docs/tools.md).
+</details>
+
+<details>
+<summary><b>Everything after some line looks like a comment in the editor</b></summary>
+
+The highlighter missed a `]-`. Check the file headlessly:
+
+```powershell
+build\annota.exe studio yourfile.ant --check-highlight
+```
+
+It fails when the document still ends inside a `-[ ]-` comment.  `build.ps1 -Verify` runs this
+over every example.
+</details>
+
+<details>
+<summary><b>A hot loop did not get faster</b></summary>
+
+Automatic promotion only applies to functions that can be translated as a whole (integer
+arithmetic, comparisons, branches, returns). Run with `ANNOTA_JIT_DEBUG=1` to see which functions
+were compiled and which were not, lower the bar with `ANNOTA_JIT_THRESHOLD=500`, or turn the
+backend off with `ANNOTA_NO_JIT=1`.  See [docs/jit.md](docs/jit.md).
+</details>
+
+More in [docs/reference.md](docs/reference.md), [docs/tools.md](docs/tools.md) and in the Chinese
+README's FAQ section.
 
 ## Contributing
 

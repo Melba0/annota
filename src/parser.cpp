@@ -984,6 +984,14 @@ StmtP Parser::parseUse() {
         } else if (!isBuiltinModule(spec)) {
             // a missing module used to be a silent no-op, which turned into confusing
             // "undefined variable" errors much later - say it right here instead
+            // a `use <name>` may name a plugin: ask the loader to load <name>.dll / lib<name>.so
+            bool becameNative = false;
+            if (loader_ && loader_->ensureModule(spec)) becameNative = true;
+            if (becameNative) {
+                // nothing to inline: the module lives in the FFI registry and is installed at
+                // run time (and the analyzer knows it through the same registry)
+                return nullptr;
+            }
             error("cannot find module '" + spec + "'" + (loader_ ? loader_->searchHint(spec) : ""));
         }
     }

@@ -35,7 +35,14 @@ Annota 是一门"标注即规范"的小语言：`[[require]]`、`[[ensure]]`、`
   `longlong`（128 位）与 `longdouble`（80 位）；声明宽度按 C 语义回绕/舍入，整数除法向零截断。
 * 🧱 **定长类型化数组**——`int[5]`、`int[3][4]`、`int[]`：连续存储、自动补 0、O(1) 行视图、
   静态越界证明，以及用 `[[unsafe]]` 关掉运行时检查的开关。
-* ⚡ **`[[jit]]` 标记**——唯一的优化标记，让某函数在加载期做常量折叠与超指令融合，基准可量化。
+* ⚡ **机器码，有标记没标记都行**——解释器会自己把热整数循环编译成 x86-64，并在函数执行到一半时
+  当场接管；`[[jit]]` 是唯一的相关标注，只表示"在加载期就编译同一个后端"。语义永远不变：
+  翻译不了的照旧解释执行。见 [docs/jit.md](docs/jit.md)。
+* 🔌 **原生代码热插拔**——`annota plugin build mycode.cpp` 把单个 C++ 文件编成插件，程序里
+  `use mycode` 运行期加载；标准库的热内核也是这么放进去的，所以扩展库既不用改核心、
+  也不用重编译解释器。
+* 🤝 **想共享时显式共享**——赋值、传参、返回都深拷贝（可预测，没有意外联动）；
+  `lend a = b` 是显式引用，让两个名字共享同一个存储单元。
 * 🧭 **分类讨论与 `elif`**——`if` / `elif` / `else` 链；每条路径各自学习事实
   （`if i < 1 ( i = 1 )` 之后可证 `i >= 1`），会返回的分支不污染并集，
   并且每条诊断都会注明来自哪个分支。
@@ -43,9 +50,10 @@ Annota 是一门"标注即规范"的小语言：`[[require]]`、`[[ensure]]`、`
   （宽度、有无符号、怎么声明与转换），补全把它们作为 `type` 提供，编辑器也会高亮；
   这些名字来自 parser / 分析器 / 高亮器共用的同一份注册表。
 * 📁 **开箱可用的标准库**——`Seq` / `Str` / `Dict` / `Mathx` / `File` / `Dir` / `Path` / `Test` / 切片，
-  以及正确处理 UTF-8 路径的文件层与 JSON 模块。
-* ✅ **自带验证**——`build.ps1 -Verify` 一条命令跑完 8 个示例、12 个分析用例、性能基准、
-  LSP 端到端和 IDE 无头截图。
+  以及正确处理 UTF-8 路径的文件层、JSON、图与几何模块；热内核（排序、中位数、`argsort` 等）
+  是通过 [FFI](docs/ffi.md) 链接进来的 C++。
+* ✅ **自带验证**——`build.ps1 -Verify` 一条命令跑完 19 个示例（600+ 条断言）、16 个分析用例、
+  插件往返、性能基准、LSP 端到端、高亮检查和 IDE 无头截图。
 
 ---
 
@@ -54,6 +62,7 @@ Annota 是一门"标注即规范"的小语言：`[[require]]`、`[[ensure]]`、`
 - [快速开始](#快速开始)
 - [30 行看懂这门语言](#30-行看懂这门语言)
 - [命令行](#命令行)
+- [工具与原生插件](#工具与原生插件)
 - [REPL](#repl)
 - [图形化 IDE](#图形化-ide)
 - [静态分析](#静态分析)
@@ -84,8 +93,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 # 构建 + 跑完所有检查（示例、分析用例、基准、LSP、IDE）
 powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
-build\annota.exe examples\selfcheck.ant    # 72 条断言覆盖语言全部特性
+build\annota.exe examples\selfcheck.ant    # 78 条断言覆盖语言全部特性
 build\annota.exe studio                    # 图形化 IDE
+build\annota.exe plugin build plugins\hello.cpp   # C++ 插件，不重编译解释器（见 docs/tools.md）
 ```
 
 需要 C++17 编译器（MinGW-w64 g++ 13 或 MSVC 2022）。**Qt 6 Widgets 是可选的**：
@@ -237,12 +247,18 @@ new t = "a"
         + "b"        -- ✗ `+ "b"` 会被当成新语句
 ```
 
-📘 **[语法规范](docs/syntax.md)**——词法、语句、表达式、运算符优先级，以及续行与 `else` 的确切规则。
+📘 **[语法规范](docs/syntax.md)**——词法、语句、表达式、运算符优先级、值与引用语义（`lend`），
+以及续行与 `else` 的确切规则。
 📘 **[代码规范](docs/style.md)**——文件怎么写、怎么命名、标注怎么用、提交前检查清单。
-📘 **[`[[jit]]`](docs/jit.md)**——标记到底做了什么：超指令融合，以及整数子集的 x86-64 机器码后端，
-翻译不了就自动回退解释执行。
+📘 **[使用手册](docs/tools.md)**——构建开关、全部子命令与选项、所有环境变量、插件工作流与排错。
+📘 **[`[[jit]]`](docs/jit.md)**——标记到底做了什么：超指令融合，整数子集的 x86-64 机器码后端，
+以及热循环的自动提升与回退。
 📘 **[链接 C++（FFI）](docs/ffi.md)**——从 C++ 注册原生函数与模块（可静态链接，也可做成插件加载），
 让标准库变快而不必改语法核心。
+
+原生代码是热插拔的：`annota plugin build mycode.cpp` 生成插件，程序里 `use mycode` 自动加载，
+**不需要重新构建解释器**（见 `plugins/hello.cpp`）。Annota 自己的热循环会被自动编译成机器码，
+`[[jit]]` 只是表示"加载时就编译"。
 
 标准库就是这么分层的：语言核心只有词法/语法/编译/虚拟机，`lib/*.mod` 是可读的脚本层，
 热内核放在通过 FFI 注册的 C++ 里——`Seq.sort`、`kth`、`median`、`dedup`、`sort_by`、
@@ -261,6 +277,7 @@ annota ide <query> <file> ...   悬停 / 跳转 / 重命名 / 补全 / 内联状
                                 快速修复 / 抑制清单 / 报告 / 检查表 / 标注表 / 文档
 annota bench                    分析器性能基准
 annota lsp                      语言服务器（stdio，JSON-RPC）
+annota plugin build <file.cpp>  把单个 C++ 文件编成插件（见 docs/tools.md）
 
   -e <code>            执行一段代码
   --dump-tokens        打印词法单元流
@@ -268,11 +285,38 @@ annota lsp                      语言服务器（stdio，JSON-RPC）
   --dump-bc            反汇编字节码
   --dump-annotations   以 JSON 打印标注索引
   --contracts          运行期检查 assert/require/ensure/invariant
+  --plugin <file>      启动时加载原生插件（可重复，见 docs/tools.md）
   --gui                在窗口中显示程序自己的 view（Qt 构建）
   --gui-tree           以文本打印组件树（无需 Qt）
   --gui-shot <png>     不开窗，把 view 渲染成 PNG
   --features           报告本二进制的可选能力
 ```
+
+`annota analyze` 还支持 `--level N`、`--modules`、`--json`；`annota studio` 支持 `--run`、
+`--preview`、`--echo`、`--shot <png>`、`--tab=<名字>`、`--check-highlight`（无头运行用）。
+所有开关、环境变量与工作流汇总在 **[docs/tools.md](docs/tools.md)**。
+
+## 工具与原生插件
+
+用 C++ 扩展标准库**不需要重编译解释器**：一条命令生成插件，程序里一句 `use` 就能用：
+
+```powershell
+build\annota.exe plugin build plugins\hello.cpp     # -> build\plugins\hello.dll
+build\annota.exe examples\plugin.ant                # 脚本里写 use hello
+```
+
+Annota 自己的热循环会被**自动**编译成机器码（见 [docs/jit.md](docs/jit.md)）；`[[jit]]`
+只是要求"在加载阶段就编译"。
+
+| 环境变量 | 作用 |
+|---|---|
+| `ANNOTA_PLUGIN` | 启动时加载的插件，多个用 `;`（Windows）或 `:` 分隔 |
+| `ANNOTA_JIT_THRESHOLD` | 热循环自动编译的门槛（默认 4000 次回跳，`0` 关闭） |
+| `ANNOTA_NO_JIT` | 完全关闭机器码后端（超指令融合仍生效） |
+| `ANNOTA_JIT_DEBUG` | 打印哪些函数被自动编译、哪些不可翻译 |
+| `CXX` | `annota plugin build` 使用的编译器 |
+
+细节： [docs/tools.md](docs/tools.md) · [docs/ffi.md](docs/ffi.md) · [docs/jit.md](docs/jit.md)。
 
 ## REPL
 
@@ -556,12 +600,15 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 
 | 步骤 | 证明了什么 |
 |---|---|
-| 8 个示例程序 | 语言语义没有回归（仅 `selfcheck.ant` 就有 72 条断言） |
-| 12 个分析用例 | 每条检查该报的报、不该报的不报 |
+| 19 个示例程序 | 语言语义没有回归（仅 `selfcheck.ant` 就有 78 条断言） |
+| 16 个分析用例 | 每条检查该报的报、不该报的不报 |
 | 对示例跑分析器 | 真实且正确的代码上**零误报** |
+| 编一个插件再用 `use` 加载 | 原生代码确实热插拔（换工作目录也一样） |
 | `annota bench` | 三层延迟预算达标 |
 | LSP 冒烟测试 | 完整编辑器会话（打开 → 悬停 → 重命名 → 保存 → 诊断） |
-| `studio --shot` | IDE 能建窗并完成无头渲染 |
+| 对示例跑语法高亮检查 | 没有文件因为漏掉 `]-` 而整段被当成注释 |
+| `studio --shot` / `--run --echo` | IDE 能建窗截图，也能无头运行程序 |
+| `tools/doc_links.ps1` | 文档里的相对链接都能解析 |
 
 ## 性能
 
@@ -573,6 +620,39 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify
 | L1 击键 | 50 ms | **8 ms** |
 | L2 保存 | 500 ms | **23 ms** |
 | L3 后台 | 5 s | **23 ms** |
+
+### 与 C++ 的运行时对比
+
+`examples/perf.ant` 是自带计时与正确性断言的基准（`annota examples/perf.ant`），
+`tools/cpp_baseline.cpp` 是同一批负载的 C++ 版本
+（`g++ -O2 tools/cpp_baseline.cpp -o cpp_baseline`）。下表来自一台机器
+（MinGW-w64 g++ 13.1，`-O2`，单核），数值会随工具链变化，请自己复测：
+
+| 负载 | Annota | C++ | 说明 |
+|---|---|---|---|
+| int 循环（无标注） | ~1 ms / 40 万次 | 0.085 ms | 自动 JIT 会提升它；≈2 ns/迭代 |
+| int 循环（`[[jit]]`） | < 1 ms | 0.085 ms | 加载期就编译 |
+| 函数调用（4 万次） | 21–25 ms | 0.056 ms | ≈550 ns/次 |
+| `Seq.sort` / 中位数 / `argsort` | 0–2 ms | 0.08–0.14 ms | 一次原生调用进 `seqnative` |
+| KMP 搜索（2000 字符） | ~2 ms | 0.211 ms | 约 C++ 的 10% |
+| 编辑距离（80×80） | ~470 ms | 0.424 ms | 脚本 DP：约 C++ 的 0.1% |
+| Dijkstra（14×14 网格） | ~50 ms | 0.065 ms | 脚本算法 |
+| 矩阵乘（30×30） | ~18 ms | 0.010 ms | 脚本算法 |
+| **合计** | **1.1–1.8 s** | **3.22 ms** | **≈350–550 倍，即 C++ 的 0.2–0.3%** |
+
+怎么读这张表：
+
+* **每条 VM 指令约 13 ns**：普通 `while` 循环每轮约 12 条指令；超指令减少条数，机器码后端
+  则彻底去掉派发，所以热整数循环能到 **1–2 ns/迭代**（只是 C++ 的个位数倍，而不是几百倍）。
+* **剩下的差距主要来自脚本算法**：排序、DP、图、矩阵每一步都要展开成很多条指令和分配，
+  因此落在 C++ 的 0.01%–1%。把这类内核搬到 C++
+  （[FFI](docs/ffi.md)，一条命令、不用重编译）是最直接的提速方式。
+* **容器操作遵循值语义**：赋值、传参、返回都深拷贝，所以列表密集的负载按设计就要付拷贝成本；
+  要共享就用 `lend`（[syntax.md](docs/syntax.md) §4.1.2）。
+* **原生原语就是 C++ 速度**：`Seq.sort`、`nth`、`median`、`argsort`、`lower_bound`/`upper_bound`、
+  `len`、`sum`、字符串方法与文件 I/O 都是一次 C++ 调用。
+* 调用开销（≈550 ns/次）是解释器目前最明显的短板；逐指令派发已经和 CPython 一个量级，
+  整数子集还有 JIT 兜着。
 
 ## 常见问题
 
@@ -645,7 +725,44 @@ build\annota.exe studio examples\input.ant --run --echo --shot out.png
 `io.read_file` 在非 UTF-8 代码页下可能失败。
 </details>
 
-更多内容见 [docs/reference.md](docs/reference.md)。
+<details>
+<summary><b>报 <code>cannot find module 'test'</code>（或任何标准库模块）</b></summary>
+
+模块会依次在程序所在目录、它的 `lib/` 与 `../lib/`、**解释器所在目录**及其 `lib/`、`../lib/`、
+当前目录里找，所以图形界面启动、快捷方式启动、换工作目录都不影响标准库解析。报错信息会列出
+它实际搜过的每个目录；`annota analyze <文件> --modules` 可以看到分析器解析到了什么。
+详见 [docs/tools.md](docs/tools.md)。
+</details>
+
+<details>
+<summary><b>编好的 C++ 插件没有被 <code>use</code> 找到</b></summary>
+
+`annota plugin build <文件.cpp>` 默认写到 `<解释器目录>/plugins/`，这个目录会被自动搜索；
+放在别处需要用 `--plugin <文件>` 或设 `ANNOTA_PLUGIN`。如果它说找不到编译器，用 `CXX`
+指定一个。完整流程与手工编译命令见 [docs/ffi.md](docs/ffi.md) 与 [docs/tools.md](docs/tools.md)。
+</details>
+
+<details>
+<summary><b>编辑器里从某一行开始整段显示成注释</b></summary>
+
+高亮器漏掉了 `]-`。可以无头检查：
+
+```powershell
+build\annota.exe studio 你的文件.ant --check-highlight
+```
+
+文档最后一块仍处于注释状态时它会报错退出；`build.ps1 -Verify` 会对 `examples/` 全部文件做这项检查。
+</details>
+
+<details>
+<summary><b>热循环为什么没有变快</b></summary>
+
+自动提升只作用于能被整体翻译的函数（整数运算、比较、分支、返回）。用 `ANNOTA_JIT_DEBUG=1`
+看哪些被编译、哪些没有；想更早提升用 `ANNOTA_JIT_THRESHOLD=500`，想彻底关掉用
+`ANNOTA_NO_JIT=1`。见 [docs/jit.md](docs/jit.md)。
+</details>
+
+更多内容见 [docs/reference.md](docs/reference.md) 与 [docs/tools.md](docs/tools.md)。
 
 ## 参与贡献
 
@@ -676,6 +793,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify   # 提 PR 前必须�
 文档要求"所有赋值都是深拷贝"，因此 `OP_SET_LOCAL/SET_GLOBAL/SET_FIELD/SET_INDEX/SET_UPVAL`、
 实参绑定、返回值都调用 `deepCopy()`；自引用结构用 `Obj* → Value` 记忆表处理。
 唯一例外是方法接收者 `this`（按单元绑定），否则 `counter.inc()` 与 GUI 字段读写无法工作。
+
+拷贝只在**可能被观察到**时发生：如果某个对象当前只被本帧引用（`use_count() == 1`），
+就直接搬运而不复制。需要**显式共享**时用 `lend a = b`——它让两个名字绑定到同一个
+`shared_ptr<Value>` 单元，因此读写与闭包捕获都作用于同一份数据（见
+[syntax.md](docs/syntax.md) §4.1.2）。
 </details>
 
 <details>
@@ -719,8 +841,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify   # 提 PR 前必须�
 `init`（是否初始化）、`taint`（来源）、`type`。合并规则：区间取凸包、三态合并、
 任一分支未初始化即为未初始化、污点取或。
 
-由于语言是深拷贝值语义，**不需要别名分析**。循环用"两遍迭代 + 加宽"求不动点：
-循环体改写的变量在出口处放宽到 unknown，避免用一次迭代的结论去推断整个循环。
+由于语言是深拷贝值语义，**不需要通用别名分析**；只有 `lend` 会引入别名，分析器按别名组
+保守处理（读任一名字算读另一个，任一侧写入就丢弃另一侧已推断出的取值/长度）。循环用
+"两遍迭代 + 加宽"求不动点：循环体改写的变量在出口处放宽到 unknown，避免用一次迭代的结论
+去推断整个循环。
 
 语句级 CFG（`if` 双边、`while`/`for` 回边、`break`/`continue` 跳转、`return`/`throw` 无后继、
 `except` 从块入口引异常边）用于不可达代码与活跃性分析（死存储、未使用变量）。
@@ -766,13 +890,27 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Verify   # 提 PR 前必须�
 
 | 文件 | 内容 |
 |---|---|
-| `examples/selfcheck.ant` | **自检**：72 条断言覆盖语言全部特性 |
-| `examples/stdlib.ant` | 标准库导览（Seq / Str / Dict / Mathx / slice / Test） |
-| `examples/algorithms.ant` | 快排/归并/冒泡、二分查找、记忆化斐波那契、LCS、编辑距离、筛法、矩阵乘法 |
+| `examples/selfcheck.ant` | **自检**：78 条断言覆盖语言全部特性（含值语义与 `lend`） |
+| `examples/syntax.ant` | 语法巡礼：声明、控制流、闭包、类、引用、陷阱，45 条断言 |
+| `examples/stdlib.ant` | 标准库导览（Seq / Str / Dict / Mathx / slice / Test），69 条断言 |
+| `examples/algorithms.ant` | 排序/查找/DP/图/矩阵等算法，86 条断言 |
+| `examples/arrays.ant` | 定长与类型化数组、行视图、越界检查，23 条断言 |
+| `examples/collections.ant` | Dict / Set / Counter 与哈希性能对照，32 条断言 |
+| `examples/strings.ant` | KMP、编辑距离、LCS、CSV、Base64、终端宽度，47 条断言 |
+| `examples/numerics.ant` | 数论、进制、开方、汉诺塔等，53 条断言 |
+| `examples/graphs.ant` | BFS/DFS/Dijkstra/Floyd/Kruskal，35 条断言 |
+| `examples/geometry.ant` | 凸包、最近点对、多边形面积，34 条断言 |
 | `examples/files.ant` | 文件与目录 API，39 条断言 |
-| `examples/input.ant` | `input`：控制台读 stdin，GUI/IDE 弹对话框 |
+| `examples/system.ant` | 进程、环境变量、时间、线程等系统接口，53 条断言 |
+| `examples/perf.ant` | **性能基准**：自带计时与正确性断言，19 条断言 |
+| `examples/jit.ant` | 手动 `[[jit]]` 与**自动 JIT** 的对照，12 条断言 |
+| `examples/ffi.ant` | 链接 C++ 的 `fast` 模块（原生内核 + 回调），18 条断言 |
+| `examples/plugin.ant` | **热插拔插件**：`use` 加载 `plugins/hello.cpp` 编出的模块，6 条断言 |
+| `examples/input.ant` | `input`：控制台读 stdin，GUI/IDE 弹对话框，2 条断言 |
 | `examples/smoke.ant` | 各类语法的最小集合 |
 | `examples/buffer.ant` | 文档第 17 章综合示例（`--contracts` 可开契约检查） |
 | `examples/gui_counter.ant` | 文档 15.12 GUI 示例，`--gui` 开窗、`--gui-shot` 出图 |
 | `examples/modules.ant` + `shapes.mod` | 自定义模块、`__call__`/`__get__`/`__set__`/`__iter__` 魔法函数 |
-| `examples/analysis/*.ant` | 12 个静态分析用例（正例 / 反例 / 边界 / 抑制） |
+| `examples/analysis/*.ant` | 16 个静态分析用例（正例 / 反例 / 边界 / 抑制 / `lend`） |
+
+示例里的断言合计 600 条以上；`build.ps1 -Verify` 会把它们全部跑一遍。

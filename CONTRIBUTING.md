@@ -10,6 +10,7 @@ the project so that a pull request can be reviewed quickly.
 - [Adding an analyzer check](#adding-an-analyzer-check)
 - [Adding an annotation](#adding-an-annotation)
 - [Adding a standard library function](#adding-a-standard-library-function)
+- [Adding native code (FFI, kernels and plugins)](#adding-native-code-ffi-kernels-and-plugins)
 - [Documentation](#documentation)
 - [Commit and pull request style](#commit-and-pull-request-style)
 
@@ -69,13 +70,23 @@ On Linux, build with CMake (`cmake -S . -B build && cmake --build build`); the r
 Individual pieces while iterating:
 
 ```powershell
-build\annota.exe examples\selfcheck.ant                # language semantics (72 assertions)
+build\annota.exe examples\selfcheck.ant                # language semantics (78 assertions)
 build\annota.exe examples\files.ant                    # file API (39 assertions)
+build\annota.exe examples\jit.ant                      # manual and automatic JIT (12 assertions)
+build\annota.exe examples\plugin.ant                   # loads the plugin built below
 build\annota.exe analyze-suite examples\analysis       # analyzer fixtures
 build\annota.exe analyze <file> --json                 # one file, machine readable
 build\annota.exe bench                                 # performance budgets
 powershell -ExecutionPolicy Bypass -File tools/lsp_smoke.ps1
 build\annota.exe studio <file> --shot out.png          # headless IDE render
+build\annota.exe studio <file> --check-highlight       # no file ends inside a -[ ]- comment
+```
+
+The plugin round-trip from `-Verify`, step by step (this is the whole hot-plug story):
+
+```powershell
+build\annota.exe plugin build plugins\hello.cpp        # -> build\plugins\hello.dll
+build\annota.exe examples\plugin.ant                   # `use hello` loads it
 ```
 
 A new analyzer fixture must declare what it expects in its first line:
@@ -143,13 +154,47 @@ express (file system access, time, and so on).
   `try_*` variant when they can fail.
 * Cover it with assertions in the matching example (`examples/stdlib.ant`, `examples/files.ant`).
 
+## Adding native code (FFI, kernels and plugins)
+
+The core stays small: **hot algorithms are linked in, not added to the interpreter**. Pick the
+lightest option that works:
+
+| Situation | Where it goes |
+|---|---|
+| A hot loop written in Annota | nowhere - the interpreter compiles hot integer loops to machine code by itself; `[[jit]]` only asks for load-time compilation |
+| An algorithm kernel that the standard library calls | a new `native/*.cpp` registering a module through `src/ffi.hpp` (see `native/seq_native.cpp`); `build.ps1` links `native/*.cpp` automatically |
+| Native ability that must work without rebuilding | a plugin source under `plugins/`, built with `annota plugin build` and loaded by `use` |
+| A raw OS capability the language cannot express | one `_`-prefixed primitive in `src/sys_api.cpp` |
+
+Rules for anything in `native/` or `plugins/`:
+
+* Register through `src/ffi.hpp` - `ANNOTA_MODULE(name) { mod.fn("member", ...); } ANNOTA_END_MODULE`
+  for a module, `ANNOTA_FUNCTION(name, fn)` for a global. Never add to `src/builtins.cpp` just to
+  expose a helper.
+* The interface is documented in [docs/ffi.md](docs/ffi.md): arguments arrive as
+  `std::vector<Value>&`, `ffiArg`/`ffiItems`/`ffiList`/`ffiInt` convert, `vm.throwError(...)`
+  reports, `vm.callSync(fn, args)` calls back into Annota.
+* Keep the module self-checking: add assertions to an example (`examples/ffi.ant`,
+  `examples/plugin.ant`) and, for a plugin, a line in the `-Verify` plugin step.
+* Mind the value semantics the same way script code must: a native that mutates a container it did
+  not create is a bug; return a new value instead (see [docs/syntax.md](docs/syntax.md) §4.1.1).
+* `annota plugin build` needs the interpreter's import library, which `build.ps1` writes next to
+  the executable (`libannota.dll.a`); the plugins search path is documented in
+  [docs/tools.md](docs/tools.md).
+
 ## Documentation
 
 * `README.md` (English) and `README_zh.md` (Chinese) are kept in sync; update both.
 * `docs/reference.md` is **generated**: run `build\annota.exe ide docs --out docs/reference.md`
-  after changing annotations, diagnostic codes or file primitives. Never edit it by hand.
+  after changing annotations, diagnostic codes, primitives or subcommands. Never edit it by hand.
+* The hand-written guides are `docs/syntax.md` (language), `docs/stdlib.md` (library),
+  `docs/tools.md` (build, CLI, environment variables, plugins, troubleshooting),
+  `docs/jit.md` (optimisation) and `docs/ffi.md` (linking C++). Keep them in Chinese like the
+  rest, and link them from both READMEs.
 * Screenshots live in `docs/images/`. They are produced headlessly:
   `build\annota.exe studio <file> --run --shot docs/images/ide-problems.png`.
+* After moving files around, run `powershell -ExecutionPolicy Bypass -File tools/doc_links.ps1`
+  (also part of `-Verify`): a broken relative link fails CI.
 
 ## Commit and pull request style
 

@@ -11,6 +11,39 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* **Automatic JIT.**  The interpreter counts backward jumps per chunk and, once a loop is hot
+  (default 4000 iterations, `ANNOTA_JIT_THRESHOLD`), compiles that function with the x86-64
+  backend and switches to it *in place* through a loop-header entry point (on-stack replacement),
+  so a single long call speeds up too.  `[[jit]]` now only means "compile at load time".
+* **Hot-pluggable C++.**  `annota plugin build <file.cpp>` turns one C++ file into a plugin
+  (default `build/plugins/<name>.dll`), and `use <name>` loads it automatically - no interpreter
+  rebuild, no flags.  `--plugin` and `ANNOTA_PLUGIN` still work for plugins kept elsewhere, the
+  analyzer loads the same plugin, and the loader now also searches next to the executable and the
+  program's parent `lib/`, so a GUI launch resolves the standard library regardless of the
+  working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
+* `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
+  `examples/jit.ant`.
+
+### Documentation
+
+* **New usage manual: `docs/tools.md`** — build flags, every subcommand and option, all environment
+  variables, the plugin workflow (including the manual compile commands), how to reproduce the
+  benchmarks and a troubleshooting section.  Both READMEs link it and summarise the essentials.
+* `docs/syntax.md`: reserved words now list `lend` and `elif`; new §4.1.1 (value semantics) and
+  §4.1.2 (`lend`) replace the version that had been inserted in the middle of the typed-array
+  section; the `[[jit]]` note and §11 gained the automatic-JIT behaviour.
+* `docs/jit.md` was rewritten around automatic promotion (thresholds, OSR, measured numbers,
+  how to reproduce) and `docs/ffi.md` now leads with `annota plugin build` and shows commands that
+  actually link against the interpreter's import library.
+* `docs/stdlib.md`: the sorting/selection/lookup tables now say which entry points are native
+  (`seqnative`) and which are script reference implementations.
+* `docs/style.md` gained guidance on when to reach for native code and on value semantics;
+  `CONTRIBUTING.md` gained an "Adding native code (FFI, kernels and plugins)" section and an
+  updated documentation section; the PR template lists the native/plugin checklist items.
+* Both READMEs: command line and environment variables, the new guides, the real verification
+  steps (19 examples, 16 fixtures, plugin round-trip, highlighter check) and freshly measured
+  performance tables.
+
 * **References: `lend a = b`.**  Value semantics stay the default (assignment, arguments and
   returns deep copy), and `lend` is the explicit way to share: both names then read and write the
   same storage cell, closures capture that same cell, and the analyzer knows the two names are
@@ -60,6 +93,11 @@ major change, and a new check is a minor one.
 * `Text.pad_left` / `Text.pad_right` count terminal columns, so CJK tables line up
   (`Text.width` is the new helper); `examples/perf.ant` no longer prints a boolean as the
   interpreter version.
+* `lib/seq.mod` defined `upper_bound` twice (the native wrapper and the script reference version);
+  the script one is now `upper_bound_script`, matching `lower_bound_script` and the documented API.
+* The IDE's syntax highlighter ignored a closing `]-` that started a line, so everything after a
+  multi-line `-[ ... ]-` header was painted as a comment; `annota studio <file> --check-highlight`
+  now guards this in CI.
 
 ### Changed
 

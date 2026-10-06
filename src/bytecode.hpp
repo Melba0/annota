@@ -88,6 +88,8 @@ struct ParamInfo {
 
 struct Chunk {
     std::shared_ptr<JitCode> jit;       // non-null when the function was translated to machine code
+    uint32_t hotTicks = 0;              // backward jumps seen in the interpreter (hot-loop meter)
+    bool jitTried = false;              // do not retry a function the backend rejected
     std::string file;
     std::string fnName;
     std::vector<uint8_t> code;

@@ -316,6 +316,7 @@ int main(int argc, char** argv) {
         if (cmd == "analyze") return cmdAnalyze(argc - 1, argv + 1);
         if (cmd == "analyze-suite") return cmdAnalyzeSuite(argc - 1, argv + 1);
         if (cmd == "bench") return cmdBench(argc - 1, argv + 1);
+        if (cmd == "plugin") return cmdPlugin(argc - 1, argv + 1);
         if (cmd == "studio" || cmd == "ide-gui" || cmd == "gui-ide") return cmdStudio(argc - 1, argv + 1);
         if (cmd == "ide") return cmdIde(argc - 1, argv + 1);
         if (cmd == "lsp") return cmdLsp(argc - 1, argv + 1);

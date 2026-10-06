@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,8 @@ struct JitOut {
 struct JitCode {
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> readSlots;      // locals that must hold an int when the native code runs
+    // loop headers that can be entered directly (hot-loop promotion): bytecode ip -> entry
+    std::map<size_t, JitFn> osrEntries;
     JitFn fn = nullptr;
     void* mapping = nullptr;
     size_t mappingSize = 0;
@@ -645,6 +648,31 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
     if (std::getenv("ANNOTA_JIT_DEBUG"))
         std::fprintf(stderr, "[jit] compiled %s chunk=%p bytes=%zu\n", ch->fnName.c_str(),
                      (void*)ch.get(), e.c.size());
+    // Hot loops can be entered directly: for every backward jump target with an empty operand
+    // stack the interpreter may switch to this native code mid-function.  A trampoline runs the
+    // prologue (so the epilogue stays balanced) and jumps to the loop header.
+    std::vector<std::pair<size_t, size_t>> tramp;      // (target ip, patch position)
+    for (auto& kv : e.labelAt) {
+        size_t ip = kv.first;
+        if (ip >= code.size()) continue;
+        auto di = indexOf.find(ip);
+        if (di == indexOf.end()) continue;
+        bool isLoopHeader = false;
+        for (auto& x : ins) {
+            bool backward = (x.op == OP_LOOP || x.op == OP_JUMP) && x.target >= 0 &&
+                            (size_t)x.target < x.at;
+            if (backward && (size_t)x.target == ip) { isLoopHeader = true; break; }
+        }
+        if (!isLoopHeader) continue;
+        if (depth[di->second] != 0) continue;            // only enter with an empty operand stack
+        size_t off = e.c.size();
+        e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);   // sub rsp, frame
+        e.u8(0xE9);
+        int64_t rel = (int64_t)e.labelAt[ip] - (int64_t)(e.c.size() + 4);
+        e.u32((uint32_t)(int32_t)rel);                                       // jmp loop header
+        tramp.push_back({ip, off});
+    }
+
     auto jc = std::make_shared<JitCode>();
     jc->bytes = e.c;
     void* mem = jitAllocExec(jc->bytes.size());
@@ -653,6 +681,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
     jc->mapping = mem;
     jc->mappingSize = jc->bytes.size();
     jc->fn = reinterpret_cast<JitFn>(mem);
+    for (auto& t : tramp)
+        jc->osrEntries[t.first] = reinterpret_cast<JitFn>((uint8_t*)mem + t.second);
     for (size_t s = 0; s < readSlots.size(); s++)
         if (readSlots[s]) jc->readSlots.push_back((uint8_t)s);
     return jc;

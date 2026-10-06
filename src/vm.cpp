@@ -1,6 +1,7 @@
 // Annota - vm.cpp : the bytecode virtual machine.
 #include "vm.hpp"
 #include "jit.hpp"
+#include "ffi.hpp"
 #include "builtins.hpp"
 #include <algorithm>
 #include <cmath>
@@ -164,6 +165,9 @@ void VM::defineGlobal(const std::string& name, const Value& v) {
 }
 
 bool VM::getGlobal(const std::string& name, Value& out) {
+    // a module registered by a linked C++ file or by a plugin is installed on first use, so
+    // `use <plugin>` works no matter when the plugin was loaded
+    if (!globals.count(name) && ffiHasAny(name)) ffiInstallNamed(*this, name);
     auto it = globals.find(name);
     if (it == globals.end() || !it->second) return false;
     out = *it->second;
@@ -466,6 +470,25 @@ static inline Value copyIfShared(const Value& v) {
     return deepCopy(v);
 }
 
+// the native code works on plain int64s: this says whether the frame is ready for it
+static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
+    for (uint8_t s : jc->readSlots)
+        if (s >= fr.locals.size() || !fr.locals[s] || fr.locals[s]->t != VT::Int) return false;
+    return true;
+}
+
+// how many backward jumps a loop needs before the interpreter compiles it (0 disables)
+static uint32_t jitHotThreshold() {
+    static uint32_t t = [] {
+        if (const char* e = std::getenv("ANNOTA_JIT_THRESHOLD")) {
+            long v = std::strtol(e, nullptr, 10);
+            return v < 0 ? 0u : (uint32_t)v;
+        }
+        return 4000u;
+    }();
+    return t;
+}
+
 // Reading a local without copying it: a null cell behaves like null.
 static inline const Value& cellValue(const Cell& c) {
     static const Value kNull;
@@ -692,12 +715,7 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
             const std::shared_ptr<JitCode>& jc = callee.o->chunk->jit;
             if (jc) {
                 // the native code works on plain int64s: check the locals it reads first
-                bool ready = true;
-                for (uint8_t s : jc->readSlots) {
-                    if (s >= fr.locals.size() || !fr.locals[s] ||
-                        fr.locals[s]->t != VT::Int) { ready = false; break; }
-                }
-                if (ready) {
+                if (jitLocalsOk(jc, fr)) {
                     int64_t L[64];
                     size_t count = std::min<size_t>(fr.locals.size(), 64);
                     for (size_t i = 0; i < count; i++)
@@ -1169,6 +1187,14 @@ Value VM::execute(size_t stopDepth) {
                     }
                     case OP_JUMP: {
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
+                        // a `while` loop may compile to a backward jump instead of OP_LOOP
+                        if (j < 0 && !f.chunk->jit && !f.chunk->jitTried) {
+                            uint32_t threshold = jitHotThreshold();
+                            if (threshold > 0 && ++f.chunk->hotTicks >= threshold) {
+                                f.chunk->jitTried = true;
+                                f.chunk->jit = jitCompileX64(f.chunk);
+                            }
+                        }
                         f.ip += j;
                         break;
                     }
@@ -1190,6 +1216,52 @@ Value VM::execute(size_t stopDepth) {
                     }
                     case OP_LOOP: {
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
+                        // ---- automatic JIT: a loop that keeps running compiles itself, no
+                        // marker needed; the machine code can even take over from here.
+                        uint32_t threshold = jitHotThreshold();
+                        if (!f.chunk->jit && !f.chunk->jitTried && threshold > 0 &&
+                            ++f.chunk->hotTicks >= threshold) {
+                            f.chunk->jitTried = true;
+                            f.chunk->jit = jitCompileX64(f.chunk);
+                            if (std::getenv("ANNOTA_JIT_DEBUG"))
+                                std::fprintf(stderr, "[jit] 自动编译 %s%s\n",
+                                             f.chunk->fnName.c_str(),
+                                             f.chunk->jit ? "（机器码）" : "（不可翻译，继续解释）");
+                        }
+                        size_t back = f.ip + (size_t)(int64_t)j;
+                        if (f.chunk->jit) {
+                            auto entry = f.chunk->jit->osrEntries.find(back);
+                            if (entry != f.chunk->jit->osrEntries.end() && jitLocalsOk(f.chunk->jit, f) &&
+                                !(f.buildOnReturn && f.klass)) {
+                                int64_t L[64];
+                                size_t count = std::min<size_t>(f.locals.size(), 64);
+                                for (size_t k = 0; k < count; k++)
+                                    L[k] = (f.locals[k] && f.locals[k]->t == VT::Int)
+                                               ? f.locals[k]->i : 0;
+                                size_t base = f.stackBase;
+                                bool discard = f.discardResult;
+                                JitOut out;
+                                entry->second(L, &out);
+                                Value r = out.kind == 3 ? Value::null()
+                                        : out.kind == 2 ? Value::boolean(out.value != 0)
+                                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
+                                                        : Value::integer(out.value);
+                                Frame fr = std::move(frames.back());
+                                frames.pop_back();
+                                while (!tryFrames.empty() &&
+                                       tryFrames.back().frameIndex >= frames.size())
+                                    tryFrames.pop_back();
+                                stack.resize(base);
+                                recycleFrame(fr);
+                                if (discard) {
+                                    if (frames.size() == stopDepth) return Value::null();
+                                    break;
+                                }
+                                if (frames.size() == stopDepth) return r;
+                                push(r);
+                                break;
+                            }
+                        }
                         f.ip += j;
                         break;
                     }

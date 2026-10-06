@@ -502,7 +502,9 @@ std::string markdownDocs() {
     out += "                             checks, annotations, docs\n";
     out += "annota bench                 analysis performance benchmark\n";
     out += "annota lsp                   language server (stdio, JSON-RPC)\n";
-    out += "```\n";
+    out += "annota plugin build <src>    compile one C++ file into a plugin (--out, --name)\n";
+    out += "```\n\n";
+    out += "Full usage, options, environment variables and the plugin workflow: `docs/tools.md`.\n";
     return out;
 }
 } // namespace

@@ -100,4 +100,30 @@ print ""
 print "循环 40 万次 (解释器) ->", t1 - t0, "ms"
 print "循环 40 万次 ([[jit]]) ->", t2 - t1, "ms"
 
+Test.suite("自动 JIT（完全不写标注）")
+
+-- 这个函数没有任何标注：循环跑热了会自己编译成机器码并在循环头接管
+sum_auto(n)(
+    new s = 0
+    new i = 0
+    while i < n(
+        s = s + i
+        i = i + 1
+    )
+    =s
+)
+
+Test.eq(sum_auto(10), 45, "小输入结果正确")
+Test.eq(sum_auto(100000), 4999950000, "大输入结果正确")
+new t0 = _sys_clock()
+new auto_a = sum_auto(2000000)
+new t1 = _sys_clock()
+new auto_b = sum_auto(2000000)
+new t2 = _sys_clock()
+Test.eq(auto_a == auto_b, true, "两次结果一致")
+Test.eq(auto_a, 1999999000000, "自动 JIT 的结果正确")
+print ""
+print "自动 JIT 第一次 ->", t1 - t0, "ms"
+print "自动 JIT 第二次 ->", t2 - t1, "ms"
+
 Test.check()

@@ -7,6 +7,7 @@
 //   * output panel that runs the buffer with F5
 //   * hover panel, quick fixes, coverage, and the annotation / check reference dialogs
 #include "value.hpp"
+#include "module_loader.hpp"
 #include "commands.hpp"
 #include "common.hpp"
 
@@ -71,51 +72,6 @@ namespace annota {
 namespace {
 
 // ---------------------------------------------------------------- module loading
-struct IdeLoader : ModuleLoader {
-    std::string baseDir;
-    std::vector<std::string> dirs;
-    std::vector<std::string> loaded;
-    explicit IdeLoader(std::string dir) : baseDir(std::move(dir)) {
-        dirs = {baseDir, baseDir + "/lib", "lib", "."};
-    }
-    void remember(const std::string& file) {
-        std::string d = file;
-        size_t q = d.find_last_of("/\\");
-        if (q != std::string::npos) {
-            d = d.substr(0, q);
-            if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) dirs.push_back(d);
-        }
-    }
-    static bool exists(const std::string& p) {
-        std::ifstream in(p, std::ios::binary);
-        return (bool)in;
-    }
-    bool loadModule(const std::string& spec, std::vector<Token>& toks, std::string& file) override {
-        std::vector<std::string> cands;
-        bool pathLike = spec.find('/') != std::string::npos || spec.find('\\') != std::string::npos ||
-                        spec.find(".mod") != std::string::npos;
-        if (pathLike) {
-            cands.push_back(spec);
-            for (auto& d : dirs) cands.push_back(d + "/" + spec);
-        } else {
-            for (auto& d : dirs) cands.push_back(d + "/" + spec + ".mod");
-            cands.push_back(spec + ".mod");
-        }
-        for (auto& c : cands) {
-            if (!exists(c)) continue;
-            std::ifstream in(c, std::ios::binary);
-            std::stringstream ss;
-            ss << in.rdbuf();
-            file = c;
-            remember(c);
-            loaded.push_back(c);
-            toks = lex(ss.str(), c);
-            return true;
-        }
-        return false;
-    }
-};
-
 std::string dirOf(const std::string& path) {
     size_t q = path.find_last_of("/\\");
     return q == std::string::npos ? std::string(".") : path.substr(0, q);
@@ -137,7 +93,9 @@ RunOutcome runBuffer(const std::string& source, const std::string& path, bool co
     RunOutcome out;
     long long t0 = clock();
     try {
-        IdeLoader loader(dirOf(path));
+        // one loader for the CLI and the IDE: a GUI launch has a different working
+        // directory, and a second implementation is how `use test` broke there
+        FileModuleLoader loader(dirOf(path));
         std::vector<Token> toks = lex(source, path);
         MacroRegistry registry;
         Parser parser(std::move(toks), path, &loader, &registry);
@@ -373,16 +331,30 @@ protected:
                 setFormat(m.capturedStart(), m.capturedLength(), r.fmt);
             }
         }
-        // -[ ... ]- block comments can span lines
+        // -[ ... ]- block comments can span lines.  When the previous line left us inside a
+        // comment, the search for the closing marker must start at column 0: a line that *is*
+        // `]-` (how multi-line headers close) would otherwise be skipped, and everything after
+        // it would be painted as a comment forever.
         setCurrentBlockState(0);
-        int start = 0;
-        if (previousBlockState() != 1) start = text.indexOf(QStringLiteral("-["));
-        while (start >= 0) {
-            int end = text.indexOf(QStringLiteral("]-"), start + 2);
-            int len = end < 0 ? text.length() - start : end - start + 2;
-            setFormat(start, len, commentFmt_);
-            if (end < 0) { setCurrentBlockState(1); break; }
-            start = text.indexOf(QStringLiteral("-["), start + len);
+        bool inComment = previousBlockState() == 1;
+        int i = 0;
+        while (i < text.length()) {
+            if (inComment) {
+                int end = text.indexOf(QStringLiteral("]-"), i);
+                if (end < 0) {
+                    setFormat(i, text.length() - i, commentFmt_);
+                    setCurrentBlockState(1);
+                    return;
+                }
+                setFormat(i, end + 2 - i, commentFmt_);
+                i = end + 2;
+                inComment = false;
+            } else {
+                int start = text.indexOf(QStringLiteral("-["), i);
+                if (start < 0) break;
+                i = start;
+                inComment = true;
+            }
         }
     }
 
@@ -471,6 +443,8 @@ protected:
 public:
     // used by `annota studio <file> --run|--preview` (headless verification / screenshots)
     void runForTest(bool echo = false) { runCurrent(); if (echo) echoOutput(); }
+    // the check hook inspects the document the editor really shows
+    QTextDocument* documentForTest() { return editor_->document(); }
     void previewForTest(bool echo = false) { runCurrent(); if (echo) echoOutput(); previewView(); }
     void analyzeForTest() { analyzeNow(3); }
     // --echo prints what the output pane holds, so CI can inspect a headless run
@@ -1169,7 +1143,7 @@ private:
 };
 
 int runStudio(const std::string& file, const std::string& shot, const std::string& tab, bool autorun,
-              bool autopreview, bool echo) {
+              bool autopreview, bool echo, bool checkHighlight = false) {
     static int argc = 1;
     static char name[] = "annota-studio";
     static char* argv[] = {name, nullptr};
@@ -1177,7 +1151,25 @@ int runStudio(const std::string& file, const std::string& shot, const std::strin
     QApplication::setApplicationName(QStringLiteral("Annota Studio"));
     Studio win(QString::fromStdString(file), QString::fromStdString(tab));
     win.show();
+    if (checkHighlight) {
+        // CI hook: after layout, the document must not end inside a `-[ ]-` comment - that is
+        // the display bug where a missed `]-` paints the rest of the file as a comment
+        QTimer::singleShot(500, &win, [&win, file] {
+            QTextDocument* doc = win.documentForTest();
+            QTextBlock last = doc->lastBlock();
+            int bad = (last.isValid() && last.userState() == 1) ? last.blockNumber() + 1 : 0;
+            if (bad > 0)
+                std::fprintf(stderr, "annota studio: %s 从第 %d 行起被整段当成 -[ ]- 注释（高亮错误）\n",
+                             file.c_str(), bad);
+            else
+                std::printf("highlight: ok (%s, %d 行)\n", file.c_str(), doc->blockCount());
+            std::fflush(stdout);
+            QCoreApplication::exit(bad > 0 ? 1 : 0);
+        });
+    }
     if (autorun) QTimer::singleShot(80, &win, [&win, echo] { win.runForTest(echo); });
+    // `--echo` is the headless hook: with no screenshot to take, quit once the run has printed
+    if (echo && shot.empty()) QTimer::singleShot(600, [] { QCoreApplication::quit(); });
     if (autopreview) QTimer::singleShot(120, &win, [&win, echo] { win.previewForTest(echo); });
     if (!shot.empty()) {
         // headless verification: give the window a moment to lay out, save a PNG, then quit
@@ -1205,6 +1197,7 @@ int cmdStudio(int argc, char** argv) {
     bool autorun = false;
     bool autopreview = false;
     bool echo = false;
+    bool checkHighlight = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) { shot = argv[++i]; continue; }
@@ -1212,9 +1205,10 @@ int cmdStudio(int argc, char** argv) {
         if (a == "--run") { autorun = true; continue; }
         if (a == "--preview") { autopreview = true; continue; }
         if (a == "--echo") { echo = true; continue; }
+        if (a == "--check-highlight") { checkHighlight = true; continue; }
         if (!a.empty() && a[0] != '-') file = a;
     }
-    return runStudio(file, shot, tab, autorun, autopreview, echo);
+    return runStudio(file, shot, tab, autorun, autopreview, echo, checkHighlight);
 }
 
 } // namespace annota

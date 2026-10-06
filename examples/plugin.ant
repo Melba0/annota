@@ -1,0 +1,18 @@
+-[ plugin.ant : 热插拔原生模块（`use` 直接加载插件，不重编译解释器）
+
+   先构建：annota plugin build plugins/hello.cpp
+   再运行：annota run examples/plugin.ant
+]-
+use test
+use hello
+
+Test.suite("插件模块（动态加载）")
+
+Test.eq(hello.version, "1.0", "插件模块常量")
+Test.eq(hello.greet("annota"), "hello, annota!", "原生函数调用")
+Test.eq(hello.greet(), "hello, world!", "默认参数")
+Test.eq(hello.sum_squares(10), 385, "原生内核结果")
+Test.eq(hello.shout_all(["a", "bc"]), ["A", "BC"], "原生处理列表")
+Test.eq(hello.origin != "", true, "插件自报来源")
+
+Test.check()
