@@ -29,6 +29,9 @@ struct Param {
     std::string type;
     ExprP def;          // optional default
     bool vararg = false;
+    // `lend xs`: the callee borrows the caller's container instead of receiving a copy.  The body
+    // must only read it (the compiler enforces that), so the caller's value cannot change.
+    bool borrow = false;
     std::vector<ExprP> typeDims;   // `T[n][m]`, `[]` -> null entry
 };
 

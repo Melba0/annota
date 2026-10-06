@@ -129,7 +129,19 @@ private:
     bool stmtUnsafe_ = false;      // the statement being compiled carries [[unsafe]]
     Value makeDefault(const std::string& type);
     void emitNewArray(const StmtP& s);
-    void optimizeChunk(const std::shared_ptr<Chunk>& ch);   // [[jit]]: fold + fuse this function
+    // Fold + fuse one function.  `allowCompareBranch` enables the compare-and-branch fusions,
+    // which are only used where they always have been (the `[[jit]]` chunks); the other fusions
+    // are semantics preserving in any function.
+    void optimizeChunk(const std::shared_ptr<Chunk>& ch, bool allowCompareBranch);
+    // `lend` parameters borrow the caller's container; their body must only read it
+    void checkLendParams();
+    // names that OP_CALL_DIRECT may address: top-level functions and `[[static]]` class methods
+    // that are never reassigned anywhere in the program
+    void scanDirectCallable();
+    bool directCallable(const std::string& key) const;
+    std::set<std::string> directFuncs_;
+    std::map<std::string, std::set<std::string>> directStatic_;
+    std::set<std::string> directBlocked_;
     void noteLocalShape(const std::string& name, const std::string& type,
                         const std::vector<ExprP>& dims);
     bool hasAnn(const std::vector<Annotation>& anns, const char* name) const;

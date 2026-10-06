@@ -1,4 +1,4 @@
-// Annota - main.cpp : command line driver.
+﻿// Annota - main.cpp : command line driver.
 //
 //   annota run   <file.ant>        execute a program            (default)
 //   annota check <file.ant>        parse + compile + report annotations
@@ -148,6 +148,11 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
                         formatInt((int64_t)i + j);
                 break;
             }
+            case OP_CONVERT: {
+                uint8_t kk = u8();
+                extra = "kind " + formatInt(kk);
+                break;
+            }
             case OP_INDEX_ADD_IMM: {
                 uint8_t a = u8();
                 uint8_t b = u8();
@@ -155,12 +160,17 @@ static void disassemble(const std::shared_ptr<Chunk>& ch, int depth) {
                 extra = "slot " + formatInt(a) + "[" + formatInt(b) + "] += " + formatInt(v);
                 break;
             }
+            case OP_CALL_DIRECT: {
+                uint16_t nameIdx = u16();
+                uint8_t argc = u8();
+                extra = "name #" + formatInt(nameIdx) + ", " + formatInt(argc) + " arg(s)";
+                break;
+            }
             case OP_LOCAL_ADD_LOCAL: {
                 uint8_t a = u8();
                 uint8_t b = u8();
                 extra = "slot " + formatInt(a) + " += slot " + formatInt(b);
-                break;
-            }
+                break;            }
             case OP_ASSERT: { uint16_t k = u16(); extra = "\"" + constAt(k).o->str + "\""; break; }
             default: break;
         }

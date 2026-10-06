@@ -1,4 +1,4 @@
-// Annota - ide_cmd.cpp : `analyze`, `analyze-suite` and the `ide` query commands.
+﻿// Annota - ide_cmd.cpp : `analyze`, `analyze-suite` and the `ide` query commands.
 #include "commands.hpp"
 #include "vm.hpp"
 #include "parser.hpp"
@@ -341,9 +341,9 @@ int cmdBench(int argc, char** argv) {
         {"list loop     ", 200000,
          "new xs = []\nnew i = 0\nwhile i < 100(\n    xs.push(i)\n    i = i + 1\n)\nnew n = 2000\nnew t = 0\nnew k = 0\nwhile k < n(\n    for x in xs( t = t + x )\n    k = k + 1\n)\nprint t\n"},
         {"jit off loop  ", 1000000,
-         "sum_to(n)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
+         "sum_to(n:int64)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
         {"jit on loop   ", 1000000,
-         "[[jit]]\nsum_to(n)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
+         "[[jit]]\nsum_to(n:int64)(\n    new s = 0\n    new i = 0\n    while i < n(\n        s = s + i\n        i = i + 1\n    )\n    =s\n)\nprint sum_to(1000000)\n"},
         {"float loop    ", 500000,
          "new n = 500000\nnew f = 0.5\nnew i = 0\nwhile i < n( f = f * 1.000001 + 0.25, i = i + 1 )\nprint f\n"},
     };

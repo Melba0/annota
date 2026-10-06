@@ -1,10 +1,19 @@
 // Annota - bytecode.hpp : opcodes and code chunks.
 #pragma once
 #include "value.hpp"
+#include <functional>
 
 namespace annota {
 
 struct JitCode;                    // src/jit.hpp (the [[jit]] machine code backend)
+
+// A `OP_CALL_DIRECT` target resolved for the JIT: the callee's machine code plus its chunk (for
+// the parameter list).  An empty target means the call has to stay interpreted.
+struct JitCallTarget {
+    std::shared_ptr<JitCode> code;
+    const Chunk* chunk = nullptr;
+};
+using JitResolver = std::function<JitCallTarget(const std::string&)>;
 
 enum Op : uint8_t {
     OP_NOP = 0,
@@ -25,6 +34,7 @@ enum Op : uint8_t {
     OP_GET_FIELD,         // u16 name const
     OP_SET_FIELD,         // u16 name const   (deep copy)
     OP_GET_INDEX, OP_SET_INDEX,
+    OP_GET_INDEX2, OP_SET_INDEX2,   // `a[i][j]`: one dispatch, no intermediate row view
     OP_GET_SUPER,         // u16 name const, u16 owner-class const
     OP_SUPER_INIT,        // u16 owner-class const
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
@@ -37,6 +47,7 @@ enum Op : uint8_t {
     OP_JUMP_IF_TRUE_KEEP, // s16 (keeps the value, used by ||)
     OP_LOOP,              // s16 backwards
     OP_CALL,
+    OP_CALL_DIRECT,       // u16 name const, u8 argc: statically known callee, no argument list
     OP_CALL_UI,
     OP_RETURN,
     OP_RETURN_NULL,
@@ -82,14 +93,17 @@ struct UpvalDesc { uint8_t fromLocal; uint8_t index; };
 
 struct ParamInfo {
     std::string name;
+    std::string type;           // declared type; `[[jit]]` requires an integer one
     bool hasDefault = false;
     bool vararg = false;
+    bool borrow = false;        // declared `lend`: bound without copying
 };
 
 struct Chunk {
     std::shared_ptr<JitCode> jit;       // non-null when the function was translated to machine code
     uint32_t hotTicks = 0;              // backward jumps seen in the interpreter (hot-loop meter)
     bool jitTried = false;              // do not retry a function the backend rejected
+    bool jitBusy = false;               // set while the backend compiles it (breaks resolver cycles)
     std::string file;
     std::string fnName;
     std::vector<uint8_t> code;
@@ -101,6 +115,11 @@ struct Chunk {
     int fixedCount = 0;          // named parameters (variadic not included)
     int varargSlot = -1;
     bool isMethod = false;       // locals[0] is `this`
+    // Bit i set = parameter i was declared `lend` and is bound without a deep copy.
+    uint32_t paramBorrow = 0;
+    // resolved callees for OP_CALL_DIRECT, indexed by the name constant (filled on first use)
+    std::vector<Value> directCache;
+    std::vector<Cell> directSelf;       // `this` for a class qualified direct call
     std::vector<Value> protos;   // nested function prototypes
 };
 

@@ -1,4 +1,4 @@
--[ jit.ant : [[jit]] 标记 —— 超指令 + 机器码后端
+﻿-[ jit.ant : [[jit]] 标记 —— 超指令 + 机器码后端
 
    `[[jit]]` 只表示“这段请提前优化”。解释器在加载时先做超指令融合（比较+分支、
    x 自增、a[i] += k 等），如果整个函数都落在整数子集里，再把它翻译成 x86-64 机器码；
@@ -13,7 +13,7 @@ use test
 Test.suite("jit: 机器码后端")
 
 [[jit]]
-sum_jit(n)(
+sum_jit(n:int64)(
     new s = 0
     new i = 0
     while i < n(
@@ -33,8 +33,20 @@ sum_plain(n)(
     =s
 )
 
+-- 带类型提示的同款函数：给参数标注类型后，传浮点会按声明类型转换，
+-- 所以"浮点参数回退解释器"要和它比较（而不是和未标注的 sum_plain 比）
+sum_int_plain(n:int64)(
+    new s = 0
+    new i = 0
+    while i < n(
+        s = s + i
+        i = i + 1
+    )
+    =s
+)
+
 [[jit]]
-count_jit(n)(
+count_jit(n:int64)(
     new i = 0
     while i < n(
         i = i + 1
@@ -43,7 +55,7 @@ count_jit(n)(
 )
 
 [[jit]]
-sum_even_jit(n)(
+sum_even_jit(n:int64)(
     new s = 0
     for i in 0 to n - 1(
         if i % 2 == 0(
@@ -65,7 +77,7 @@ sum_even_plain(n)(
 
 -- 递归函数不是整数直线子集（有自调用），[[jit]] 会安静地回退解释器
 [[jit]]
-fact_jit(n)(
+fact_jit(n:int64)(
     if n <= 1( =1 )
     =n * fact_jit(n - 1)
 )
@@ -85,8 +97,8 @@ Test.eq(sum_even_jit(100), 2450, "带 if 的循环")
 Test.eq(fact_jit(10), 3628800, "递归自动回退解释器")
 
 -- 2. 参数类型不满足整数子集时不崩溃、语义不变
-Test.eq(sum_jit(1.5), sum_plain(1.5), "浮点参数回退解释器")
-Test.eq(sum_jit(10.75), sum_plain(10.75), "浮点参数结果一致")
+Test.eq(sum_jit(1.5), sum_int_plain(1.5), "浮点参数回退解释器")
+Test.eq(sum_jit(10.75), sum_int_plain(10.75), "浮点参数结果一致")
 
 -- 3. 性能：同一份循环，标记前后
 new n = 400000

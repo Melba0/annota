@@ -1,4 +1,4 @@
-// Annota - vm.cpp : the bytecode virtual machine.
+﻿// Annota - vm.cpp : the bytecode virtual machine.
 #include "vm.hpp"
 #include "jit.hpp"
 #include "ffi.hpp"
@@ -381,6 +381,61 @@ void VM::setIndex(Value& obj, const Value& idx, const Value& v) {
     }
 }
 
+// `a[i][j]` in one dispatch.  Semantically identical to getIndex(getIndex(a, i), j) - the same
+// bounds checks, the same error text, the same value sharing - but for arrays it computes the
+// element directly from the strides instead of building the intermediate row view (arrayView
+// copies the whole Obj, which dominated two-dimensional access).
+Value VM::getIndex2(const Value& obj, const Value& i0, const Value& j0) {
+    if (obj.t != VT::Array || obj.o->dims.size() < 2)
+        return getIndex(getIndex(obj, i0), j0);
+
+    int64_t i = i0.t == VT::Int ? i0.i : (int64_t)i0.asFloat();
+    int64_t n = obj.o->dims[0];
+    if (i < 0 || i >= n)
+        throwError("array index " + formatInt(i) + " out of range [0, " + formatInt(n) + ")");
+    int64_t stride0 = obj.o->strides.empty() ? 1 : obj.o->strides[0];
+    int64_t at = obj.o->offset + i * stride0;
+
+    // the row view would expose dims[1] as its own dims[0], so the second check is the same text
+    int64_t j = j0.t == VT::Int ? j0.i : (int64_t)j0.asFloat();
+    int64_t n1 = obj.o->dims[1];
+    if (j < 0 || j >= n1)
+        throwError("array index " + formatInt(j) + " out of range [0, " + formatInt(n1) + ")");
+    int64_t stride1 = obj.o->strides.size() > 1 ? obj.o->strides[1] : 1;
+    int64_t at2 = at + j * stride1;
+
+    if (obj.o->dims.size() == 2) {
+        if (at2 < 0 || !obj.o->buf || at2 >= (int64_t)obj.o->buf->size()) return obj.defaultElement();
+        return (*obj.o->buf)[(size_t)at2];
+    }
+    return obj.arrayView(at2, 2);           // three or more dimensions: hand back the sub-view
+}
+
+void VM::setIndex2(Value& obj, const Value& i0, const Value& j0, const Value& v) {
+    if (obj.t != VT::Array || obj.o->dims.size() < 2) {
+        Value row = getIndex(obj, i0);
+        setIndex(row, j0, v);
+        return;
+    }
+
+    int64_t i = i0.t == VT::Int ? i0.i : (int64_t)i0.asFloat();
+    int64_t n = obj.o->dims[0];
+    if (i < 0 || i >= n)
+        throwError("array index " + formatInt(i) + " out of range [0, " + formatInt(n) + ")");
+    int64_t stride0 = obj.o->strides.empty() ? 1 : obj.o->strides[0];
+    int64_t at = obj.o->offset + i * stride0;
+
+    int64_t j = j0.t == VT::Int ? j0.i : (int64_t)j0.asFloat();
+    int64_t n1 = obj.o->dims[1];
+    if (j < 0 || j >= n1)
+        throwError("array index " + formatInt(j) + " out of range [0, " + formatInt(n1) + ")");
+    int64_t stride1 = obj.o->strides.size() > 1 ? obj.o->strides[1] : 1;
+    int64_t at2 = at + j * stride1;
+
+    if (!obj.o->buf) obj.o->buf = std::make_shared<std::vector<Value>>();
+    if (at2 >= 0 && at2 < (int64_t)obj.o->buf->size()) (*obj.o->buf)[(size_t)at2] = deepCopy(v);
+}
+
 // ---------------------------------------------------------------- iterators
 Value VM::makeIter(const Value& v) {
     if (v.t == VT::Array) {
@@ -472,8 +527,25 @@ static inline Value copyIfShared(const Value& v) {
 
 // the native code works on plain int64s: this says whether the frame is ready for it
 static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
-    for (uint8_t s : jc->readSlots)
+    for (uint8_t s : jc->readSlots) {
         if (s >= fr.locals.size() || !fr.locals[s] || fr.locals[s]->t != VT::Int) return false;
+        // The native code works on raw int64s and wraps each operation to the width the parameter
+        // was *declared* with (see JitCode::slotKind), so the value must have exactly that kind -
+        // anything else (a float, an untyped literal for a narrow parameter, a wider type) keeps
+        // being interpreted, where the interpreter's own per-kind rules apply.
+        if (s < jc->slotKind.size() && jc->slotKind[s] != 0) {
+            NumKind want = (NumKind)(jc->slotKind[s] - 1);
+            NumKind got = fr.locals[s]->k;
+            if (got == want) continue;
+            // `long`/`int64` does not wrap, so an untyped integer behaves identically there;
+            // narrow declarations keep requiring their exact kind
+            if (want == NumKind::I64 && got == NumKind::None) continue;
+            return false;
+        } else {
+            NumKind k = fr.locals[s]->k;
+            if (k != NumKind::None && k != NumKind::I64) return false;
+        }
+    }
     return true;
 }
 
@@ -535,7 +607,12 @@ static bool bindNeedsCopy(const Value& v) {
     }
 }
 
-static void bindArg(Cell& c, const Value& v) {
+static void bindArg(Cell& c, const Value& v, bool borrow) {
+    if (borrow) {                       // the compiler proved this parameter is read-only
+        if (!c) c = std::make_shared<Value>(v);
+        else *c = v;
+        return;
+    }
     if (!c) {
         c = std::make_shared<Value>(bindNeedsCopy(v) ? deepCopy(v) : v);
         return;
@@ -545,6 +622,15 @@ static void bindArg(Cell& c, const Value& v) {
 }
 
 void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, const Value& named) {
+    static const std::vector<Value> kNoArgs;
+    const std::vector<Value>& pa = pos.o ? pos.o->items : kNoArgs;
+    bindArgsSpan(f, ch, pa.empty() ? nullptr : pa.data(), pa.size(), named);
+}
+
+// Binds `n` positional arguments (which may live on the operand stack - OP_CALL_DIRECT passes a
+// pointer into it) plus any named arguments.  `lend` parameters are bound without a copy.
+void VM::bindArgsSpan(Frame& f, const std::shared_ptr<Chunk>& ch, const Value* pa, size_t n,
+                      const Value& named) {
     size_t base = ch->isMethod ? 1 : 0;
     size_t nparams = ch->params.size();
     size_t nfixed = 0;
@@ -553,27 +639,27 @@ void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, 
         if (ch->params[i].vararg) varargIdx = (int)i;
         else nfixed++;
     }
-    static const std::vector<Value> kNoArgs;
-    const std::vector<Value>& pa = pos.o ? pos.o->items : kNoArgs;
     if (nparams > 64) throwError("too many parameters in '" + ch->fnName + "' (at most 64)");
     f.providedMask = 0;
-    f.argc = (int)pa.size();
+    f.argc = (int)n;
     size_t pi = 0;
     for (size_t i = 0; i < nparams; i++) {
         if ((int)i == varargIdx) continue;
-        if (pi < pa.size()) {
-            bindArg(f.locals[base + i], pa[pi++]);
+        if (pi < n) {
+            // `lend` parameters borrow the caller's container (the compiler proved they are only
+            // read); everything else keeps the value semantics and is deep copied
+            bindArg(f.locals[base + i], pa[pi++], (ch->paramBorrow & (1u << i)) != 0);
             f.providedMask |= (1ull << i);
         }
     }
     if (varargIdx >= 0) {
         std::vector<Value> rest;
-        while (pi < pa.size()) rest.push_back(pa[pi++]);
+        while (pi < n) rest.push_back(pa[pi++]);
         *f.locals[base + (size_t)varargIdx] = Value::list(rest);
         f.providedMask |= (1ull << (size_t)varargIdx);
-    } else if (pi < pa.size()) {
+    } else if (pi < n) {
         throwError("too many arguments: '" + ch->fnName + "' expects " + formatInt((int64_t)nfixed) +
-                   " but got " + formatInt((int64_t)pa.size()));
+                   " but got " + formatInt((int64_t)n));
     }
     if (named.o && !named.o->map.empty()) {
         for (auto& kv : named.o->map) {
@@ -582,7 +668,7 @@ void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, 
             if (idx < 0) throwError("unexpected named argument '" + kv.first + "' for '" + ch->fnName + "'");
             if (f.providedMask & (1ull << (size_t)idx))
                 throwError("argument '" + kv.first + "' given twice");
-            bindArg(f.locals[base + (size_t)idx], kv.second);
+            bindArg(f.locals[base + (size_t)idx], kv.second, false);   // named: always copy
             f.providedMask |= (1ull << (size_t)idx);
         }
     }
@@ -590,6 +676,118 @@ void VM::bindArgs(Frame& f, const std::shared_ptr<Chunk>& ch, const Value& pos, 
         if (!(f.providedMask & (1ull << i)) && !ch->params[i].hasDefault && (int)i != varargIdx)
             throwError("missing argument '" + ch->params[i].name + "' for '" + ch->fnName + "'");
     }
+}
+
+// ---------------------------------------------------------------- direct calls
+// `OP_CALL_DIRECT` names a function (or a `[[static]]` class method) that the compiler resolved
+// statically, so there is no callee value and no argument list on the heap: the arguments are
+// already on the operand stack.  The name is resolved lazily and cached; a name that no longer
+// holds a function falls back to the generic path, which keeps monkey patching correct.
+Value VM::directCallee(Chunk& ch, uint16_t nameIdx, Cell& selfOut) {
+    selfOut = nullptr;
+    if (nameIdx < ch.directCache.size() && ch.directCache[nameIdx].t == VT::Function) {
+        if (nameIdx < ch.directSelf.size()) selfOut = ch.directSelf[nameIdx];
+        return ch.directCache[nameIdx];
+    }
+    if (nameIdx >= ch.consts.size() || ch.consts[nameIdx].t != VT::Str) return Value::null();
+    const std::string& nm = ch.consts[nameIdx].o->str;
+    Value found = Value::null();
+    size_t dot = nm.find('.');
+    if (dot == std::string::npos) {
+        auto it = globals.find(nm);
+        if (it != globals.end() && it->second) found = *it->second;
+    } else {
+        auto it = globals.find(nm.substr(0, dot));
+        if (it != globals.end() && it->second && it->second->t == VT::Class &&
+            it->second->o->klass) {
+            MethodInfo* mi = it->second->o->klass->findMethod(nm.substr(dot + 1));
+            if (mi) {
+                found = mi->fn;
+                // a class qualified call still runs with the class as `this`: the method body
+                // resolves its own bare calls and fields through it
+                selfOut = std::make_shared<Value>(*it->second);
+            }
+        }
+    }
+    if (found.t == VT::Function) {
+        if (ch.directCache.size() < ch.consts.size()) {
+            ch.directCache.resize(ch.consts.size());
+            ch.directSelf.resize(ch.consts.size());
+        }
+        ch.directCache[nameIdx] = found;
+        ch.directSelf[nameIdx] = selfOut;
+    }
+    return found;
+}
+
+// Runs the callee's machine code when it has some and the locals it reads are plain ints; the
+// result is pushed and the frame is recycled.  Returns false when the interpreter must run it.
+bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
+    if (fn.t != VT::Function || !fn.o->chunk) return false;
+    const std::shared_ptr<JitCode>& jc = fn.o->chunk->jit;
+    if (!jc) return false;
+    if (!jitLocalsOk(jc, fr)) return false;
+    int64_t L[64];
+    size_t count = std::min<size_t>(fr.locals.size(), 64);
+    for (size_t i = 0; i < count; i++)
+        L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
+    JitOut out;
+    jc->fn(L, &out);
+    Value r = out.kind == 3 ? Value::null()
+            : out.kind == 2 ? Value::boolean(out.value != 0)
+            : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
+                            : Value::integer(out.value);
+    stack.resize(fr.stackBase);
+    recycleFrame(fr);
+    frames.pop_back();
+    while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
+        tryFrames.pop_back();
+    push(r);
+    return true;
+}
+
+void VM::invokeFunction(const Value& fn, const Value* args, size_t n, const Value& named,
+                        const Cell& selfCell) {
+    pushFrame(fn, selfCell);
+    Frame& fr = frames.back();
+    fr.stackBase = stack.size() - n;      // this call consumes the arguments on the operand stack
+    bindArgsSpan(fr, fn.o->chunk, args, n, named);
+    if (runNativeIfReady(fn, fr)) return;
+    stack.resize(fr.stackBase);           // the callee reads its parameters from the frame
+}
+
+// Resolves a statically named callee for the JIT: the function must exist, be callable without a
+// `this` binding, and have machine code - compiled on demand the first time.
+JitResolver VM::jitResolver() {
+    auto resolve = std::make_shared<std::function<JitCallTarget(const std::string&)>>();
+    *resolve = [this, resolve](const std::string& nm) -> JitCallTarget {
+        JitCallTarget t;
+        Value found = Value::null();
+        size_t dot = nm.find('.');
+        if (dot == std::string::npos) {
+            auto it = globals.find(nm);
+            if (it != globals.end() && it->second) found = *it->second;
+        } else {
+            auto it = globals.find(nm.substr(0, dot));
+            if (it != globals.end() && it->second && it->second->t == VT::Class &&
+                it->second->o->klass) {
+                MethodInfo* mi = it->second->o->klass->findMethod(nm.substr(dot + 1));
+                if (mi) found = mi->fn;
+            }
+        }
+        if (found.t != VT::Function || !found.o->chunk) return t;
+        const std::shared_ptr<Chunk>& callee = found.o->chunk;
+        if (callee->isMethod) return t;                  // a method needs a `this` binding
+        if (!callee->jit && !callee->jitTried && !callee->jitBusy) {
+            callee->jitTried = true;
+            callee->jit = jitCompileX64(callee, *resolve);
+        }
+        if (!callee->jit) return t;
+        t.code = callee->jit;
+        t.chunk = callee.get();
+        return t;
+    };
+    return *resolve;
 }
 
 // A view/component instance carries window level attributes (`title`, `width`, `height`) as
@@ -712,29 +910,7 @@ Value VM::callFunction(const Value& callee, const Value& pos, const Value& named
             pushFrame(callee, thisCell);
             Frame& fr = frames.back();
             bindArgs(fr, callee.o->chunk, pos, named);
-            const std::shared_ptr<JitCode>& jc = callee.o->chunk->jit;
-            if (jc) {
-                // the native code works on plain int64s: check the locals it reads first
-                if (jitLocalsOk(jc, fr)) {
-                    int64_t L[64];
-                    size_t count = std::min<size_t>(fr.locals.size(), 64);
-                    for (size_t i = 0; i < count; i++)
-                        L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
-                    JitOut out;
-                    jc->fn(L, &out);
-                    Value r = out.kind == 3 ? Value::null()
-                            : out.kind == 2 ? Value::boolean(out.value != 0)
-                            : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
-                                            : Value::integer(out.value);
-                    stack.resize(fr.stackBase);
-                    recycleFrame(fr);
-                    frames.pop_back();
-                    while (!tryFrames.empty() && tryFrames.back().frameIndex >= frames.size())
-                        tryFrames.pop_back();
-                    push(r);
-                    return r;
-                }
-            }
+            runNativeIfReady(callee, fr);
             return Value::null();
         }
         case VT::Bound: {
@@ -1028,14 +1204,17 @@ Value VM::execute(size_t stopDepth) {
                         uint8_t b = code[f.ip++];
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]);
                         f.ip += 2;
+                        // the ip after this instruction: a user __lt__ may push a frame, so the
+                        // jump has to be patched through frames.back() with an absolute target
+                        // (frames.back().ip still points at the start of this instruction)
+                        const size_t nextIp = f.ip;
                         const Value& x = cellValue(f.locals[a]);
                         const Value& y = cellValue(f.locals[b]);
                         if (x.t == VT::Int && y.t == VT::Int) {
                             if (!(x.i < y.i)) f.ip += j;
                         } else {
-                            // a user __lt__ may run here, so re-read the frame before patching ip
                             bool ok = truthy(binaryResult(OP_LT, x, y, "<"));
-                            if (!ok) frames.back().ip += j;
+                            if (!ok) frames.back().ip = (int64_t)nextIp + j;
                         }
                         break;
                     }
@@ -1044,12 +1223,13 @@ Value VM::execute(size_t stopDepth) {
                         int8_t imm = (int8_t)code[f.ip++];
                         int16_t j = (int16_t)((code[f.ip] << 8) | code[f.ip + 1]);
                         f.ip += 2;
+                        const size_t nextIp = f.ip;
                         const Value& x = cellValue(f.locals[a]);
                         if (x.t == VT::Int) {
                             if (!(x.i < (int64_t)imm)) f.ip += j;
                         } else {
                             bool ok = truthy(binaryResult(OP_LT, x, Value::integer(imm), "<"));
-                            if (!ok) frames.back().ip += j;
+                            if (!ok) frames.back().ip = (int64_t)nextIp + j;
                         }
                         break;
                     }
@@ -1061,7 +1241,7 @@ Value VM::execute(size_t stopDepth) {
                         Value index = cellValue(f.locals[idx]);
                         Value cur = getIndex(container, index);
                         Value nv = cur.t == VT::Int
-                                       ? Value::integer(cur.i + imm)
+                                       ? Value::typedInt(cur.i + imm, cur.k)
                                        : binaryResult(OP_ADD, cur, Value::integer(imm), "+");
                         setIndex(container, index, nv);
                         break;
@@ -1119,6 +1299,21 @@ Value VM::execute(size_t stopDepth) {
                         Value idx = pop();
                         Value obj = pop();
                         push(getIndex(obj, idx));
+                        break;
+                    }
+                    case OP_GET_INDEX2: {
+                        Value j = pop();
+                        Value i = pop();
+                        Value obj = pop();
+                        push(getIndex2(obj, i, j));
+                        break;
+                    }
+                    case OP_SET_INDEX2: {
+                        Value v = pop();
+                        Value j = pop();
+                        Value i = pop();
+                        Value obj = pop();
+                        setIndex2(obj, i, j, v);
                         break;
                     }
                     case OP_SET_INDEX: {
@@ -1192,7 +1387,7 @@ Value VM::execute(size_t stopDepth) {
                             uint32_t threshold = jitHotThreshold();
                             if (threshold > 0 && ++f.chunk->hotTicks >= threshold) {
                                 f.chunk->jitTried = true;
-                                f.chunk->jit = jitCompileX64(f.chunk);
+                                f.chunk->jit = jitCompileX64(f.chunk, jitResolver());
                             }
                         }
                         f.ip += j;
@@ -1222,7 +1417,7 @@ Value VM::execute(size_t stopDepth) {
                         if (!f.chunk->jit && !f.chunk->jitTried && threshold > 0 &&
                             ++f.chunk->hotTicks >= threshold) {
                             f.chunk->jitTried = true;
-                            f.chunk->jit = jitCompileX64(f.chunk);
+                            f.chunk->jit = jitCompileX64(f.chunk, jitResolver());
                             if (std::getenv("ANNOTA_JIT_DEBUG"))
                                 std::fprintf(stderr, "[jit] 自动编译 %s%s\n",
                                              f.chunk->fnName.c_str(),
@@ -1458,6 +1653,26 @@ Value VM::execute(size_t stopDepth) {
                         Value pos = pop();
                         Value callee = pop();
                         callFunction(callee, pos, named, nullptr, Value::null(), false);
+                        continue;
+                    }
+                    case OP_CALL_DIRECT: {
+                        uint16_t nameIdx = (uint16_t)((code[f.ip] << 8) | code[f.ip + 1]);
+                        f.ip += 2;
+                        uint8_t argc = code[f.ip++];
+                        Cell self;
+                        Value callee = directCallee(*f.chunk, nameIdx, self);
+                        size_t n = (size_t)argc;
+                        if (callee.t == VT::Function && n <= stack.size()) {
+                            invokeFunction(callee, stack.data() + (stack.size() - n), n,
+                                           emptyNamedArgs(), self);
+                            continue;
+                        }
+                        // the name is not a function any more: keep the generic call semantics
+                        if (n > stack.size()) n = stack.size();
+                        std::vector<Value> args(stack.end() - (std::ptrdiff_t)n, stack.end());
+                        stack.resize(stack.size() - n);
+                        callFunction(callee, Value::list(std::move(args)), emptyNamedArgs(), nullptr,
+                                     Value::null(), false);
                         continue;
                     }
                     case OP_CALL_UI: {
@@ -1959,6 +2174,8 @@ const char* opName(uint8_t op) {
         case OP_SET_FIELD: return "set_field";
         case OP_GET_INDEX: return "get_index";
         case OP_SET_INDEX: return "set_index";
+        case OP_GET_INDEX2: return "get_index2";
+        case OP_SET_INDEX2: return "set_index2";
         case OP_GET_SUPER: return "get_super";
         case OP_SUPER_INIT: return "super_init";
         case OP_JUMP: return "jump";
@@ -1967,6 +2184,7 @@ const char* opName(uint8_t op) {
         case OP_JUMP_IF_TRUE_KEEP: return "jump_if_true_keep";
         case OP_LOOP: return "loop";
         case OP_CALL: return "call";
+        case OP_CALL_DIRECT: return "call_direct";
         case OP_CALL_UI: return "call_ui";
         case OP_RETURN: return "return";
         case OP_RETURN_NULL: return "return_null";

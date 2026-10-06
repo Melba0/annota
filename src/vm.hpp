@@ -90,6 +90,18 @@ public:
     void setField(Value& obj, const std::string& name, const Value& v, int line);
     Value getIndex(const Value& obj, const Value& idx);
     void setIndex(Value& obj, const Value& idx, const Value& v);
+    // `a[i][j]` fused: same semantics, no intermediate row view for arrays
+    Value getIndex2(const Value& obj, const Value& i, const Value& j);
+    void setIndex2(Value& obj, const Value& i, const Value& j, const Value& v);
+    // OP_CALL_DIRECT: bind arguments that live on the operand stack, then run the callee
+    Value directCallee(Chunk& ch, uint16_t nameIdx, Cell& selfOut);
+    void invokeFunction(const Value& fn, const Value* args, size_t n, const Value& named,
+                        const Cell& selfCell);
+    // resolves (and if needed compiles) a callee so the JIT can emit a native call
+    JitResolver jitResolver();
+    bool runNativeIfReady(const Value& fn, Frame& fr);
+    void bindArgsSpan(Frame& f, const std::shared_ptr<Chunk>& ch, const Value* args, size_t n,
+                      const Value& named);
     bool findMethod(const Value& obj, const std::string& name, Value& out);
     bool callMagic(const Value& obj, const char* name, std::vector<Value> args, Value& out);
     Value makeIter(const Value& v);

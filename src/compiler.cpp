@@ -1,4 +1,4 @@
-// Annota - compiler.cpp : AST -> bytecode.
+﻿// Annota - compiler.cpp : AST -> bytecode.
 #include <cstdio>
 #include <cstdlib>
 #include "compiler.hpp"
@@ -12,8 +12,7 @@ Compiler::Compiler(Program prog, std::string file, bool contracts)
 
 void Compiler::error(const std::string& msg, int line) {
     throw CompileError(file_ + ":" + formatInt(line) + ": " + msg, line);
-}
-void Compiler::warn(const std::string& msg) { warnings_.push_back(msg); }
+}void Compiler::warn(const std::string& msg) { warnings_.push_back(msg); }
 
 // ---------------------------------------------------------------- emission
 int Compiler::emit(Op op, int line) {
@@ -206,11 +205,13 @@ Value Compiler::constEval(const ExprP& e, bool& ok) {
 
 // ---------------------------------------------------------------- program
 CompileResult Compiler::compile() {
+    scanDirectCallable();          // must run before any call site is compiled
     pushState("<main>", true);
     fs_->chunk->file = file_;
     for (auto& s : prog_.stmts) stmt(s);
     emit(OP_RETURN_NULL, 0);
     popState();
+    checkLendParams();
     res_.main = pool_[0]->chunk;
     res_.annotations = prog_.annotationIndex;
     return res_;
@@ -561,16 +562,28 @@ void Compiler::storeTarget(const ExprP& target, bool isDecl, bool isConst) {
 // Build `T[n]` / `T[]` / `T[m][n]` from the declared dimensions plus an optional element list.
 // [[jit]]: a deliberately small, safe pass over one chunk.  Fusions keep the instruction count
 // identical (the freed slots become OP_NOP) so that every jump target stays valid.
-void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
+void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch, bool allowCompareBranch) {
     if (!ch) return;
     auto& code = ch->code;
+    // `ANNOTA_FUSE` masks the individual fusions (a debugging knob; the default runs all of them).
+    //   bit0 local += immediate | bit1 compare-and-branch | bit2 index += immediate | bit3 local += local
+    static const unsigned fuseMask = [] {
+        const char* s = std::getenv("ANNOTA_FUSE");
+        if (!s || !*s) return 0xFu;
+        return (unsigned)std::strtoul(s, nullptr, 0);
+    }();
+    const bool fLocalImm = (fuseMask & 1u) != 0;
+    const bool fCompare = allowCompareBranch && (fuseMask & 2u) != 0;
+    const bool fIndexImm = (fuseMask & 4u) != 0, fLocalLocal = (fuseMask & 8u) != 0;
+    if (fLocalImm)
     for (size_t i = 0; i + 3 < code.size(); i++) {
-        // GET_LOCAL s ; [GET_LOCAL s] ; INT1 k ; ADD|SUB ; SET_LOCAL s
+        // GET_LOCAL s ; INT1 k ; ADD|SUB ; SET_LOCAL s      ->  s += k / s -= k
+        // (the fused form is stack neutral, which is what this exact sequence does: the optional
+        //  `GET_LOCAL s` variant would leave one value behind, so it must not be fused)
         size_t j = i;
         if (code[j] != OP_GET_LOCAL) continue;
         uint8_t s1 = code[j + 1];
         j += 2;
-        if (j + 1 < code.size() && code[j] == OP_GET_LOCAL && code[j + 1] == s1) j += 2;
         if (j + 1 >= code.size() || code[j] != OP_INT1) continue;
         uint8_t imm = code[j + 1];
         j += 2;
@@ -588,6 +601,7 @@ void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
     // GET_LOCAL a ; GET_LOCAL b ; LT ; JUMP_IF_FALSE  ->  one compare-and-branch
     // The jump is relative to the end of the instruction, and the fused form is 3 bytes shorter,
     // so the encoded target moves by +3.
+    if (fCompare)
     for (size_t i = 0; i + 7 < code.size(); i++) {
         if (code[i] != OP_GET_LOCAL || code[i + 2] != OP_GET_LOCAL) continue;
         if (code[i + 4] != OP_LT) continue;
@@ -602,6 +616,7 @@ void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
         i += 7;
     }
     // GET_LOCAL a ; INT1 k ; LT ; JUMP_IF_FALSE  ->  compare against an immediate
+    if (fCompare)
     for (size_t i = 0; i + 7 < code.size(); i++) {
         if (code[i] != OP_GET_LOCAL) continue;
         if (code[i + 2] != OP_INT1) continue;
@@ -616,21 +631,12 @@ void Compiler::optimizeChunk(const std::shared_ptr<Chunk>& ch) {
         for (size_t k = i + 5; k <= i + 7; k++) code[k] = OP_NOP;
         i += 7;
     }
-    // GET_LOCAL arr ; GET_LOCAL idx ; GET_INDEX ; INT1 k ; ADD ; SET_INDEX -> arr[idx] += k
-    for (size_t i = 0; i + 8 < code.size(); i++) {
-        if (code[i] != OP_GET_LOCAL || code[i + 2] != OP_GET_LOCAL) continue;
-        if (code[i + 4] != OP_GET_INDEX) continue;
-        if (code[i + 5] != OP_INT1) continue;
-        if (code[i + 7] != OP_ADD) continue;
-        if (code[i + 8] != OP_SET_INDEX) continue;
-        uint8_t arr = code[i + 1], idx = code[i + 3], imm = code[i + 6];
-        code[i] = OP_INDEX_ADD_IMM;
-        code[i + 1] = arr;
-        code[i + 2] = idx;
-        code[i + 3] = imm;
-        for (size_t k = i + 4; k <= i + 8; k++) code[k] = OP_NOP;
-        i += 9;
-    }
+    // `arr[idx] = arr[idx] + k` is deliberately NOT fused: the value's prefix is preceded by the
+    // target's own `GET_LOCAL arr ; GET_LOCAL idx`, so the replaced range has a stack effect of -2,
+    // and the pattern would also match `a[i] = b[j] + k` (different slots).  Rewriting it needs a
+    // pop-based opcode plus a same-slot check; the win does not justify the risk.
+    (void)fIndexImm;
+    if (fLocalLocal)
     for (size_t i = 0; i + 6 < code.size(); i++) {
         // GET_LOCAL s ; GET_LOCAL t ; ADD ; SET_LOCAL s
         if (code[i] != OP_GET_LOCAL) continue;
@@ -771,6 +777,15 @@ void Compiler::stmtAssign(const StmtP& s) {
         emit(OP_SET_FIELD, s->line);
         emitU16((uint16_t)addString(s->target->name), s->line);
     } else if (s->target->kind == EK::Index) {
+        // `a[i][j] = v`: the same evaluation order as before (a, i, j, v), one fused store
+        if (!stmtUnsafe_ && s->target->a && s->target->a->kind == EK::Index && s->target->a->a) {
+            expr(s->target->a->a);
+            expr(s->target->a->b);
+            expr(s->target->b);
+            expr(s->value);
+            emit(OP_SET_INDEX2, s->line);
+            return;
+        }
         expr(s->target->a);
         expr(s->target->b);
         expr(s->value);
@@ -837,6 +852,20 @@ void Compiler::stmtUse(const StmtP& s) {
 }
 
 void Compiler::stmtFuncDef(const StmtP& s) {
+    // `[[jit]]` compiles ahead of time, which needs each parameter's kind: require an integer type
+    // hint (int8/int16/int32/int64 - `int` is int32, `long` is int64).
+    if (hasAnn(s->annotations, "jit")) {
+        for (auto& p : s->params) {
+            if (p.vararg || p.borrow) continue;
+            NumKind k = numKindByName(p.type);
+            const bool integer = k == NumKind::I8 || k == NumKind::I16 || k == NumKind::I32 ||
+                                 k == NumKind::I64;
+            if (!integer)
+                error("[[jit]] 要求每个参数都有整型类型提示（int8/int16/int32/int64，即 int 或 long）；参数 '" +
+                          p.name + "' 目前是 " + (p.type.empty() ? std::string("未标注") : "'" + p.type + "'"),
+                      s->line);
+        }
+    }
     std::shared_ptr<Chunk> ch = compileFunction(s->name, s->params, s->body, s->isMethod, fs_->cls, s->annotations);
     int k = addConst(Value::function(ch));
     emit(OP_CLOSURE, s->line);
@@ -1009,11 +1038,16 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
 
     if (isMethod) declareLocal("this", false);
     int fixed = 0;
+    size_t paramIdx = 0;
     for (auto& p : params) {
         ParamInfo pi;
         pi.name = p.name;
+        pi.type = p.type;
         pi.hasDefault = (bool)p.def;
         pi.vararg = p.vararg;
+        pi.borrow = p.borrow;
+        if (p.borrow && paramIdx < 32) f->chunk->paramBorrow |= (1u << paramIdx);
+        paramIdx++;
         f->chunk->params.push_back(pi);
         int slot = declareLocal(p.name, false);
         if (p.vararg) {
@@ -1111,9 +1145,13 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
     // point at the module instead of at whoever wrote `use`
     if (!f->origin.empty()) ch->file = f->origin;
     popState();
-    if (hasAnn(anns, "jit")) {
-        optimizeChunk(ch);                    // superinstructions first
-        ch->jit = jitCompileX64(ch);          // then whole-function machine code
+    // Superinstructions are semantics preserving, so every function gets them: the interpreter
+    // then executes fewer dispatches even where the machine-code backend cannot help.  The
+    // compare-and-branch pair stays limited to `[[jit]]` chunks, where it has always been used.
+    const bool eagerJit = hasAnn(anns, "jit");
+    optimizeChunk(ch, eagerJit);
+    if (eagerJit) {
+        ch->jit = jitCompileX64(ch);          // eager whole-function machine code
     }
     return ch;
 }
@@ -1169,7 +1207,85 @@ void Compiler::compileArgs(const ExprP& e) {
     emitU16((uint16_t)n, e->line);
 }
 
+void Compiler::scanDirectCallable() {
+    // A `OP_CALL_DIRECT` site addresses a name instead of a value, so the name must keep meaning
+    // the same function for the whole run: collect the top-level functions and `[[static]]` class
+    // methods, and every name the program ever assigns or re-declares.
+    std::function<void(const std::vector<StmtP>&, const std::string&)> walk =
+        [&](const std::vector<StmtP>& ss, const std::string& cls) {
+            for (auto& s : ss) {
+                if (!s) continue;
+                switch (s->kind) {
+                    case SK::FuncDef:
+                        if (cls.empty()) directFuncs_.insert(s->name);
+                        else if (s->isStatic) directStatic_[cls].insert(s->name);
+                        break;
+                    case SK::ClassDef:
+                        walk(s->members, s->name);
+                        break;
+                    case SK::Assign:
+                    case SK::CompoundAssign:
+                    case SK::Del:
+                    case SK::Input:
+                        if (s->target && s->target->kind == EK::Ident) directBlocked_.insert(s->target->name);
+                        break;
+                    case SK::New:
+                    case SK::Const:
+                        for (auto& n : s->names) directBlocked_.insert(n);
+                        if (!s->name.empty()) directBlocked_.insert(s->name);
+                        break;
+                    case SK::For:
+                        break;
+                    default:
+                        break;
+                }
+                if (s->body) walk(s->body->stmts, cls);
+                if (s->elseBody) walk(s->elseBody->stmts, cls);
+            }
+        };
+    walk(prog_.stmts, "");
+}
+
+bool Compiler::directCallable(const std::string& key) const {
+    size_t dot = key.find('.');
+    if (dot == std::string::npos)
+        return directFuncs_.count(key) > 0 && directBlocked_.count(key) == 0;
+    const std::string cls = key.substr(0, dot), m = key.substr(dot + 1);
+    auto it = directStatic_.find(cls);
+    if (it == directStatic_.end() || it->second.count(m) == 0) return false;
+    return directBlocked_.count(cls) == 0 && directBlocked_.count(m) == 0;
+}
+
 void Compiler::exprCall(const ExprP& e) {
+    // A call to a function (or `[[static]]` method) the program defines: address it by name, so
+    // the callee value and the argument list never have to be built.  Anything unusual (named or
+    // spread arguments, children, a shadowing local) keeps the generic path.
+    bool plain = !e->children && e->args.size() <= 255;
+    if (plain)
+        for (auto& a : e->args)
+            if (!a.name.empty() || a.spread) { plain = false; break; }
+    std::string key;
+    // inside a class a bare name resolves to a method of that class first, so the direct form may
+    // only be used when the class has no method of that name
+    auto shadowedByMethod = [&](const std::string& n) {
+        return fs_->cls && fs_->cls->findMethod(n) != nullptr;
+    };
+    if (plain && e->a && e->a->kind == EK::Ident &&
+        resolveLocal(fs_, e->a->name) < 0 && resolveUpval(fs_, e->a->name) < 0 &&
+        !shadowedByMethod(e->a->name) && directCallable(e->a->name)) {
+        key = e->a->name;
+    } else if (plain && e->a && e->a->kind == EK::Field && e->a->a && e->a->a->kind == EK::Ident &&
+               resolveLocal(fs_, e->a->a->name) < 0 && resolveUpval(fs_, e->a->a->name) < 0 &&
+               directCallable(e->a->a->name + "." + e->a->name)) {
+        key = e->a->a->name + "." + e->a->name;
+    }
+    if (!key.empty()) {
+        for (auto& a : e->args) expr(a.value);
+        emit(OP_CALL_DIRECT, e->line);
+        emitU16((uint16_t)addString(key), e->line);
+        emitByte((uint8_t)e->args.size(), e->line);
+        return;
+    }
     expr(e->a);
     compileArgs(e);
     if (e->children) {
@@ -1319,6 +1435,15 @@ void Compiler::expr(const ExprP& e) {
         }
         case EK::Call: exprCall(e); return;
         case EK::Index: {
+            // `a[i][j]`: one fused instruction instead of two dispatches plus an intermediate row
+            // view (the VM keeps a contiguous-array fast path that never builds the view object).
+            if (!stmtUnsafe_ && e->a && e->a->kind == EK::Index && e->a->a) {
+                expr(e->a->a);
+                expr(e->a->b);
+                expr(e->b);
+                emit(OP_GET_INDEX2, e->line);
+                return;
+            }
             bool proved = stmtUnsafe_;                 // reuse the existing [[unsafe]] hint
             if (!proved && e->a && e->a->kind == EK::Ident) {
                 int slot = resolveLocal(fs_, e->a->name);
@@ -1388,6 +1513,192 @@ void Compiler::expr(const ExprP& e) {
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------- lend parameters
+// `f(lend xs, ...)` borrows the caller's container instead of copying it, which is what makes a
+// hot library call such as `Seq.bsearch(sorted_data, x)` cheap.  In exchange the body must only
+// *read* the value: mutating it, aliasing it into another container, returning it or capturing it
+// in a closure would let the caller observe the change.  This pass enforces that here, so a `lend`
+// parameter is always sound at the call site (natives are trusted, like `[[unsafe]]`).
+namespace {
+
+class LendWalker {
+public:
+    LendWalker(const std::vector<Param>& params, std::function<void(const std::string&, int)> err)
+        : err_(std::move(err)) {
+        for (auto& p : params) if (p.borrow) lent_.insert(p.name);
+    }
+    bool active() const { return !lent_.empty(); }
+
+    void block(const BlockP& b) {
+        if (!b) return;
+        for (auto& s : b->stmts) stmt(s);
+        if (b->exceptBody) block(b->exceptBody);
+    }
+    // public entry point: check this body against the declared `lend` parameters
+    void run(const BlockP& body, const ExprP& bodyExpr) {
+        if (body) block(body);
+        if (bodyExpr) expr(bodyExpr, true);
+    }
+    // check a closure body for its own `lend` parameters while also watching the outer names
+    void runNested(const std::set<std::string>& outer, const std::vector<Param>& ps,
+                   const BlockP& body, const ExprP& bodyExpr) {
+        LendWalker inner(ps, err_);
+        if (inner.lent_.empty()) return;
+        inner.lent_.insert(outer.begin(), outer.end());
+        inner.closureDepth = 1;
+        if (body) inner.block(body);
+        if (bodyExpr) inner.expr(bodyExpr, true);
+    }
+
+    void stmt(const StmtP& s) {
+        if (!s) return;
+        switch (s->kind) {
+            case SK::Expr: expr(s->expr, true); break;
+            case SK::Assign:
+            case SK::CompoundAssign:
+                if (targetRoots(s->target)) fail("被修改（借用的值不能写）", s->line);
+                expr(s->value, false);
+                break;
+            case SK::New:
+            case SK::FieldDecl:
+                if (isLent(s->initExpr)) fail("被别名保存（借用的值会与调用者共享）", s->line);
+                expr(s->initExpr, true);
+                break;
+            case SK::Del:
+                if (targetRoots(s->target)) fail("被删除元素（借用的值不能写）", s->line);
+                break;
+            case SK::Return:
+            case SK::Throw:
+                if (isLent(s->expr)) fail("被返回（借用的值会逃逸）", s->line);
+                expr(s->expr, true);
+                break;
+            case SK::Print:
+                for (auto& a : s->args) expr(a, true);
+                expr(s->sep, true);
+                break;
+            case SK::If: expr(s->cond, true); block(s->body); block(s->elseBody); break;
+            case SK::While: expr(s->cond, true); block(s->body); break;
+            case SK::For: expr(s->iterable, true); block(s->body); break;
+            case SK::Block: block(s->body); break;
+            case SK::ViewDef:
+            case SK::State:
+                expr(s->initExpr, true);
+                for (auto& m : s->members) stmt(m);
+                if (s->body) block(s->body);
+                break;
+            default: break;
+        }
+    }
+
+private:
+    bool isLent(const ExprP& e) const {
+        return e && e->kind == EK::Ident && lent_.count(e->name) > 0;
+    }
+    bool targetRoots(const ExprP& t) const {
+        const Expr* p = t.get();
+        while (p) {
+            if (p->kind == EK::Ident) return lent_.count(p->name) > 0;
+            if (p->kind == EK::Index || p->kind == EK::Field) { p = p->a.get(); continue; }
+            return false;
+        }
+        return false;
+    }
+    void fail(const std::string& why, int line) {
+        std::string names;
+        for (auto& n : lent_) { if (!names.empty()) names += ", "; names += n; }
+        err_("lend 参数 '" + names + "' " + why + "（写入会直接影响调用者；确认要这样写就给函数加 [[lend_write]] 标注）", line);
+    }
+
+    void expr(const ExprP& e, bool readOnly) {
+        if (!e) return;
+        switch (e->kind) {
+            case EK::Ident:
+                if (closureDepth > 0 && isLent(e)) fail("被闭包捕获（借用的值会活过这次调用）", e->line);
+                break;
+            case EK::Index:
+                expr(e->a, true);
+                expr(e->b, true);
+                break;
+            case EK::Field:
+                expr(e->a, true);
+                break;
+            case EK::Call: {
+                // `xs.push(...)`: a method on the borrowed value may write to it
+                if (e->a && e->a->kind == EK::Field && targetRoots(e->a->a) && e->a->a &&
+                    e->a->a->kind == EK::Ident)
+                    fail("被当作方法接收者调用（该方法可能修改它）", e->line);
+                expr(e->a, true);
+                for (auto& a : e->args) {
+                    if (isLent(a.value)) continue;          // the callee receives a copy (or borrows read-only)
+                    expr(a.value, readOnly);
+                }
+                if (e->children) block(e->children);
+                break;
+            }
+            case EK::List:
+            case EK::Tuple:
+                for (auto& it : e->items) {
+                    if (isLent(it)) fail("被放进新容器（借用的值会与调用者共享）", e->line);
+                    expr(it, true);
+                }
+                break;
+            case EK::Unary: expr(e->a, true); break;
+            case EK::Binary:
+            case EK::Logical:
+                expr(e->a, true);
+                expr(e->b, true);
+                break;
+            case EK::Piecewise:
+                expr(e->a, true);
+                for (auto& c : e->cases) { expr(c.first, true); expr(c.second, true); }
+                expr(e->elseVal, true);
+                break;
+            case EK::Iter: expr(e->a, true); break;
+            case EK::Lambda: {
+                // a closure may capture the borrowed value; check the closure against the outer
+                // names, then check its own body for its own `lend` parameters
+                closureDepth++;
+                if (e->body) block(e->body);
+                if (e->bodyExpr) expr(e->bodyExpr, true);
+                closureDepth--;
+                runNested(lent_, e->params, e->body, e->bodyExpr);
+                break;
+            }
+            default: break;
+        }
+    }
+
+    std::set<std::string> lent_;
+    std::function<void(const std::string&, int)> err_;
+    int closureDepth = 0;
+};
+
+} // namespace
+
+void Compiler::checkLendParams() {
+    // `lend` parameters are writable - the write goes straight to the caller's container, which is
+    // the point of borrowing - so this only *warns*; `[[lend_write]]` marks a function where that
+    // is intended and silences it.
+    auto checkOne = [&](const std::vector<Param>& params, const BlockP& body, const ExprP& bodyExpr,
+                        bool allowWrite) {
+        if (allowWrite) return;
+        LendWalker w(params, [&](const std::string& msg, int line) { warn(msg + "（第 " + formatInt(line) + " 行）"); });
+        if (!w.active()) return;
+        w.run(body, bodyExpr);
+    };
+    std::function<void(const std::vector<StmtP>&)> walk = [&](const std::vector<StmtP>& ss) {
+        for (auto& s : ss) {
+            if (!s) continue;
+            if (s->kind == SK::FuncDef)
+                checkOne(s->params, s->body, s->expr, hasAnn(s->annotations, "lend_write"));
+            if (s->kind == SK::ClassDef) walk(s->members);
+            if (s->body) walk(s->body->stmts);
+            if (s->elseBody) walk(s->elseBody->stmts);
+        }
+    };
+    walk(prog_.stmts);
 }
 
 } // namespace annota

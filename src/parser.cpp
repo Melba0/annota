@@ -316,7 +316,12 @@ bool Parser::looksLikeParamList(size_t a, size_t b) const {
     if (b <= a) return true;
     size_t i = a;
     while (i < b) {
-        if (at(i).type == T::Ellipsis || at(i).type == T::Star || at(i).type == T::StarStar) {
+        if (at(i).type == T::Kw_lend) {          // `lend xs`: a borrowed parameter
+            i++;
+            if (i >= b || at(i).type != T::Ident) return false;
+            i++;
+        }
+        else if (at(i).type == T::Ellipsis || at(i).type == T::Star || at(i).type == T::StarStar) {
             i++;
             if (i >= b || at(i).type != T::Ident) return false;
             i++;
@@ -1067,10 +1072,13 @@ std::vector<Param> Parser::parseParams() {
     skipNL();
     while (!check(T::RParen)) {
         Param p;
+        // `lend xs` declares a borrowed (read-only) parameter
+        if (accept(T::Kw_lend)) p.borrow = true;
         // `*args` (Python style) or `...args` marks the variadic tail
         if (check(T::StarStar))
             error("'**kwargs' is not supported; pass a Dict as a normal parameter instead");
         if (accept(T::Star) || accept(T::Ellipsis)) p.vararg = true;
+        if (p.borrow && p.vararg) error("a variadic parameter cannot be borrowed with 'lend'");
         p.name = expect(T::Ident, "a parameter name").text;
         if (accept(T::Colon)) {
             if (check(T::Ident)) p.type = cur().text, p_++;

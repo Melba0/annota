@@ -11,6 +11,18 @@ major change, and a new check is a minor one.
 
 ### Added
 
+* **`lend` parameters: borrow instead of copy.**  `total(lend xs)` declares that the callee only
+  *reads* the container, so the call binds the caller's list/array/dict without deep copying it (the
+  copy happens at the call boundary, which a `lend` statement inside the callee is too late to
+  avoid).  The compiler enforces the promise: mutating the parameter (`xs[i] = v`, `xs.push(v)`,
+  `del xs[i]`), letting it escape (`=xs`, `new t = xs`, `[xs]`, closure capture) or using it as a
+  method receiver is a compile error.  The standard library's sorting/searching family
+  (`Seq.sort` / `sort_by` / `merge_sort` / `heap_sort` / `insertion_sort` / `kth` / `median` /
+  `quantile` / `dedup` / `unique` / `is_sorted` / `bsearch` / `bsearch_by` / `lower_bound` /
+  `upper_bound` / `sort_native`) now takes `lend xs`, which removes a full copy per call; together
+  with an in-place (`ffiItems`-free) `seqnative.lower_bound`/`upper_bound`, the 4000-element binary
+  search benchmark went from **440 ms to 14 ms** and the whole `perf.ant` suite from 1.60 s to
+  **0.96 s**.  See the syntax reference §4.1.3.
 * **Automatic releases.**  `.github/workflows/release.yml` publishes a GitHub Release whenever a
   `v*` tag is pushed (or on demand via `workflow_dispatch`): it builds the interpreter on Windows
   (MinGW + Qt 6) and Linux, assembles a self-contained bundle for each (`lib/` next to the
@@ -108,6 +120,40 @@ major change, and a new check is a minor one.
   now guards this in CI.
 
 ### Changed
+
+* **Direct calls.**  A call to a top-level function or a `[[static]]` class method that the program
+  defines is now compiled to `OP_CALL_DIRECT <name> <argc>`: there is no callee value and no
+  argument list on the heap, and the VM binds the arguments straight out of the operand stack
+  (a class qualified call passes the class as `this`, so the method body resolves its own bare
+  calls as before).  The 40k-call benchmark row went from 23 ms to **11 ms**, and every library
+  wrapper benefits.  Names that could be shadowed (a local/upvalue of the same name, a
+  reassignment anywhere in the program, a method of the enclosing class) keep the generic path,
+  and a name that no longer holds a function falls back at run time.
+* **The machine-code backend can call other compiled functions.**  The JIT emits a native `call`
+  for a direct call site when the callee has machine code, takes exactly these arguments as plain
+  integers, is not a method and has a statically known result kind: the arguments are marshalled
+  straight out of the virtual registers and the callee's `L[]`/`JitOut` live on the caller's native
+  frame, so recursion works.  Resolving a callee compiles it on demand (a busy flag breaks cycles).
+  In practice this only fires for callees whose result kind does not depend on the argument kind -
+  a function such as `f(x) = x + 1` still needs the interpreter's dynamic kind, which is the next
+  thing to solve.
+* `jitLocalsOk` now refuses declared integer widths (`int8`/`int32`/...): the native code works on
+  raw int64s and would not wrap like the interpreter, so those values keep being interpreted.
+
+* **Superinstructions are no longer exclusive to `[[jit]]`.**  Every function now gets the
+  semantics-preserving fusions (`x = x + k`, `x -= k`, `x = x + y`), so the *interpreter* executes
+  fewer dispatches even where the machine-code backend cannot help; `[[jit]]` additionally enables
+  the compare-and-branch pair and compiles the function eagerly.  `ANNOTA_FUSE` masks the
+  individual patterns for debugging.
+* `a[i][j]` compiles to a single `get_index2` / `set_index2` instruction: for arrays the element is
+  computed straight from the strides instead of materialising the intermediate row view (which
+  copies the whole `Obj`), with exactly the same bounds checks and error text.
+* **Two unsound fusions were removed.**  The compare-and-branch pair patched its jump through
+  `frames.back().ip`, which still pointed at the *start* of the instruction (a wrong target for
+  every non-integer comparison), and the `arr[idx] += k` fusion ignored the two values that the
+  target's own `GET_LOCAL` pair leaves on the stack (and never checked that the read and the write
+  use the same slots) - applied to every function it corrupted the stack.  Both are fixed or
+  withdrawn, which is why the fusions above are enabled per pattern instead of wholesale.
 
 * Faster calls: frames reuse pooled local cells (captured cells are detached), parameter
   presence is a bitmask instead of a vector, immutable values are shared instead of deep-copied

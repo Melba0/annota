@@ -1,4 +1,4 @@
--[ seq.mod : 序列（List / Tuple / 数组）通用操作与算法 ]-
+﻿-[ seq.mod : 序列（List / Tuple / 数组）通用操作与算法 ]-
 -[ 排序是稳定的归并排序 O(n log n)，另有堆排序；选择用快速选择 O(n) 平均； ]
 -[ 查找在有序序列上走二分 O(log n)；集合运算走排序 + 线性扫描，不做 O(n^2) 暴力。 ]-
 
@@ -231,7 +231,7 @@ Seq()=(
     -- ============================================================ 排序（归并 / 堆 / 插入）
     -- 稳定归并排序：less(a, b) 为真表示 a 应排在 b 前面
     [[static]]
-    merge_sort(xs, less)(
+    merge_sort(lend xs, less)(
         new n = len(xs)
         if n < 2(
             =Seq.copy(xs)
@@ -270,11 +270,11 @@ Seq()=(
     -- 默认排序走原生原语（C++ std::stable_sort，稳定）：热路径不付解释器成本。
     -- 需要自定义比较函数时用 merge_sort。
     [[static]]
-    sort(xs, reverse = false)( =seqnative.sorted(xs, reverse) )
+    sort(lend xs, reverse = false)( =seqnative.sorted(xs, reverse) )
 
     -- 按 key 排序：先用原生 argsort 得到稳定排列，再按排列重排（O(n log n)，排序在 C++ 里）
     [[static]]
-    sort_by(xs, key, reverse = false)(
+    sort_by(lend xs, key, reverse = false)(
         new keys = []
         for x in xs(
             keys.push(key(x))
@@ -290,7 +290,7 @@ Seq()=(
     -- 堆排序：原地风格的 O(n log n)，不需要递归深度
     [[static]]
     [[static]]
-    heap_sort(xs, reverse = false)(
+    heap_sort(lend xs, reverse = false)(
         new a = Seq.copy(xs)
         new n = len(a)
         -- sift down 写成闭包：闭包按引用捕获 a，所以能原地调整又不违反"实参按值传递"
@@ -332,7 +332,7 @@ Seq()=(
     [[static]]
 
     [[static]]
-    insertion_sort(xs, less)(
+    insertion_sort(lend xs, less)(
         new a = Seq.copy(xs)
         for i in 1 to len(a) - 1(
             new key = a[i]
@@ -347,7 +347,7 @@ Seq()=(
     )
 
     [[static]]
-    is_sorted(xs, less = null)(
+    is_sorted(lend xs, less = null)(
         if len(xs) < 2( =true )
         new i = 1
         while i < len(xs)(
@@ -363,7 +363,7 @@ Seq()=(
 
     -- 原生排序（C++ std::sort 支撑），性能最好，但不受稳定性保证
     [[static]]
-    sort_native(xs) = seqnative.sorted(xs)
+    sort_native(lend xs) = seqnative.sorted(xs)
 
     -- 把 x 插入已经有序的序列，保持有序（二分定位）
     [[static]]
@@ -377,10 +377,10 @@ Seq()=(
     -- ============================================================ 有序序列上的查找（二分）
     -- 二分原语：直接调用 C++ 的 lower_bound / upper_bound
     [[static]]
-    lower_bound(xs, value)( =seqnative.lower_bound(xs, value) )
+    lower_bound(lend xs, value)( =seqnative.lower_bound(xs, value) )
 
     [[static]]
-    upper_bound(xs, value)( =seqnative.upper_bound(xs, value) )
+    upper_bound(lend xs, value)( =seqnative.upper_bound(xs, value) )
 
     -- 脚本版二分（保留作为参考实现，与原生版语义一致）
     [[static]]
@@ -414,14 +414,14 @@ Seq()=(
     )
 
     [[static]]
-    bsearch(xs, value)(
+    bsearch(lend xs, value)(
         new at = Seq.lower_bound(xs, value)
         if at < len(xs) && xs[at] == value( =at )
         =-1
     )
 
     [[static]]
-    bsearch_by(xs, value, key)(
+    bsearch_by(lend xs, value, key)(
         new lo = 0
         new hi = len(xs)
         while lo < hi(
@@ -439,7 +439,7 @@ Seq()=(
     -- ============================================================ 选择（快速选择 O(n) 平均）
     -- 第 k 小（k 从 0 开始），平均 O(n)；Lomuto 划分保证枢轴落在最终位置
     [[static]]
-    kth(xs, k)( =seqnative.nth(xs, k) )
+    kth(lend xs, k)( =seqnative.nth(xs, k) )
 
     -- 脚本版快速选择（三数取中 + Lomuto 划分），保留作为参考实现
     [[static]]
@@ -500,7 +500,7 @@ Seq()=(
     [[static]]
 
     [[static]]
-    median(xs)(
+    median(lend xs)(
         new n = len(xs)
         if n == 0( =null )
         if n % 2 == 1(
@@ -511,7 +511,7 @@ Seq()=(
 
     -- 分位数：q 取 0..1，最近秩法（不需要插值）
     [[static]]
-    quantile(xs, q)(
+    quantile(lend xs, q)(
         new n = len(xs)
         if n == 0( =null )
         new pos = math.floor(q * (n - 1))
@@ -519,7 +519,7 @@ Seq()=(
     )
 
     [[static]]
-    median_sorted(xs)(
+    median_sorted(lend xs)(
         new n = len(xs)
         if n == 0( =null )
         if n % 2 == 1(
@@ -686,11 +686,11 @@ Seq()=(
 
     -- ============================================================ 集合运算
     [[static]]
-    unique(xs)( =Seq.dedup(xs) )
+    unique(lend xs)( =Seq.dedup(xs) )
 
     -- 去重：原生 argsort 得到稳定排列（同值按下标升序），取每个值的首次出现，再按下标排序
     [[static]]
-    dedup(xs)(
+    dedup(lend xs)(
         new order = seqnative.argsort(xs)
         new keep = []
         new last = null

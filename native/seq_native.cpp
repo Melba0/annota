@@ -100,15 +100,30 @@ ANNOTA_MODULE(seqnative)
     });
 
     // binary search on an already sorted sequence
-    mod.fn("lower_bound", [](VM& vm, ValueList& a) {
+    // Binary search on an already sorted sequence.  `ffiItems` would copy the whole sequence on
+    // every call (the standard library borrows its argument with `lend`, so nothing else copies
+    // it) - instead probe the container in place, which is log2(n) reads and no allocation.
+    auto at = [](VM& vm, const Value& seq, size_t i) -> Value {
+        if (seq.t == VT::List || seq.t == VT::Tuple) return seq.o->items[i];
+        return vm.getIndex(seq, Value::integer((int64_t)i));
+    };
+    auto seqSize = [](VM& vm, const Value& seq) -> size_t {
+        if (seq.t == VT::List || seq.t == VT::Tuple || seq.t == VT::Iter) return seq.o->items.size();
+        if (seq.t == VT::Str) return seq.o->str.size();
+        if (seq.t == VT::Bytes) return seq.o->bytes.size();
+        if (seq.t == VT::Array) return (size_t)seq.arrayCount();
+        vm.throwError(std::string("expected a sequence but got ") + seq.typeName());
+    };
+
+    mod.fn("lower_bound", [at, seqSize](VM& vm, ValueList& a) {
         if (a.size() < 2) vm.throwError("seqnative.lower_bound expects a sequence and a value");
-        std::vector<Value> items = ffiItems(vm, a[0]);
+        const Value& seq = a[0];
         const Value& key = a[1];
-        size_t lo = 0, hi = items.size();
+        size_t lo = 0, hi = seqSize(vm, seq);
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
             bool comparable = true;
-            bool less = orderLess(vm, items[mid], key, comparable);
+            bool less = orderLess(vm, at(vm, seq, mid), key, comparable);
             if (!comparable) vm.throwError("seqnative.lower_bound: elements are not comparable");
             if (less) lo = mid + 1;
             else hi = mid;
@@ -116,15 +131,15 @@ ANNOTA_MODULE(seqnative)
         return Value::integer((int64_t)lo);
     });
 
-    mod.fn("upper_bound", [](VM& vm, ValueList& a) {
+    mod.fn("upper_bound", [at, seqSize](VM& vm, ValueList& a) {
         if (a.size() < 2) vm.throwError("seqnative.upper_bound expects a sequence and a value");
-        std::vector<Value> items = ffiItems(vm, a[0]);
+        const Value& seq = a[0];
         const Value& key = a[1];
-        size_t lo = 0, hi = items.size();
+        size_t lo = 0, hi = seqSize(vm, seq);
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
             bool comparable = true;
-            bool less = orderLess(vm, key, items[mid], comparable);
+            bool less = orderLess(vm, key, at(vm, seq, mid), comparable);
             if (!comparable) vm.throwError("seqnative.upper_bound: elements are not comparable");
             if (!less) lo = mid + 1;
             else hi = mid;

@@ -1,4 +1,4 @@
-// Annota - jit.hpp : the machine code backend behind the single `[[jit]]` marker.
+﻿// Annota - jit.hpp : the machine code backend behind the single `[[jit]]` marker.
 //
 // `[[jit]]` asks for load-time optimisation.  The superinstruction pass in the compiler always
 // runs; on top of that this file tries to translate the whole function into x86-64 machine code.
@@ -42,9 +42,13 @@ struct JitOut {
 struct JitCode {
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> readSlots;      // locals that must hold an int when the native code runs
+    std::vector<uint8_t> slotKind;       // per local: the exact NumKind+1 required, 0 = don't care
     // loop headers that can be entered directly (hot-loop promotion): bytecode ip -> entry
     std::map<size_t, JitFn> osrEntries;
     JitFn fn = nullptr;
+    // kind byte every `return` writes (0 int, 1 int64, 2 bool, 3 null); -2 when it varies, which
+    // makes the function unusable as a direct call target from other native code
+    int retByte = -2;
     void* mapping = nullptr;
     size_t mappingSize = 0;
 
@@ -224,6 +228,20 @@ public:
     }
 
     // out->value = rax ; out->kind = kind
+    // narrow the result of an arithmetic op back to the declared width, the way the interpreter's
+    // per-kind wrapping does (the JIT only ever computes in 64 bit registers)
+    void wrapRax(int kind) {
+        switch ((NumKind)kind) {
+            case NumKind::I8:  u8(0x48); u8(0x0F); u8(0xBE); u8(0xC0); break;   // movsx rax, al
+            case NumKind::I16: u8(0x48); u8(0x0F); u8(0xBF); u8(0xC0); break;   // movsx rax, ax
+            case NumKind::I32: u8(0x48); u8(0x63); u8(0xC0); break;             // movsxd rax, eax
+            case NumKind::U8:  u8(0x0F); u8(0xB6); u8(0xC0); break;             // movzx eax, al
+            case NumKind::U16: u8(0x0F); u8(0xB7); u8(0xC0); break;             // movzx eax, ax
+            case NumKind::U32: u8(0x89); u8(0xC0); break;                       // mov eax, eax
+            default: break;                                                     // 64 bit: already exact
+        }
+    }
+
     void storeResult(int kind) {
         u8(0x48); u8(0x89);
         if (kOut == 0x02) u8(0x02); else u8(0x06);          // [rdx] / [rsi]
@@ -260,11 +278,18 @@ inline std::shared_ptr<JitCode> jitFail(int line) {
     if (std::getenv("ANNOTA_JIT_DEBUG")) std::fprintf(stderr, "[jit] not eligible at line %d\n", line);
     return nullptr;
 }
-inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) {
+inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
+                                              const JitResolver& resolve = {}) {
     if (!ch) return jitFail(__LINE__);
     const std::vector<uint8_t>& code = ch->code;
     if (ch->numLocals > 64 || code.empty()) return jitFail(__LINE__);
     if (std::getenv("ANNOTA_NO_JIT")) return jitFail(__LINE__);
+    if (ch->jitBusy) return jitFail(__LINE__);          // breaks cycles while resolving callees
+    struct BusyGuard {
+        const std::shared_ptr<Chunk>& c;
+        explicit BusyGuard(const std::shared_ptr<Chunk>& x) : c(x) { c->jitBusy = true; }
+        ~BusyGuard() { c->jitBusy = false; }
+    } busyGuard(ch);
 
     // ---- decode and classify (only the integer subset is translatable)
     std::vector<JitIns> ins;
@@ -304,6 +329,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                 x.target = (int)((int64_t)(ip + 5) + (int16_t)((code[ip + 3] << 8) | code[ip + 4]));
                 break;
             case OP_RETURN: case OP_RETURN_NULL: x.next = ip + 1; break;
+            case OP_CONVERT: x.next = ip + 2; x.imm = code[ip + 1]; break;
+            case OP_CALL_DIRECT:
+                x.next = ip + 4;
+                x.a = (code[ip + 1] << 8) | code[ip + 2];        // name constant
+                x.imm = code[ip + 3];                            // argument count
+                break;
             default: return jitFail(__LINE__);                       // not translatable: keep interpreting
         }
         if (x.next > code.size()) return jitFail(__LINE__);
@@ -324,6 +355,19 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
     }
 
     // ---- forward analysis: stack depth, local kinds, definite assignment, ceiling on stack
+    // a direct call site is only usable when the callee has machine code and takes exactly these
+    // arguments as plain ints; otherwise the whole chunk stays interpreted
+    auto resolveCall = [&](const JitIns& x) -> JitCallTarget {
+        JitCallTarget none;
+        if (!resolve || (size_t)x.a >= ch->consts.size() || ch->consts[(size_t)x.a].t != VT::Str)
+            return none;
+        JitCallTarget t = resolve(ch->consts[(size_t)x.a].o->str);
+        if (!t.code || !t.chunk || !t.code->fn) return none;
+        if (t.code->retByte < 0 || t.code->retByte > 2) return none;
+        if (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm) return none;
+        if (t.chunk->numLocals > 64) return none;
+        return t;
+    };
     size_t n = ins.size();
     const int kUnset = -1;
     std::vector<int> depth(n, kUnset);
@@ -340,6 +384,20 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
         (void)isParam;
     }
     if (ch->isMethod && ch->numLocals > 0) kindAt[0][0] = kJitAllInts;
+    // a parameter with an integer type hint has an exact kind, which is what makes the values
+    // (and the result kind) statically known - `[[jit]]` requires those hints on every parameter
+    std::vector<uint8_t> expectKind(ch->numLocals, 0);
+    for (size_t i = 0; i < ch->params.size() && i < 64; i++) {
+        NumKind k = numKindByName(ch->params[i].type);
+        bool integer = k == NumKind::I8 || k == NumKind::I16 || k == NumKind::I32 ||
+                       k == NumKind::I64 || k == NumKind::U8 || k == NumKind::U16 ||
+                       k == NumKind::U32 || k == NumKind::U64;
+        if (!integer) continue;
+        size_t slot = (ch->isMethod ? 1 : 0) + i;
+        if (slot >= ch->numLocals) continue;
+        kindAt[0][slot] = jitBit(k);
+        expectKind[slot] = (uint8_t)k + 1;
+    }
 
     auto meet = [](JitKindSet a, JitKindSet b) -> JitKindSet { return (JitKindSet)(a | b); };
 
@@ -385,6 +443,30 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                     break;
                 }
                 case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: case OP_JUMP_IF_NOT_LT_LOCAL_IMM: break;
+                case OP_CONVERT: {
+                    // the compiler converts every typed parameter at entry; the JIT's entry check
+                    // already requires exactly that kind, so the conversion is the identity here -
+                    // any other conversion (a real `int(x)`, a boxed width) stays interpreted
+                    if (d < 1 || x.imm > (int)NumKind::U64) return jitFail(__LINE__);
+                    int sole = jitSoleKind(vk.back());
+                    if (sole != x.imm) return jitFail(__LINE__);
+                    vk.back() = jitBit((NumKind)x.imm);
+                    break;
+                }
+                case OP_CALL_DIRECT: {
+                    JitCallTarget t = resolveCall(x);
+                    if (!t.code || (int)vk.size() < x.imm) return jitFail(__LINE__);
+                    for (int k = 0; k < x.imm; k++) {
+                        // the callee's native code only accepts plain ints
+                        JitKindSet ks = vk[(size_t)((int)vk.size() - x.imm + k)];
+                        int sole = jitSoleKind(ks);
+                        if (sole < 0 || sole > (int)NumKind::U64) return jitFail(__LINE__);
+                    }
+                    for (int k = 0; k < x.imm; k++) vk.pop_back();
+                    pushKind(t.code->retByte == 2 ? kJitBool
+                             : t.code->retByte == 1 ? jitBit(NumKind::I64) : kJitNone);
+                    break;
+                }
                 case OP_RETURN:
                     if (d < 1) return jitFail(__LINE__);
                     break;                                   // exact kind handled at emit time
@@ -480,6 +562,27 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
         }
     }
     if (maxDepth > 48) return jitFail(__LINE__);
+    // a kind set that is not a single kind may only contain the 64 bit ones: wrapping a narrowed
+    // value is only correct when the width is unambiguous
+    for (size_t i = 0; i < n; i++) {
+        if (depth[i] == kUnset) continue;
+        for (size_t s = 0; s < ch->numLocals; s++) {
+            JitKindSet ks = kindAt[i][s];
+            // `kJitAllInts` means "an integer of unknown width": the entry check narrows it to the
+            // 64 bit / untyped kinds, which do not wrap, so raw int64 work is exact.  Any *other*
+            // set that mixes in a narrow width has no single wrapping rule and stays interpreted.
+            if (ks == kJitAllInts || jitSoleKind(ks) >= 0) continue;
+            if (ks & (jitBit(NumKind::I8) | jitBit(NumKind::I16) | jitBit(NumKind::I32) |
+                      jitBit(NumKind::U8) | jitBit(NumKind::U16) | jitBit(NumKind::U32)))
+                return jitFail(__LINE__);
+        }
+        for (auto& ks : vrKind[i]) {
+            if (ks == kJitAllInts || jitSoleKind(ks) >= 0) continue;
+            if (ks & (jitBit(NumKind::I8) | jitBit(NumKind::I16) | jitBit(NumKind::I32) |
+                      jitBit(NumKind::U8) | jitBit(NumKind::U16) | jitBit(NumKind::U32)))
+                return jitFail(__LINE__);
+        }
+    }
 
     // ---- which locals must be plain ints when the native code starts?
     std::vector<uint8_t> readSlots(ch->numLocals, 0);
@@ -503,6 +606,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
             default: break;
         }
     }
+
+    for (size_t s = 0; s < ch->numLocals; s++) if (expectKind[s]) readSlots[s] = 1;
 
     // ---- locals that are returned directly keep a kind byte: the interpreter's `typeof` for
     //      them depends on which assignment ran last, so the native code records it at runtime
@@ -529,6 +634,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
     }
 
     // ---- emit
+    int seenRetByte = -1;                                  // -2 once two returns disagree
+    auto noteRetByte = [&](int b) {
+        if (seenRetByte == -1) seenRetByte = b;
+        else if (seenRetByte != b) seenRetByte = -2;
+    };
     JitEmitter e;
     size_t kindSlots = 0;
     for (size_t i = 0; i < ch->numLocals; i++) if (tracked[i]) kindSlots++;
@@ -565,12 +675,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                 e.loadLocalToRax(x.a);
                 e.movR8Imm(x.imm);
                 if (x.op == OP_LOCAL_ADD_IMM) e.addRaxR8(); else e.subRaxR8();
+                { int wsole = jitSoleKind(kindAt[i][(size_t)x.a]); if (wsole >= 0) e.wrapRax(wsole); }
                 e.storeRaxToLocal(x.a);
                 break;                                  // x = x + k preserves the kind byte
             case OP_LOCAL_ADD_LOCAL:
                 e.loadLocalToRax(x.a);
                 e.loadLocalToR8(x.b);
                 e.addRaxR8();
+                { int wsole = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]));
+                  if (wsole >= 0) e.wrapRax(wsole); }
                 e.storeRaxToLocal(x.a);
                 if (tracked[(size_t)x.a]) {
                     int sole = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a],
@@ -586,6 +699,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                 if (x.op == OP_ADD) e.addRaxR8();
                 else if (x.op == OP_SUB) e.subRaxR8();
                 else e.imulRaxR8();
+                {
+                    int wsole = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
+                                                            vrKind[i][(size_t)d - 1]));
+                    if (wsole >= 0) e.wrapRax(wsole);
+                }
                 e.storeRaxToVr(d - 2);
                 break;
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
@@ -616,6 +734,39 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                 e.cmpRaxImm(x.imm);
                 e.jccPlaceholder(0x8D, (size_t)x.target);
                 break;
+            case OP_CALL_DIRECT: {
+                // a native call to another compiled function: allocate its L[] and JitOut on this
+                // native frame (so recursion works), marshal the arguments that are already in the
+                // virtual registers, call its entry, and take the value it wrote
+                JitCallTarget t = resolveCall(x);
+                if (!t.code) return jitFail(__LINE__);
+                const int Lbytes = (int)t.chunk->numLocals * 8;
+                int N = 32 + Lbytes + 16;                  // shadow space + L[] + JitOut
+                if ((N % 16) != 8) N += 8 - (N % 16);      // keep rsp 16-aligned at the call
+                e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)N);       // sub rsp, N
+                for (int k = 0; k < x.imm; k++) {
+                    int src = N + (d - x.imm + k) * 8;                        // the argument's VR
+                    e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)src);
+                    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(32 + k * 8));
+                }
+                if (JitEmitter::kBase == 0x01) { e.u8(0x48); e.u8(0x89); e.u8(0xE1); }   // mov rcx, rsp
+                else { e.u8(0x48); e.u8(0x89); e.u8(0xE7); }                            // mov rdi, rsp
+                e.u8(0x48); e.u8(0x8D);
+                e.u8(JitEmitter::kOut == 0x02 ? 0x94 : 0xB4);
+                e.u8(0x24); e.u32((uint32_t)(32 + Lbytes));                             // lea rdx/rsi, out
+                e.u8(0x49); e.u8(0xBB);
+                uint64_t fnAddr = (uint64_t)(uintptr_t)&t.code->fn;
+                for (int b = 0; b < 8; b++) e.u8((uint8_t)((fnAddr >> (8 * b)) & 0xff));  // mov r11, &fn
+                e.u8(0x4D); e.u8(0x8B); e.u8(0x1B);                                      // mov r11, [r11]
+                e.u8(0x41); e.u8(0xFF); e.u8(0xD3);                                      // call r11
+                e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24);
+                e.u32((uint32_t)(32 + Lbytes));                                          // mov rax, out.value
+                e.u8(0x48); e.u8(0x81); e.u8(0xC4); e.u32((uint32_t)N);                  // add rsp, N
+                int resVr = d - x.imm;
+                e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(resVr * 8));
+                if (tracked[(size_t)resVr]) e.storeKindByte(e.kindBase + (size_t)resVr, t.code->retByte == 2 ? 2 : t.code->retByte);
+                break;
+            }
             case OP_RETURN: {
                 e.loadVrToRax(d - 1);
                 int sole = jitSoleKind(vrKind[i][(size_t)d - 1]);
@@ -624,8 +775,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
                     // the value came straight from a tracked local: its kind byte is exact
                     e.loadKindByteToR8(e.kindBase + (size_t)ins[i - 1].a);
                     e.storeResultWithKindInR8();
+                    noteRetByte(-2);
                 } else if (sole >= 0) {
-                    e.storeResult(sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : 0);
+                    int byte = sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : 0;
+                    e.storeResult(byte);
+                    noteRetByte(byte);
                 } else {
                     return jitFail(__LINE__);                 // kind would not match the interpreter
                 }
@@ -634,6 +788,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
             }
             case OP_RETURN_NULL:
                 e.nullReturn();
+                noteRetByte(3);
                 break;
             default:
                 return jitFail(__LINE__);
@@ -641,6 +796,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
     }
     e.labelAt[code.size()] = e.c.size();
     e.nullReturn();
+    noteRetByte(3);
 
     if (e.pending.size() > 0 && !e.finish()) return jitFail(__LINE__);
     if (e.c.size() > 60000) return jitFail(__LINE__);
@@ -685,6 +841,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch) 
         jc->osrEntries[t.first] = reinterpret_cast<JitFn>((uint8_t*)mem + t.second);
     for (size_t s = 0; s < readSlots.size(); s++)
         if (readSlots[s]) jc->readSlots.push_back((uint8_t)s);
+    jc->retByte = seenRetByte;                 // -2 when the returns disagree
+    jc->slotKind = expectKind;
     return jc;
 }
 

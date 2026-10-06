@@ -1,4 +1,4 @@
--[ perf.ant : 性能基准。自己计时（_sys_clock 单调毫秒），打印表格， ]
+﻿-[ perf.ant : 性能基准。自己计时（_sys_clock 单调毫秒），打印表格， ]
 -[ 并对每个工作负载的结果做正确性断言——不写死时间阈值，避免在慢机器上误报。 ]-
 
 use test
@@ -59,7 +59,7 @@ count_up(n)(
 
 -- ② [[jit]] 标记：加载期把循环体融合成超指令
 [[jit]]
-count_up_jit(n)(
+count_up_jit(n:int64)(
     new i = 0
     new acc = 0
     while i < n(
