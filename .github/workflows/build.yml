@@ -55,7 +55,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++
 
       - name: Build
-        run: g++ -std=c++17 -O2 -pthread -Isrc src/*.cpp -o annota
+        run: |
+          # native/*.cpp are the FFI kernels the standard library calls (`seqnative`);
+          # -rdynamic lets a separately built plugin resolve the interpreter's symbols.
+          g++ -std=c++17 -O2 -pthread -rdynamic -Isrc src/*.cpp native/*.cpp -o annota
 
       - name: Language self-check
         run: |

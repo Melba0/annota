@@ -992,7 +992,21 @@ StmtP Parser::parseUse() {
                 // run time (and the analyzer knows it through the same registry)
                 return nullptr;
             }
-            error("cannot find module '" + spec + "'" + (loader_ ? loader_->searchHint(spec) : ""));
+            // These modules are C++ kernels that ship in native/ and are registered through the
+            // FFI.  A build that forgot to link them fails here, so say exactly that instead of
+            // a bare "cannot find module".
+            static const char* const kNativeKernels[] = {"seqnative", "fast", "hello"};
+            std::string kernelHint;
+            for (const char* k : kNativeKernels) {
+                if (spec != k) continue;
+                kernelHint = "\n  note: '" + spec +
+                             "' is a native (C++) module: this build did not link it.  "
+                             "Build with build.ps1, or with CMake, or add native/*.cpp to your "
+                             "compile command (see docs/ffi.md).";
+                break;
+            }
+            error("cannot find module '" + spec + "'" + (loader_ ? loader_->searchHint(spec) : "") +
+                  kernelHint);
         }
     }
     return s;

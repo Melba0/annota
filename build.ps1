@@ -165,66 +165,78 @@ if ($Verify) {
     Write-Host "[verify] lsp smoke"
     & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\lsp_smoke.ps1") -Exe $exe
     if ($LASTEXITCODE -ne 0) { $failed++ }
-    if ($useQt) {
-        Write-Host "[verify] input: console reads stdin, GUI asks through a dialog"
-    $piped = "annota`nworld" | & $exe (Join-Path $root "examples\input.ant") 2>&1 | Out-String
-    if ($piped -notmatch "0 failures" -or $piped -notmatch "annota") {
-        Write-Host "  FAIL input from stdin"; $failed++
-    } else { Write-Host "  ok   input from stdin" }
-    if ($useQt) {
-        $env:ANNOTA_INPUT = "hello"
-        $gui = & $exe studio (Join-Path $root "examples\input.ant") --run --echo `
-                             --shot (Join-Path $outDir "ide-input.png") 2>&1 | Out-String
-        Remove-Item Env:\ANNOTA_INPUT -ErrorAction SilentlyContinue
-        if ($gui -notmatch "hello") { Write-Host "  FAIL input through the GUI provider"; $failed++ }
-        else { Write-Host "  ok   input through the GUI provider" }
-    }
-    Write-Host "[verify] syntax highlighter: no file ends inside a block comment"
-    $hlBad = 0
-    foreach ($e in $examples) {
-        $path = Join-Path $root "examples\$e"
-        & $exe studio $path --check-highlight *> $null
-        if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL $e (highlight)"; $hlBad++ }
-    }
-    if ($hlBad -eq 0) { Write-Host "  ok   $($examples.Count) files" } else { $failed += $hlBad }
-    Write-Host "[verify] documentation links"
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\doc_links.ps1") -Root $root
-    if ($LASTEXITCODE -ne 0) { $failed++ }
-    Write-Host "[verify] IDE (annota studio) renders headlessly"
-    # A CI runner may have no interactive desktop.  Try the platforms in order, print the first
-    # diagnostic line of every failure, and only skip the check when none of them works - a
-    # silent failure here would hide real breakage.
+    # ---- Qt-dependent checks.  A CI runner usually has no interactive desktop, and `studio`
+    # writes warnings to stderr, so: switch to a non-terminating error preference, detect a
+    # usable Qt platform once, and skip (loudly) whatever needs it instead of failing.
     $savedQpa = $env:QT_QPA_PLATFORM
     $savedEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $shot = Join-Path $outDir "ide-verify.png"
-    $probe = Join-Path $outDir "ide-probe.png"
     $platform = $null
-    foreach ($cand in @("offscreen", "minimal", "windows")) {
-        $env:QT_QPA_PLATFORM = $cand
-        Remove-Item $probe -ErrorAction SilentlyContinue
-        $out = & $exe studio (Join-Path $root "examples\files.ant") --run --shot $probe 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $probe)) { $platform = $cand; break }
-        $first = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-        Write-Host "  note: QT_QPA_PLATFORM=$cand unusable: $first" -ForegroundColor DarkGray
+    $probe = Join-Path $outDir "ide-probe.png"
+    if ($useQt) {
+        Write-Host "[verify] input: console reads stdin, GUI asks through a dialog"
+        $piped = "annota`nworld" | & $exe (Join-Path $root "examples\input.ant") 2>&1 | Out-String
+        if ($piped -notmatch "0 failures" -or $piped -notmatch "annota") {
+            Write-Host "  FAIL input from stdin"; $failed++
+        } else { Write-Host "  ok   input from stdin" }
+
+        foreach ($cand in @("offscreen", "minimal", "windows")) {
+            $env:QT_QPA_PLATFORM = $cand
+            Remove-Item $probe -ErrorAction SilentlyContinue
+            $out = & $exe studio (Join-Path $root "examples\files.ant") --run --shot $probe 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $probe)) { $platform = $cand; break }
+            $first = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+            Write-Host "  note: QT_QPA_PLATFORM=$cand unusable: $first" -ForegroundColor DarkGray
+        }
+        if (-not $platform) {
+            Write-Host "  SKIP the GUI input check (no usable Qt platform on this machine)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  using QT_QPA_PLATFORM=$platform"
+            $env:ANNOTA_INPUT = "hello"
+            $gui = & $exe studio (Join-Path $root "examples\input.ant") --run --echo `
+                                 --shot (Join-Path $outDir "ide-input.png") 2>&1 | Out-String
+            Remove-Item Env:\ANNOTA_INPUT -ErrorAction SilentlyContinue
+            if ($gui -notmatch "hello") { Write-Host "  FAIL input through the GUI provider"; $failed++ }
+            else { Write-Host "  ok   input through the GUI provider" }
+        }
     }
-    if (-not $platform) {
-        Write-Host "  SKIP studio checks (no usable Qt platform on this machine)" -ForegroundColor Yellow
+
+    Write-Host "[verify] syntax highlighter: no file ends inside a block comment"
+    if (-not $useQt -or -not $platform) {
+        Write-Host "  SKIP highlighter check (needs a runnable annota studio)" -ForegroundColor Yellow
     } else {
-        Write-Host "  using QT_QPA_PLATFORM=$platform"
-        Remove-Item $shot -ErrorAction SilentlyContinue
-        & $exe studio (Join-Path $root "examples\analysis\01_basics.ant") --run --shot $shot 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $shot)) { Write-Host "  FAIL studio --shot"; $failed++ }
-        else { Write-Host "  ok   studio --shot ($([int]((Get-Item $shot).Length / 1024)) KB)" }
-        # the IDE must be able to open a program's own `view` window (F7)
-        $preview = & $exe studio (Join-Path $root "examples\gui_counter.ant") --preview `
-                                 --shot (Join-Path $outDir "ide-preview.png") 2>&1 | Out-String
-        if ($preview -notmatch "Counter") { Write-Host "  FAIL studio --preview (no view window)"; $failed++ }
-        else { Write-Host "  ok   studio --preview (view window opened)" }
+        $hlBad = 0
+        foreach ($e in $examples) {
+            $path = Join-Path $root "examples\$e"
+            & $exe studio $path --check-highlight *> $null
+            if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL $e (highlight)"; $hlBad++ }
+        }
+        if ($hlBad -eq 0) { Write-Host "  ok   $($examples.Count) files" } else { $failed += $hlBad }
     }
-    Remove-Item $probe -ErrorAction SilentlyContinue
-    if ($savedQpa) { $env:QT_QPA_PLATFORM = $savedQpa } else { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue }
-    $ErrorActionPreference = $savedEap
+
+    Write-Host "[verify] documentation links"
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\doc_links.ps1") -Root $root
+    if ($LASTEXITCODE -ne 0) { $failed++ }
+
+    if ($useQt) {
+        Write-Host "[verify] IDE (annota studio) renders headlessly"
+        if ($platform) {
+            $shot = Join-Path $outDir "ide-verify.png"
+            Remove-Item $shot -ErrorAction SilentlyContinue
+            & $exe studio (Join-Path $root "examples\analysis\01_basics.ant") --run --shot $shot 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $shot)) { Write-Host "  FAIL studio --shot"; $failed++ }
+            else { Write-Host "  ok   studio --shot ($([int]((Get-Item $shot).Length / 1024)) KB)" }
+            # the IDE must be able to open a program's own `view` window (F7)
+            $preview = & $exe studio (Join-Path $root "examples\gui_counter.ant") --preview `
+                                     --shot (Join-Path $outDir "ide-preview.png") 2>&1 | Out-String
+            if ($preview -notmatch "Counter") { Write-Host "  FAIL studio --preview (no view window)"; $failed++ }
+            else { Write-Host "  ok   studio --preview (view window opened)" }
+        } else {
+            Write-Host "  SKIP studio checks (no usable Qt platform on this machine)" -ForegroundColor Yellow
+        }
+        Remove-Item $probe -ErrorAction SilentlyContinue
+        if ($savedQpa) { $env:QT_QPA_PLATFORM = $savedQpa } else { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue }
+        $ErrorActionPreference = $savedEap
     } else {
         Write-Host "[verify] studio checks skipped (no Qt in this build)" -ForegroundColor Yellow
     }

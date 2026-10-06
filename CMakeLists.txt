@@ -7,9 +7,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-file(GLOB ANNOTA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+# The interpreter plus the C++ kernels that the standard library calls through the FFI
+# (`native/seq_native.cpp` registers `seqnative`).  Plugins under plugins/ are built separately
+# with `annota plugin build`.
+file(GLOB ANNOTA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/native/*.cpp")
 add_executable(annota ${ANNOTA_SOURCES})
 target_include_directories(annota PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+# Export the interpreter's symbols so a plugin compiled separately can resolve them at load time
+# (`-rdynamic` on Linux; the equivalent import library on Windows).
+set_target_properties(annota PROPERTIES ENABLE_EXPORTS ON)
 
 if(WIN32)
   target_link_libraries(annota PRIVATE ws2_32)

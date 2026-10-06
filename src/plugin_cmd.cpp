@@ -27,11 +27,6 @@ bool fileExists(const std::string& p) {
     return true;
 }
 
-std::string dirOf(const std::string& p) {
-    size_t q = p.find_last_of("/\\");
-    return q == std::string::npos ? std::string(".") : p.substr(0, q);
-}
-
 std::string stemOf(const std::string& p) {
     size_t q = p.find_last_of("/\\");
     std::string b = q == std::string::npos ? p : p.substr(q + 1);
