@@ -238,6 +238,10 @@ void Compiler::compileContracts(const std::vector<Annotation>& anns, const char*
 void Compiler::stmt(const StmtP& s) {
     stmtOrigin_ = s->origin;          // "" for the main program, the module path for `use`d code
     stmtUnsafe_ = s && hasAnn(s->annotations, "unsafe");
+    // `[[jit]]` names a compilation unit - a function - so on any other statement it does nothing;
+    // saying so beats letting it look like the annotation simply had no effect.
+    if (s && s->kind != SK::FuncDef && !s->annotations.empty() && hasAnn(s->annotations, "jit"))
+        warn("[[jit]] 只对函数定义有效：编译单位是函数，标注在其它语句上会被忽略");
     if (!s) return;
     switch (s->kind) {
         case SK::Annot: {
@@ -859,9 +863,10 @@ void Compiler::stmtFuncDef(const StmtP& s) {
             if (p.vararg || p.borrow) continue;
             NumKind k = numKindByName(p.type);
             const bool integer = k == NumKind::I8 || k == NumKind::I16 || k == NumKind::I32 ||
-                                 k == NumKind::I64;
+                                 k == NumKind::I64 || k == NumKind::U8 || k == NumKind::U16 ||
+                                 k == NumKind::U32 || k == NumKind::U64;
             if (!integer)
-                error("[[jit]] 要求每个参数都有整型类型提示（int8/int16/int32/int64，即 int 或 long）；参数 '" +
+                error("[[jit]] 要求每个参数都有整型类型提示（int8/int16/int32/int64 - 即 int/long - 或对应的无符号类型）；参数 '" +
                           p.name + "' 目前是 " + (p.type.empty() ? std::string("未标注") : "'" + p.type + "'"),
                       s->line);
         }

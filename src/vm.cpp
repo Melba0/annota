@@ -785,7 +785,8 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
     Value r = out.kind == 3 ? Value::null()
             : out.kind == 2 ? Value::boolean(out.value != 0)
-            : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
+            : out.kind == 5 ? Value::typedInt(out.value, NumKind::U64)
+                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
                             : Value::integer(out.value);
     stack.resize(fr.stackBase);
     recycleFrame(fr);
@@ -1500,7 +1501,8 @@ Value VM::execute(size_t stopDepth) {
                                 if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
                                 Value r = out.kind == 3 ? Value::null()
                                         : out.kind == 2 ? Value::boolean(out.value != 0)
-                                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
+                                        : out.kind == 5 ? Value::typedInt(out.value, NumKind::U64)
+                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
                                                         : Value::integer(out.value);
                                 Frame fr = std::move(frames.back());
                                 frames.pop_back();

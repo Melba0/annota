@@ -206,6 +206,30 @@ public:
         if (slot * 8 < 128) { u8(0x40 | kBase); u8((uint8_t)(slot * 8)); }
         else { u8(0x80 | kBase); u32((uint32_t)(slot * 8)); }
     }
+    // The machine code keeps its own copy of the locals: the interpreter's L[] is the source at
+    // entry, and kBase is repointed at the private area, which is what later lets a slot hold a
+    // value in its own width (or, for a 128 bit value, two consecutive slots) instead of the exact
+    // 64 bit form the interpreter would see.
+    void localsPrologue(int numLocals, size_t localsBase) {
+        for (int i = 0; i < numLocals; i++) {
+            loadLocalToRax(i);                                  // rax = L[i]
+            u8(0x48); u8(0x89); u8(0x84); u8(0x24);
+            u32((uint32_t)(localsBase + (size_t)i * 8));        // mov [rsp+base+i*8], rax
+        }
+        u8(0x48); u8(0x8D);
+        u8(kBase == 0x01 ? 0x8C : 0xBC); u8(0x24);
+        u32((uint32_t)localsBase);                              // lea rcx/rdi, [rsp+localsBase]
+    }
+    void loadLocalToEax(int slot) {                 // 32 bit: the write zeroes the upper half
+        u8(0x8B);
+        if (slot * 8 < 128) { u8(0x40 | kBase); u8((uint8_t)(slot * 8)); }
+        else { u8(0x80 | kBase); u32((uint32_t)(slot * 8)); }
+    }
+    void addEaxLocal(int slot) {                    // add eax, [kBase+slot*8]
+        u8(0x03);
+        if (slot * 8 < 128) { u8(0x40 | kBase); u8((uint8_t)(slot * 8)); }
+        else { u8(0x80 | kBase); u32((uint32_t)(slot * 8)); }
+    }
     void cmpRaxWithLocal(int slot) {
         u8(0x48); u8(0x3B);
         if (slot * 8 < 128) { u8(0x40 | kBase); u8((uint8_t)(slot * 8)); }
@@ -230,6 +254,7 @@ public:
     }
 
     void movRaxImm(int32_t v) { u8(0x48); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
+    void movRaxImm64(uint64_t v) { u8(0x48); u8(0xB8); for (int b = 0; b < 8; b++) u8((uint8_t)((v >> (8 * b)) & 0xff)); }
     void movR8Imm(int32_t v) { u8(0x49); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
     void addRaxR8() { u8(0x4C); u8(0x01); u8(0xC0); }
     void subRaxR8() { u8(0x4C); u8(0x29); u8(0xC0); }
@@ -392,6 +417,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 x.target = (int)((int64_t)(ip + 5) + (int16_t)((code[ip + 3] << 8) | code[ip + 4]));
                 break;
             case OP_RETURN: case OP_RETURN_NULL: x.next = ip + 1; break;
+            case OP_CONST: x.next = ip + 3; x.a = (code[ip + 1] << 8) | code[ip + 2]; break;
             case OP_CONVERT: x.next = ip + 2; x.imm = code[ip + 1]; break;
             case OP_CALL_DIRECT:
                 x.next = ip + 4;
@@ -468,7 +494,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         if (!t.code || !t.chunk || !t.code->fn) return none;
         if (std::getenv("ANNOTA_JIT_DEBUG") && (t.code->retByte < 0 || t.code->retByte > 2))
             std::fprintf(stderr, "[jit] call target %s retByte %d\n", nm.c_str(), t.code->retByte);
-        if (t.code->retByte < 0 || t.code->retByte > 2) return none;
+        if (t.code->retByte < 0 || (t.code->retByte > 2 && t.code->retByte != 5)) return none;
         if (std::getenv("ANNOTA_JIT_DEBUG") && (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm))
             std::fprintf(stderr, "[jit] call target %s arity %zu vs %d (method %d)\n", nm.c_str(), t.chunk->params.size(), x.imm, (int)t.chunk->isMethod);
         if (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm) return none;
@@ -575,13 +601,25 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     break;
                 }
                 case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: case OP_JUMP_IF_NOT_LT_LOCAL_IMM: break;
+                case OP_CONST: {
+                    // pool constants that are plain 64 bit integers; strings, floats, containers and
+                    // the 128 bit widths stay interpreted
+                    if ((size_t)x.a >= ch->consts.size()) return jitFail(__LINE__);
+                    const Value& c0 = ch->consts[(size_t)x.a];
+                    if (c0.t != VT::Int || c0.o || (int)c0.k > (int)NumKind::U64) return jitFail(__LINE__);
+                    pushKind(jitBit(c0.k));
+                    break;
+                }
                 case OP_CONVERT: {
                     // the compiler converts every typed parameter at entry; the JIT's entry check
                     // already requires exactly that kind, so the conversion is the identity here -
                     // any other conversion (a real `int(x)`, a boxed width) stays interpreted
                     if (d < 1 || x.imm > (int)NumKind::U64) return jitFail(__LINE__);
                     int sole = jitSoleKind(vk.back());
-                    if (sole != x.imm) return jitFail(__LINE__);
+                    // the identity (the entry check already guarantees a typed parameter's kind), or an
+                    // untyped integer being given a declared width - which is a wrap and nothing else
+                    if (sole < 0) return jitFail(__LINE__);
+                    if (sole != x.imm && sole != (int)NumKind::None) return jitFail(__LINE__);
                     vk.back() = jitBit((NumKind)x.imm);
                     break;
                 }
@@ -596,8 +634,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     }
                     for (int k = 0; k < x.imm; k++) vk.pop_back();
                     pushKind(t.code->retByte == 2 ? kJitBool
+                             : t.code->retByte == 5 ? jitBit(NumKind::U64)
                              : t.code->retByte == 1 ? jitBit(NumKind::I64) : kJitNone);
-                    break;
                 }
                 case OP_RETURN:
                     if (d < 1) return jitFail(__LINE__);
@@ -799,9 +837,34 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     size_t kindSlots = (size_t)ch->numLocals;
     e.kindBase = (size_t)std::max(1, maxDepth + 1) * 8;
     e.frameBytes = (size_t)std::max(16, ((int)(e.kindBase + kindSlots + 15)) / 16 * 16);
+    // the locals get their own area inside the frame, above the kind bytes; offsets of the kind
+    // bytes and the virtual registers are unchanged, only the total frame grows
+    const size_t localsBase = e.frameBytes;
+    const size_t localsBytes = ((size_t)ch->numLocals * 8 + 15) / 16 * 16;
+    e.frameBytes += localsBytes;
     e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);      // sub rsp, frameBytes
+    e.localsPrologue((int)ch->numLocals, localsBase);                        // private copy of L[]
     // The analysis proved that the only instruction which can have produced the array in a virtual
     // register is the `get_local` of a JIT array local: find it and report its element kind.
+    // Comparisons must use the condition codes of the operands' signedness: an untyped or signed
+    // width compares signed, an unsigned width compares unsigned, and a set that mixes both is
+    // refused (the interpreter would promote it in a way the machine code cannot express here).
+    // Is a comparison of these two kind sets unsigned?  When both operands have a single known kind
+    // the language's own promotion decides (so `uint32 < uint32` compares unsigned, `int64 < uint32`
+    // does not); an unknown width falls back to signed, which is what the interpreter does for
+    // untyped integers and what this backend did before.  Signedness of the *result* kind is read
+    // from numTraits, so there is no second copy of the language's rules here.
+    // The kind byte a value carries out of compiled code, shared by every place that writes one:
+    // 0 = int, 1 = int64, 2 = bool, 5 = uint64 (the bits are the value, but the interpreter must
+    // build the right Value from it - a uint64 result of -4 bits prints as 18446744073709551612).
+    auto retCodeOf = [](int sole) -> int {
+        return sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : sole == (int)NumKind::U64 ? 5 : 0;
+    };
+    auto jitUnsignedCmp = [](JitKindSet a, JitKindSet b) -> int {
+        int ka = jitSoleKind(a), kb = jitSoleKind(b);
+        if (ka < 0 || kb < 0 || ka > (int)NumKind::U64 || kb > (int)NumKind::U64) return 0;
+        return numTraits(promoteNum((NumKind)ka, (NumKind)kb)).isSigned ? 0 : 1;
+    };
     auto jitArrayKindOf = [&](size_t at, int objVr) -> int {
         for (size_t k = at; k-- > 0;) {
             if (depth[k] != objVr) continue;
@@ -836,7 +899,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     int sole = jitSoleKind(vrKind[i][(size_t)d - 1]);
                     if (sole < 0) return jitFail(__LINE__);
                     e.storeKindByte(e.kindBase + (size_t)x.a,
-                                    sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : 0);
+                                    retCodeOf(sole));
                 }
                 break;
             case OP_LOCAL_ADD_IMM:
@@ -847,40 +910,62 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 { int wsole = jitSoleKind(kindAt[i][(size_t)x.a]); if (wsole >= 0) e.wrapRax(wsole); }
                 e.storeRaxToLocal(x.a);
                 break;                                  // x = x + k preserves the kind byte
-            case OP_LOCAL_ADD_LOCAL:
-                e.loadLocalToRax(x.a);
-                e.loadLocalToR8(x.b);
-                e.addRaxR8();
-                { int wsole = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]));
-                  if (wsole >= 0) e.wrapRax(wsole); }
+            case OP_LOCAL_ADD_LOCAL: {
+                int pkl = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]));
+                if (pkl == (int)NumKind::U32) {
+                    // 32 bit form: writing eax zeroes the upper half, which is exactly the
+                    // canonical uint32 form, so the narrowing fixup is unnecessary
+                    e.loadLocalToEax(x.a);
+                    e.addEaxLocal(x.b);
+                } else {
+                    e.loadLocalToRax(x.a);
+                    e.loadLocalToR8(x.b);
+                    e.addRaxR8();
+                    if (pkl >= 0) e.wrapRax(pkl);
+                }
                 e.storeRaxToLocal(x.a);
                 if (tracked[(size_t)x.a]) {
                     int sole = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a],
                                                          kindAt[i][(size_t)x.b]));
                     if (sole < 0) return jitFail(__LINE__);
                     e.storeKindByte(e.kindBase + (size_t)x.a,
-                                    sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : 0);
+                                    retCodeOf(sole));
                 }
                 break;
-            case OP_ADD: case OP_SUB: case OP_MUL:
+            }
+            case OP_ADD: case OP_SUB: case OP_MUL: {
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
-                if (x.op == OP_ADD) e.addRaxR8();
-                else if (x.op == OP_SUB) e.subRaxR8();
-                else e.imulRaxR8();
-                {
-                    int wsole = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
-                                                            vrKind[i][(size_t)d - 1]));
-                    if (wsole >= 0) e.wrapRax(wsole);
+                int pk = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
+                                                   vrKind[i][(size_t)d - 1]));
+                if (pk == (int)NumKind::U32) {
+                    // A write to a 32 bit register zeroes the upper half, which is already the
+                    // canonical form of a uint32, so the fixup the other widths need is free here.
+                    if (x.op == OP_ADD) { e.u8(0x44); e.u8(0x01); e.u8(0xC0); }        // add eax, r8d
+                    else if (x.op == OP_SUB) { e.u8(0x44); e.u8(0x29); e.u8(0xC0); }   // sub eax, r8d
+                    else { e.u8(0x44); e.u8(0x0F); e.u8(0xAF); e.u8(0xC0); }           // imul eax, r8d
+                } else {
+                    if (x.op == OP_ADD) e.addRaxR8();
+                    else if (x.op == OP_SUB) e.subRaxR8();
+                    else e.imulRaxR8();
+                    if (pk >= 0) e.wrapRax(pk);
                 }
                 e.storeRaxToVr(d - 2);
+                break;
+            }
                 break;
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
                 e.cmpRaxR8();
-                uint8_t cc = x.op == OP_EQ ? 0x94 : x.op == OP_NE ? 0x95 : x.op == OP_LT ? 0x9C
-                           : x.op == OP_GT ? 0x9F : x.op == OP_LE ? 0x9E : 0x9D;
+                int uns = jitUnsignedCmp(vrKind[i][(size_t)d - 2], vrKind[i][(size_t)d - 1]);
+                uint8_t cc;
+                if (x.op == OP_EQ) cc = 0x94;
+                else if (x.op == OP_NE) cc = 0x95;
+                else if (x.op == OP_LT) cc = uns ? 0x92 : 0x9C;
+                else if (x.op == OP_GT) cc = uns ? 0x97 : 0x9F;
+                else if (x.op == OP_LE) cc = uns ? 0x96 : 0x9E;
+                else cc = uns ? 0x93 : 0x9D;
                 e.setcc(cc);
                 e.storeRaxToVr(d - 2);
                 break;
@@ -893,16 +978,20 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.testRaxRax();
                 e.jccPlaceholder(0x84, (size_t)x.target);            // jz
                 break;
-            case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL:
+            case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: {
+                int unsLL = jitUnsignedCmp(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]);
                 e.loadLocalToRax(x.a);
                 e.cmpRaxWithLocal(x.b);
-                e.jccPlaceholder(0x8D, (size_t)x.target);            // jge (not less)
+                e.jccPlaceholder(unsLL ? 0x83 : 0x8D, (size_t)x.target);   // jae/jge (not less)
                 break;
-            case OP_JUMP_IF_NOT_LT_LOCAL_IMM:
+            }
+            case OP_JUMP_IF_NOT_LT_LOCAL_IMM: {
+                int unsLI = jitUnsignedCmp(kindAt[i][(size_t)x.a], kJitNone);
                 e.loadLocalToRax(x.a);
                 e.cmpRaxImm(x.imm);
-                e.jccPlaceholder(0x8D, (size_t)x.target);
+                e.jccPlaceholder(unsLI ? 0x83 : 0x8D, (size_t)x.target);
                 break;
+            }
             case OP_NEW_ARRAY: {
                 // 1-D numeric array: allocate [len][data...] in the per-invocation arena; the
                 // pointer replaces the dimension on the virtual stack
@@ -1021,7 +1110,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     e.storeResultWithKindInR8();
                     noteRetByte(-2);
                 } else if (sole >= 0) {
-                    int byte = sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : 0;
+                    int byte = retCodeOf(sole);
                     e.storeResult(byte);
                     noteRetByte(byte);
                 } else {
@@ -1030,8 +1119,18 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.epilogue();
                 break;
             }
+            case OP_CONST: {
+                // a pool constant the analysis proved to be a plain 64 bit integer
+                const Value& c1 = ch->consts[(size_t)x.a];
+                if (c1.i >= -2147483648LL && c1.i <= 2147483647LL) e.movRaxImm((int32_t)c1.i);
+                else e.movRaxImm64((uint64_t)c1.i);
+                e.storeRaxToVr(d);
+                break;
+            }
             case OP_CONVERT:
-                // identity conversion only (proved by the analysis): nothing to emit
+                // a typed parameter's conversion is the identity (the entry check proved it); an
+                // untyped integer being given a declared width only wraps into that width
+                if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::None) e.wrapRax(x.imm);
                 break;
             case OP_RETURN_NULL:
                 e.nullReturn();
@@ -1083,6 +1182,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         if (depth[di->second] != 0) continue;            // only enter with an empty operand stack
         size_t off = e.c.size();
         e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);   // sub rsp, frame
+        e.localsPrologue((int)ch->numLocals, localsBase);                    // and the same locals
         e.u8(0xE9);
         int64_t rel = (int64_t)e.labelAt[ip] - (int64_t)(e.c.size() + 4);
         e.u32((uint32_t)(int32_t)rel);                                       // jmp loop header

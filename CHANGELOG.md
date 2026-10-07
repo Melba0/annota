@@ -96,6 +96,54 @@ major change, and a new check is a minor one.
 
 ### Fixed
 
+* **Unsigned 64 bit results lost their signedness on the way back.**  The result code in `JitOut` only
+  distinguished int/int64/bool/null, so a `uint64` value whose top bit was set came back as a signed
+  number: a loop over `uint64` printed `-4` where the interpreter printed `18446744073709551612`
+  (the bits were right, the interpretation was not).  Every place that writes a local's kind byte
+  and the return path now share one mapping (0 int / 1 int64 / 2 bool / 5 uint64), and the direct-call
+  result kind carries it through as well.  Found by cross-checking every integer kind against the
+  interpreter with the JIT on and off; that matrix now agrees bit for bit.
+
+* **The machine code now keeps its own copy of the locals** (`localsPrologue`): the prologue copies
+  the interpreter's `L[]` into a private area inside the frame and repoints the base register at it,
+  and the on-stack-replacement trampoline does the same.  Nothing observably changed yet - the slots
+  still hold exact 64 bit values - but this removes the constraint that made a slot unable to hold a
+  value in its own width, which is the prerequisite for the remaining work in `docs/jit-internals.md`
+  (raw-width slots, then two consecutive slots for a 128 bit value).
+* Comparison signedness now comes from the language itself: with two known operand kinds the code
+  follows `promoteNum`/`numTraits`, and an unknown width falls back to signed (what the interpreter
+  does for untyped integers).  The previous set-based test wrongly refused to compile loops with an
+  untyped parameter, which silently sent the plain int loop back to the interpreter.
+
+* **Narrow integer arithmetic now uses narrow instructions where the target width allows it.**  A
+  `uint32` add/sub/mul (and the fused `a += b` form) is emitted as a 32 bit operation: writing a 32
+  bit register already zeroes the upper half, which *is* the canonical `uint32` representation, so
+  the narrowing fixup other widths need disappears.  A 2 million iteration `uint32` loop went from
+  140 ms (interpreted) to 4 ms.  `docs/jit-internals.md` records the remaining width work (a private
+  locals frame so slots can hold raw widths) and the full specification for 128 bit support,
+  including the exact ABI changes it needs.
+
+* **Comparisons in compiled code ignored signedness.**  `<`, `>`, `<=` and `>=` always used the
+  signed condition codes (`setl`/`setg`/`setle`/`setge`), so an unsigned comparison produced the
+  wrong answer the moment machine code took over: a loop comparing `2^64-1 < 1` reported 6000 hits
+  out of 10000 instead of 0 (the first 4000 iterations, still interpreted, were right).  The backend
+  now takes the condition code from the operands' promoted kind - signed for untyped/signed widths,
+  unsigned for unsigned ones, and a set that mixes both stays interpreted - in the plain comparisons
+  and in the compare-and-branch superinstructions alike.  `[[jit]]` also accepts unsigned type hints
+  (`uint8` ... `uint64`) now that the backend handles them correctly.
+
+* **`OP_CONST` is translatable now.**  A function that mentions a literal too large for the one-byte
+  immediate form (a modulus, a mask, a big constant) carries an `OP_CONST` pool entry, and the
+  decoder rejected the whole chunk - so `[[jit]]` silently did nothing on exactly the loops people
+  write with a modulus.  `new x:int64 = 1` had the same problem from the other side: "an untyped
+  value is given a declared width" was rejected as a non-identity conversion; it is now a wrap into
+  that width, which is what the interpreter does.  A 10^6-iteration loop reduced modulo 2^61-1 went
+  from 105 ms to **2 ms**.
+* `[[jit]]` on anything but a function definition now warns instead of being ignored in silence: the
+  compilation unit is a whole function, and a top-level loop belongs to `<main>`, which also holds
+  globals and `print`, so it can never be compiled.  128 bit types (`longlong` / `ulonglong`) and
+  global variables remain outside the backend and stay interpreted.
+
 * **Deep copy of containers actually copies them.**  `copyRec` (the engine behind `deepCopy`)
   had no case for `List`, `Tuple` or `Map`, so `new b = a` shared `a`'s list: `b[0] = 99` was
   visible through `a`.  This also silently disabled the documented by-value argument semantics,
