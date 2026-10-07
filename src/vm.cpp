@@ -76,6 +76,32 @@ void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed) {
     out += '\n';
     gJitVm->write(out);
 }
+
+// The interpreter's operand stack, as seen by a trampoline that takes over in the middle of a loop.
+// It is set right before an on-stack-replacement entry is called and holds values that stay alive
+// for the whole native call.
+const Value* gJitStackBase = nullptr;
+
+// Rebuild the live virtual registers a loop header expects.  The VM has already checked each one
+// against its descriptor, so this only has to move the values: an integer becomes its payload, a
+// boolean becomes 0/1, and a range iterator is unpacked into the two private slots the machine code
+// keeps for it (current value and upper bound) - exactly the state `iter_range` would have built.
+void annotaJitOsrInit(const JitOsrFrame* f) {
+    if (!f || !gJitStackBase) return;
+    for (int64_t i = 0; i < f->depth; i++) {
+        const Value& v = gJitStackBase[i];
+        if (f->desc[i] == kJitOsrIter) {
+            if (f->iter) {
+                Obj* o = v.o.get();
+                f->iter[i * 2] = o->iterCur;
+                f->iter[i * 2 + 1] = o->iterStop;
+            }
+            continue;
+        }
+        if (f->desc[i] == kJitOsrBool) { f->vr[i] = v.b ? 1 : 0; continue; }
+        f->vr[i] = v.i;
+    }
+}
 } // namespace annota
 namespace annota {
 
@@ -615,6 +641,32 @@ static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
             NumKind k = fr.locals[s]->k;
             if (k != NumKind::None && k != NumKind::I64) return false;
         }
+    }
+    return true;
+}
+
+// Can the interpreter hand this loop header over to the native code right now?  Every live virtual
+// register has to hold what the backend's descriptor expects, so a loop whose operands changed type
+// since the last check simply keeps running interpreted.
+static bool jitOsrOk(const std::shared_ptr<JitCode>& jc, size_t ip, const Frame& fr,
+                     const std::vector<Value>& stack) {
+    auto it = jc->osrDesc.find(ip);
+    if (it == jc->osrDesc.end()) return false;
+    const std::vector<uint8_t>& desc = it->second;
+    if (fr.stackBase + desc.size() > stack.size()) return false;
+    for (size_t i = 0; i < desc.size(); i++) {
+        const Value& v = stack[fr.stackBase + i];
+        if (desc[i] == kJitOsrIter) {
+            if (v.t != VT::Iter || !v.o || v.o->iterKind != IterKind::Range) return false;
+            if (v.o->iterStep != 1) return false;          // only the `to` form is translated
+            continue;
+        }
+        if (v.t == VT::Bool) {
+            if (desc[i] != kJitOsrBool) return false;      // a bool may only feed a comparison
+            continue;
+        }
+        if (v.t != VT::Int) return false;
+        if (!jitOsrDescOk(desc[i], v.numKind())) return false;
     }
     return true;
 }
@@ -1545,6 +1597,7 @@ Value VM::execute(size_t stopDepth) {
                         if (f.chunk->jit) {
                             auto entry = f.chunk->jit->osrEntries.find(back);
                             if (entry != f.chunk->jit->osrEntries.end() && jitLocalsOk(f.chunk->jit, f) &&
+                                jitOsrOk(f.chunk->jit, back, f, stack) &&
                                 !(f.buildOnReturn && f.klass)) {
                                 int64_t L[64];
                                 size_t count = std::min<size_t>(f.locals.size(), 64);
@@ -1556,7 +1609,12 @@ Value VM::execute(size_t stopDepth) {
                                 JitOut out;
                                 gJitDivErr = 0;
                                 gJitVm = this;
+                                gJitStackBase = stack.data() + base;
                                 entry->second(L, &out);
+                                gJitStackBase = nullptr;
+                                if (std::getenv("ANNOTA_JIT_DEBUG"))
+                                    std::fprintf(stderr, "[jit] osr entry: %s at %zu\n",
+                                                 f.chunk->fnName.c_str(), back);
                                 jitArenaReset();
                                 if (gJitDivErr) {
                                     int e = gJitDivErr;

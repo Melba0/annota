@@ -43,6 +43,18 @@ major change, and a new check is a minor one.
   working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
 * `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
   `examples/jit.ant`.
+* **Range iteration in compiled code, and on-stack replacement for it.**  `for i in a to b` compiled
+  to the iterator protocol (`iter_range` / `iter_next`), which the backend did not translate - so a
+  `for` loop sent the whole function back to the interpreter, and because the iterator sat on the
+  operand stack the hot-loop entry point could not be used either.  The backend now keeps the
+  iterator's state in its own private slots (the upper bound and the current value), pushes the
+  element and advances exactly where the interpreter would, and supports empty ranges, descending
+  bounds and nested loops.  On top of that, on-stack replacement no longer requires an empty operand
+  stack: the VM checks every live value against a per-entry descriptor and rebuilds the registers in
+  the native frame (integers, booleans, and range iterators, which grow back into their private
+  slots).  A `for i in 1 to n` loop that used to run entirely interpreted - 2 000 000 iterations in
+  950 ms - now takes over mid-loop and finishes in **64 ms** (all three loops in the test), with the
+  same output.  See `docs/jit-internals.md` §6.
 * **`print` inside compiled code.**  A function that printed anything was rejected outright, which
   is why a compiled loop could not report its progress.  The machine code now lays its operands out
   as real `Value`s in its own frame (or points straight at the pool constant, which is why string

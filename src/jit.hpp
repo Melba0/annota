@@ -102,6 +102,8 @@ struct JitCode {
     std::vector<uint8_t> slotKind;       // per local: the exact NumKind+1 required, 0 = don't care
     // loop headers that can be entered directly (hot-loop promotion): bytecode ip -> entry
     std::map<size_t, JitFn> osrEntries;
+    // what each such entry needs on the interpreter's operand stack (one byte per live register)
+    std::map<size_t, std::vector<uint8_t>> osrDesc;
     JitFn fn = nullptr;
     // kind byte every `return` writes (0 int, 1 int64, 2 bool, 3 null); -2 when it varies, which
     // makes the function unusable as a direct call target from other native code
@@ -174,6 +176,26 @@ inline const Value& jitPrintConstant(uint8_t op) {
     return op == OP_TRUE ? kTrue : op == OP_FALSE ? kFalse : kNull;
 }
 
+// ---- on-stack replacement
+// When the interpreter switches to native code in the middle of a loop, every value the loop header
+// expects has to be rebuilt inside the native frame.  One descriptor byte per live virtual register
+// says what that register has to hold, and the VM checks it against the interpreter's stack before
+// the trampoline runs - a mismatch simply keeps the loop interpreted.
+constexpr uint8_t kJitOsrAny = 0;          // any integer width
+constexpr uint8_t kJitOsrWide64 = 1;       // an untyped int or an int64 (the non-wrapping widths)
+constexpr uint8_t kJitOsrBool = 254;       // a comparison result
+constexpr uint8_t kJitOsrIter = 255;       // a range iterator (state kept in the private slots)
+
+// What the trampoline tells the VM's reconstruction helper; the machine code fills this in its own
+// frame and passes one pointer to it.
+struct JitOsrFrame {
+    int64_t* vr;              // where the virtual registers live
+    int64_t* iter;            // the private range-iterator slots
+    const uint8_t* desc;      // one entry per live virtual register
+    int64_t depth;
+};
+void annotaJitOsrInit(const JitOsrFrame* f);
+
 // promote every pair and collect the outcomes
 static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
     JitKindSet out = 0;
@@ -200,6 +222,23 @@ static inline int jitSoleKind(JitKindSet s) {
     if (s == 0 || (s & (s - 1)) != 0) return -1;
     for (int i = 0; i <= (int)NumKind::U64; i++) if (s == ((JitKindSet)1 << i)) return i;
     return -1;
+}
+
+// The on-stack-replacement descriptor for one live virtual register, and the matching check.
+static inline uint8_t jitOsrDescOf(JitKindSet k) {
+    if (k == kJitRange) return kJitOsrIter;
+    int sole = jitSoleKind(k);
+    if (sole == 15) return kJitOsrBool;
+    if (sole >= 0) return (uint8_t)(jitKindCode((NumKind)sole) + 2);
+    if (k == kJitAllInts) return kJitOsrAny;
+    return kJitOsrWide64;
+}
+
+static inline bool jitOsrDescOk(uint8_t d, NumKind k) {
+    if (d == kJitOsrAny) return true;
+    if (d == kJitOsrWide64) return k == NumKind::None || k == NumKind::I64;
+    if (d == kJitOsrBool || d == kJitOsrIter) return false;
+    return (int)d - 2 == jitKindCode(k);
 }
 
 static inline int jitOpBytesUnused(uint8_t op) {
@@ -447,6 +486,11 @@ public:
     }
     // Frame-relative helpers for the temporary `Value` array that `print` hands to the VM.
     void storeRaxToFrame(size_t off) { u8(0x48); u8(0x89); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void loadFrameToRax(size_t off) { u8(0x48); u8(0x8B); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void loadFrameToR8(size_t off) { u8(0x4C); u8(0x8B); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void loadFrameToR11(size_t off) { u8(0x4C); u8(0x8B); u8(0x9C); u8(0x24); u32((uint32_t)off); }
+    void storeR11ToFrame(size_t off) { u8(0x4C); u8(0x89); u8(0x9C); u8(0x24); u32((uint32_t)off); }
+    void addR11Imm8(uint8_t v) { u8(0x49); u8(0x83); u8(0xC3); u8(v); }
     void storeAlToFrame(size_t off) { u8(0x88); u8(0x84); u8(0x24); u32((uint32_t)off); }
     void storeByteToFrame(size_t off, uint8_t v) {
         u8(0xC6); u8(0x84); u8(0x24); u32((uint32_t)off); u8(v);
@@ -535,6 +579,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     std::unordered_map<size_t, size_t> indexOf;
     int maxPrintArgs = 0;                              // frame space for the values `print` passes
     bool hasPrint = false;
+    bool hasRange = false;                             // frame space for the range iterators
     size_t ip = 0;
     while (ip < code.size()) {
         JitIns x;
@@ -545,6 +590,13 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_NOP: x.next = ip + 1; break;
             case OP_TRUE: case OP_FALSE: case OP_NULL: x.next = ip + 1; break;
             case OP_INT1: x.next = ip + 2; x.imm = (int8_t)code[ip + 1]; break;
+            case OP_POP: x.next = ip + 1; break;
+            case OP_ITER_RANGE: x.next = ip + 1; hasRange = true; break;
+            case OP_ITER_NEXT:
+                // s16: where to go once the range is exhausted; otherwise the next element follows
+                x.next = ip + 3;
+                x.target = (int)((int64_t)(ip + 3) + (int16_t)((code[ip + 1] << 8) | code[ip + 2]));
+                break;
             case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_INIT_LOCAL:
                 x.next = ip + 2; x.a = code[ip + 1]; break;
             case OP_GET_INDEX: case OP_SET_INDEX:
@@ -781,6 +833,27 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     break;
                 }
                 case OP_JUMP: case OP_LOOP: break;
+                case OP_ITER_RANGE: {
+                    // `for i in a to b`: the interpreter builds a heap iterator whose bounds are
+                    // evaluated once; the backend keeps the same state in two private slots (the
+                    // upper bound and the current value) and leaves a marker in the slot the
+                    // interpreter's iterator object would occupy, so every depth still lines up.
+                    if (d < 2) return jitFail(__LINE__);
+                    if (!jitPlainKind(vk[(size_t)d - 2]) || !jitPlainKind(vk[(size_t)d - 1]))
+                        return jitFail(__LINE__);
+                    vk.pop_back();
+                    vk.back() = kJitRange;
+                    break;
+                }
+                case OP_ITER_NEXT: {
+                    if (d < 1 || vk.back() != kJitRange) return jitFail(__LINE__);
+                    vk.push_back(kJitNone);             // Value::integer(cur): an untyped int
+                    break;
+                }
+                case OP_POP:
+                    if (d < 1) return jitFail(__LINE__);
+                    vk.pop_back();
+                    break;
                 case OP_JUMP_IF_FALSE: {
                     if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
                     vk.pop_back();
@@ -916,6 +989,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                             x.op == OP_LE || x.op == OP_GE) ? d - 1
                          : (int)vk.size();
             if ((int)vk.size() != newDepth) return jitFail(__LINE__);   // codegen safety net
+            // `iter_next` is the one instruction whose two edges leave the stack at different
+            // depths: the fallthrough pushes the element, the exhausted jump keeps only the
+            // iterator.  Both edges inherit the same locals, but their stacks differ.
+            int jumpDepth = newDepth;
+            std::vector<JitKindSet> jumpVk = vk;
+            if (x.op == OP_ITER_NEXT) {
+                jumpDepth = d;
+                jumpVk = vrKind[i];
+            }
             if (!jumpOnly && to < n) {
                 std::vector<JitKindSet> nk = kindAt[i];
                 std::vector<uint8_t> na = assignedAt[i];
@@ -943,6 +1025,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 }
             }
             bool isJump = x.op == OP_JUMP || x.op == OP_LOOP || x.op == OP_JUMP_IF_FALSE ||
+                          x.op == OP_ITER_NEXT ||
                           x.op == OP_JUMP_IF_NOT_LT_LOCAL_LOCAL ||
                           x.op == OP_JUMP_IF_NOT_LT_LOCAL_IMM;
             if (isJump && x.target >= 0 && (size_t)x.target <= code.size()) {
@@ -954,12 +1037,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     std::vector<uint8_t> na = assignedAt[i];
                     applyLocals(nk, na);
                     if (depth[ti] == kUnset) {
-                        depth[ti] = newDepth;
+                        depth[ti] = jumpDepth;
                         kindAt[ti] = nk;
                         assignedAt[ti] = na;
-                        vrKind[ti] = vk;
+                        vrKind[ti] = jumpVk;
                         changed = true;
-                    } else if (depth[ti] != newDepth) {
+                    } else if (depth[ti] != jumpDepth) {
                         return jitFail(__LINE__);
                     } else {
                         for (size_t s = 0; s < nk.size(); s++) {
@@ -1087,6 +1170,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     const size_t printBase = e.frameBytes;
     const size_t printRefBase = printBase + printValuesBytes;
     e.frameBytes += printValuesBytes + printRefsBytes;
+    // a range iterator lives in two private slots per virtual register (the current value and the
+    // upper bound); the interpreter's heap object is never represented in machine code
+    const size_t iterBase = e.frameBytes;
+    e.frameBytes += hasRange ? ((size_t)std::max(1, maxDepth) * 16 + 15) / 16 * 16 : 0;
+    // the trampoline's on-stack-replacement descriptor (a JitOsrFrame) lives here too
+    const size_t osrFrameBase = e.frameBytes;
+    e.frameBytes += 32;
+    auto iterCurOff = [&](int vr) { return iterBase + (size_t)vr * 16; };
+    auto iterStopOff = [&](int vr) { return iterBase + (size_t)vr * 16 + 8; };
     e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);      // sub rsp, frameBytes
     e.localsPrologue((int)ch->numLocals, localsBase);                        // private copy of L[]
     // The analysis proved that the only instruction which can have produced the array in a virtual
@@ -1254,6 +1346,29 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_JUMP: case OP_LOOP:
                 e.jmpPlaceholder((size_t)x.target);
                 break;
+            case OP_ITER_RANGE: {
+                // `for i in a to b` counts upwards (`step` is always +1 here): the upper bound goes
+                // into the iterator's stop slot, the lower bound becomes the current value
+                e.loadVrToRax(d - 1);
+                e.storeRaxToFrame(iterStopOff(d - 2));
+                e.loadVrToRax(d - 2);
+                e.storeRaxToFrame(iterCurOff(d - 2));
+                break;
+            }
+            case OP_ITER_NEXT: {
+                int vr = d - 1;
+                e.loadFrameToRax(iterCurOff(vr));                    // rax = cur
+                e.loadFrameToR8(iterStopOff(vr));                    // r8  = stop
+                e.cmpRaxR8();
+                e.jccPlaceholder(0x8F, (size_t)x.target);            // jg -> exhausted
+                e.storeRaxToVr(d);                                   // push the element
+                e.loadFrameToR11(iterCurOff(vr));
+                e.addR11Imm8(1);                                     // cur += 1 (after the push)
+                e.storeR11ToFrame(iterCurOff(vr));
+                break;
+            }
+            case OP_POP:
+                break;                                               // the value is dead
             case OP_JUMP_IF_FALSE:
                 e.loadVrToRax(d - 1);
                 e.testRaxRax();
@@ -1507,19 +1622,24 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     if (std::getenv("ANNOTA_JIT_DEBUG"))
         std::fprintf(stderr, "[jit] compiled %s chunk=%p bytes=%zu\n", ch->fnName.c_str(),
                      (void*)ch.get(), e.c.size());
-    // Hot loops can be entered directly: for every backward jump target with an empty operand
-    // stack the interpreter may switch to this native code mid-function.  A trampoline runs the
-    std::vector<std::pair<size_t, size_t>> tramp;     // (target ip, patch position)
-    // prologue (so the epilogue stays balanced) and jumps to the loop header.
+    // Hot loops can be entered directly: for every backward jump target whose live values the
+    // backend can rebuild, the interpreter may switch to this native code mid-function.  A
+    // trampoline runs the prologue (so the epilogue stays balanced), asks the VM to rebuild the
+    // virtual registers from the interpreter's operand stack, and jumps to the loop header.
     // A chunk that builds its own arrays keeps them in a private buffer that exists only while the
     // native code runs, so it must not be entered in the middle of a loop: on-stack replacement
     // would hand it the interpreter's array object, which the machine code cannot use.
+    std::vector<std::pair<size_t, size_t>> tramp;          // (target ip, native offset)
+    std::vector<std::vector<uint8_t>> descs;               // one descriptor per OSR entry
+    std::vector<std::pair<size_t, size_t>> descPatches;    // (imm64 position, descriptor index)
     if (!hasJitArrays) {
     for (auto& kv : e.labelAt) {
         size_t ip = kv.first;
         if (ip >= code.size()) continue;
         auto di = indexOf.find(ip);
         if (di == indexOf.end()) continue;
+        size_t ti = di->second;
+        if (depth[ti] == kUnset) continue;
         bool isLoopHeader = false;
         for (auto& x : ins) {
             bool backward = (x.op == OP_LOOP || x.op == OP_JUMP) && x.target >= 0 &&
@@ -1527,27 +1647,64 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             if (backward && (size_t)x.target == ip) { isLoopHeader = true; break; }
         }
         if (!isLoopHeader) continue;
-        if (depth[di->second] != 0) continue;            // only enter with an empty operand stack
+        // every live register has to be something the VM can rebuild from the interpreter's stack:
+        // an integer, a boolean or a range iterator
+        std::vector<uint8_t> desc;
+        bool ok = true;
+        for (int r = 0; r < depth[ti]; r++) {
+            JitKindSet ks = vrKind[ti][(size_t)r];
+            if (!jitPlainKind(ks) && ks != kJitRange) { ok = false; break; }
+            desc.push_back(jitOsrDescOf(ks));
+        }
+        if (!ok) continue;
         size_t off = e.c.size();
         e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);   // sub rsp, frame
         e.localsPrologue((int)ch->numLocals, localsBase);                    // and the same locals
+        e.leaRaxFromFrame(0);                                                // the virtual registers
+        e.storeRaxToFrame(osrFrameBase);
+        if (hasRange) e.leaRaxFromFrame(iterBase);
+        else e.movRaxImm(0);                                                 // no iterators at all
+        e.storeRaxToFrame(osrFrameBase + 8);
+        e.u8(0x48); e.u8(0xB8);                                              // mov rax, <descriptor>
+        size_t patchAt = e.c.size();
+        for (int b = 0; b < 8; b++) e.u8(0);
+        e.storeRaxToFrame(osrFrameBase + 16);
+        e.movRaxImm((int32_t)depth[ti]);
+        e.storeRaxToFrame(osrFrameBase + 24);
+        e.leaR10FromFrame(osrFrameBase);
+        e.callC2((uint64_t)(uintptr_t)&annotaJitOsrInit);
         e.u8(0xE9);
         int64_t rel = (int64_t)e.labelAt[ip] - (int64_t)(e.c.size() + 4);
         e.u32((uint32_t)(int32_t)rel);                                       // jmp loop header
+        descPatches.push_back({patchAt, descs.size()});
+        descs.push_back(std::move(desc));
         tramp.push_back({ip, off});
     }
 
+    }
+    // the descriptors travel inside the code buffer: their displacement from the code never changes,
+    // so only the absolute address the trampoline loads has to be filled in once it is mapped
+    std::vector<size_t> descOff(descs.size(), 0);
+    for (size_t k = 0; k < descs.size(); k++) {
+        descOff[k] = e.c.size();
+        for (uint8_t b : descs[k]) e.c.push_back(b);
+        while (e.c.size() % 16 != 0) e.c.push_back(0);
     }
     auto jc = std::make_shared<JitCode>();
     jc->bytes = e.c;
     void* mem = jitAllocExec(jc->bytes.size());
     if (!mem) return jitFail(__LINE__);
     std::memcpy(mem, jc->bytes.data(), jc->bytes.size());
+    for (auto& p : descPatches) {
+        uint64_t addr = (uint64_t)(uintptr_t)((uint8_t*)mem + descOff[p.second]);
+        std::memcpy((uint8_t*)mem + p.first, &addr, 8);
+    }
     jc->mapping = mem;
     jc->mappingSize = jc->bytes.size();
     jc->fn = reinterpret_cast<JitFn>(mem);
     for (auto& t : tramp)
         jc->osrEntries[t.first] = reinterpret_cast<JitFn>((uint8_t*)mem + t.second);
+    for (size_t k = 0; k < tramp.size(); k++) jc->osrDesc[tramp[k].first] = descs[k];
     for (size_t s = 0; s < readSlots.size(); s++)
         if (readSlots[s]) jc->readSlots.push_back((uint8_t)s);
     jc->retByte = seenRetByte;                 // -2 when the returns disagree
