@@ -973,6 +973,7 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     for (size_t i = 0; i < count; i++)
         L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
     JitOut out;
+    out.ctx = jitGlobalCache.data();
     gJitVm = this;
     jc->fn(L, &out);
     jitArenaReset();
@@ -1689,6 +1690,7 @@ Value VM::execute(size_t stopDepth) {
                                 size_t base = f.stackBase;
                                 bool discard = f.discardResult;
                                 JitOut out;
+                                out.ctx = jitGlobalCache.data();
                                 gJitVm = this;
                                 gJitStackBase = stack.data() + base;
                                 entry->second(L, &out);

@@ -101,10 +101,14 @@ int64_t annotaJitGlobalKind(int64_t idx);
 void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode);
 
 // The native code writes the returned value here.  `kind`: 0 = int (untyped), 1 = int64,
-// 2 = bool, 3 = null - the same Value the interpreter would have produced.
+// 2 = bool, 3 = null - the same Value the interpreter would have produced.  `ctx` is filled by the
+// VM before the call (an array of the global value pointers, by index); compiled code reads it out
+// of this structure instead of a fixed address, so two threads running the same machine code each
+// see their own VM's globals.
 struct JitOut {
     int64_t value = 0;
     int64_t kind = 3;
+    Value* const* ctx = nullptr;
 };
 
 struct JitCode {
@@ -522,6 +526,15 @@ public:
     }
     void leaR10FromFrame(size_t off) { u8(0x4C); u8(0x8D); u8(0x94); u8(0x24); u32((uint32_t)off); }
     void leaRaxFromFrame(size_t off) { u8(0x48); u8(0x8D); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    // rax = [kOut + sizeof(JitOut) - 8]: the global value-pointer array the VM left for us
+    void loadCtxToRax() {
+        u8(0x48); u8(0x8B);
+        u8(kOut == 0x02 ? 0x42 : 0x46);
+        u8((uint8_t)offsetof(JitOut, ctx));                                  // mov rax, [rdx/rsi+16]
+    }
+    void loadRaxFromRaxDisp(uint32_t off) {
+        u8(0x48); u8(0x8B); u8(0x80); u32(off);                              // mov rax, [rax+off]
+    }
     void setneAl() { u8(0x0F); u8(0x95); u8(0xC0); }
     void movR11Imm64(uint64_t v) {
         u8(0x49); u8(0xBB);
@@ -1517,9 +1530,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_GET_GLOBAL: {
-                // one helper call per read: it resolves the slot in the *calling* VM, which is what
-                // keeps two threads running the same machine code correct
-                e.callC((uint64_t)(uintptr_t)&annotaJitGetGlobal, [&] { e.movArg1Imm(insGlobal[i]); });
+                // the value-pointer array comes from this call's JitOut, so a shared piece of machine
+                // code sees the globals of whatever VM is running it
+                e.loadCtxToRax();
+                e.loadRaxFromRaxDisp((uint32_t)insGlobal[i] * 8);            // the Value*
+                e.loadRaxFromRaxDisp((uint32_t)offsetof(Value, i));          // its payload
                 e.storeRaxToVr(d);
                 break;
             }
@@ -1542,7 +1557,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 JitCallTarget t = resolveCall(x);
                 if (!t.code) return jitFail(__LINE__);
                 const int Lbytes = (int)t.chunk->numLocals * 8;
-                const int savedBase = Lbytes + 16;                     // saved kBase
+                const int savedBase = Lbytes + (int)sizeof(JitOut);    // saved kBase
                 const int savedOut = savedBase + 8;                    // saved kOut
                 int N = savedOut + 8;                                  // L[] + JitOut + 2 saves
                 if ((N % 16) != 8) N += 8 - (N % 16);                  // keep rsp 16-aligned at the call
@@ -1553,6 +1568,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.u8(0x48); e.u8(0x89);
                 e.u8(JitEmitter::kOut == 0x02 ? 0x94 : 0xB4);                  // mov [rsp+savedOut], rdx/rsi
                 e.u8(0x24); e.u32((uint32_t)savedOut);
+                // the callee needs the globals context too, and this is the only place it can get it:
+                // its own JitOut lives on this frame, filled from the one we were called with
+                e.loadCtxToRax();
+                e.storeRaxToFrame((size_t)(Lbytes + (int)offsetof(JitOut, ctx)));
                 for (int k = 0; k < x.imm; k++) {
                     int src = N + (d - x.imm + k) * 8;                        // the argument's VR
                     e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)src);
