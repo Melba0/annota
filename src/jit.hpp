@@ -1,4 +1,4 @@
-﻿// Annota - jit.hpp : the machine code backend behind the single `[[jit]]` marker.
+// Annota - jit.hpp : the machine code backend behind the single `[[jit]]` marker.
 //
 // `[[jit]]` asks for load-time optimisation.  The superinstruction pass in the compiler always
 // runs; on top of that this file tries to translate the whole function into x86-64 machine code.
@@ -256,6 +256,7 @@ public:
     void movRaxImm(int32_t v) { u8(0x48); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
     void movRaxImm64(uint64_t v) { u8(0x48); u8(0xB8); for (int b = 0; b < 8; b++) u8((uint8_t)((v >> (8 * b)) & 0xff)); }
     void movR8Imm(int32_t v) { u8(0x49); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
+    void cmpEaxR8d() { u8(0x44); u8(0x39); u8(0xC0); }                 // cmp eax, r8d
     void addRaxR8() { u8(0x4C); u8(0x01); u8(0xC0); }
     void subRaxR8() { u8(0x4C); u8(0x29); u8(0xC0); }
     void imulRaxR8() { u8(0x49); u8(0x0F); u8(0xAF); u8(0xC0); }
@@ -957,7 +958,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
-                e.cmpRaxR8();
+                // A 32 bit comparison is correct whether the slots hold the exact 64 bit value or only
+                // the low 32 bits, and it is shorter than the 64 bit form.
+                int pkC = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
+                                                    vrKind[i][(size_t)d - 1]));
+                if (pkC == (int)NumKind::I32 || pkC == (int)NumKind::U32) e.cmpEaxR8d();
+                else e.cmpRaxR8();
                 int uns = jitUnsignedCmp(vrKind[i][(size_t)d - 2], vrKind[i][(size_t)d - 1]);
                 uint8_t cc;
                 if (x.op == OP_EQ) cc = 0x94;
