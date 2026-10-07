@@ -43,6 +43,12 @@ major change, and a new check is a minor one.
   working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
 * `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
   `examples/jit.ant`.
+* **`print` inside compiled code.**  A function that printed anything was rejected outright, which
+  is why a compiled loop could not report its progress.  The machine code now lays its operands out
+  as real `Value`s in its own frame (or points straight at the pool constant, which is why string
+  literals work) and hands them to the VM, which formats them with the same `toStr` the interpreter
+  uses - the text is byte for byte what the interpreter produced, including
+  `print(a, b)`'s tuple form.  A `print` separator argument still keeps the function interpreted.
 * **Division and modulo inside compiled code.**  `OP_DIV` / `OP_MOD` used to make a whole function
   fall back to the interpreter, so the most common arithmetic still ran interpreted.  The machine
   code now calls one of two C helpers (`annotaJitDiv` / `annotaJitMod`) that own the semantics -
@@ -110,6 +116,11 @@ major change, and a new check is a minor one.
 
 ### Fixed
 
+* **A narrowing conversion silently kept the wide value.**  The translated `convert` only wrapped the
+  register and never wrote the result back to the slot, which was correct while the only conversion
+  the backend accepted was an identity - but `new a: int8 = n` with `n == 300` then left `300` in the
+  slot where the interpreter had `44`.  Found by printing the value from machine code and diffing it
+  against the interpreter; the conversion now stores what it wrapped.
 * **A value coming out of machine code now keeps its exact width.**  The result kind byte only had
   codes for int/int64/bool/null/uint64, so returning a local of any other declared width reported
   `int`: `new x: int8 = 127` then `=x` made `typeof` print `int` where the interpreter printed

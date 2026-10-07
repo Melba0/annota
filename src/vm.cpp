@@ -51,6 +51,31 @@ int64_t annotaJitMod(int64_t a, int64_t b) {
     if (b == -1) return 0;
     return a % b;
 }
+
+// `print` from compiled code.  The machine code built one `Value` per operand in its own frame with
+// the static kind each one carries, so this is the interpreter's OP_PRINT body - one string, one
+// write - with the VM the native call belongs to.
+VM* gJitVm = nullptr;                     // the VM a native call runs inside (single threaded)
+
+void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed) {
+    if (!gJitVm) return;
+    std::string out;
+    if (packed) {
+        // the compiler turns `print(a, b)` into a tuple plus a one-operand print, and the
+        // interpreter prints that tuple - so build the same one here
+        std::vector<Value> items;
+        items.reserve((size_t)count);
+        for (int64_t i = 0; i < count; i++) items.push_back(*refs[i]);
+        out += gJitVm->toStr(Value::tuple(std::move(items)));
+    } else {
+        for (int64_t i = 0; i < count; i++) {
+            if (i) out += ' ';
+            out += gJitVm->toStr(*refs[i]);
+        }
+    }
+    out += '\n';
+    gJitVm->write(out);
+}
 } // namespace annota
 namespace annota {
 
@@ -811,6 +836,7 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
         L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
     JitOut out;
     gJitDivErr = 0;
+    gJitVm = this;
     jc->fn(L, &out);
     jitArenaReset();
     if (gJitDivErr) {
@@ -1529,6 +1555,7 @@ Value VM::execute(size_t stopDepth) {
                                 bool discard = f.discardResult;
                                 JitOut out;
                                 gJitDivErr = 0;
+                                gJitVm = this;
                                 entry->second(L, &out);
                                 jitArenaReset();
                                 if (gJitDivErr) {

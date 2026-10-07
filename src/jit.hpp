@@ -9,6 +9,7 @@
 #pragma once
 #include "bytecode.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,12 @@ static inline bool jitKindFromCode(int code, NumKind& out) {
 // runs; the VM frees everything it handed out once the outermost native invocation returns.
 int64_t* annotaJitArrayAlloc(int64_t bytes);   // implemented by the VM
 void jitArenaReset();
+
+// `print` inside compiled code: the machine code lays its operands out as real `Value`s in its own
+// frame and the VM formats them with the same `toStr` the interpreter uses.  `packed` says the
+// values are the elements of the tuple the compiler built for a multi-argument `print`, which the
+// interpreter would have printed as a tuple.
+void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed);
 
 // Division and modulo are the two operations whose semantics (signed truncation, a divisor of
 // zero, `INT64_MIN / -1`) are kept in C++: the machine code calls these and then checks the flag
@@ -145,9 +152,27 @@ static const JitKindSet kJitAllInts =
 
 static const JitKindSet kJitNone = jitBit(NumKind::None);
 static const JitKindSet kJitBool = (JitKindSet)1 << 15;      // a comparison result
-// A range iterator is not an integer: the machine code keeps its state in private slots and this
-// marker only says "the value on the virtual stack at this position is such a state".
+// Three marker kinds stand for things that are *not* an integer in a virtual register.  They are
+// deliberately kept out of `jitSoleKind`, so every place that needs a real width rejects them:
+//   kJitRange - a range iterator's state, kept in the backend's own private slots
+//   kJitTuple - the tuple the compiler builds for `print(a, b)`, alive for exactly one instruction
+//   kJitConst - a pool constant of a non-integer type, only usable as a `print` operand
 static const JitKindSet kJitRange = (JitKindSet)1 << 14;
+static const JitKindSet kJitTuple = (JitKindSet)1 << 13;
+static const JitKindSet kJitConst = (JitKindSet)1 << 12;
+static const JitKindSet kJitMarkers = kJitRange | kJitTuple | kJitConst;
+
+// an ordinary integer value: the only thing arithmetic, assignments and returns may consume
+static inline bool jitPlainKind(JitKindSet k) { return (k & kJitMarkers) == 0; }
+
+// A constant that has no pool entry of its own (`true` / `false` / `null` compile to their own
+// opcodes).  A `print` may refer to it; nothing else can use it.
+inline const Value& jitPrintConstant(uint8_t op) {
+    static const Value kTrue = Value::boolean(true);
+    static const Value kFalse = Value::boolean(false);
+    static const Value kNull = Value::null();
+    return op == OP_TRUE ? kTrue : op == OP_FALSE ? kFalse : kNull;
+}
 
 // promote every pair and collect the outcomes
 static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
@@ -168,12 +193,12 @@ static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
     return out;
 }
 
-// -1 when the set does not pin down exactly one kind
+// -1 when the set does not pin down exactly one integer kind
 static inline int jitSoleKind(JitKindSet s) {
     if (s == kJitBool) return 15;
-    if (s == kJitRange) return -1;                   // not a value the arithmetic can use
+    if (s & kJitMarkers) return -1;                  // not a value the arithmetic can use
     if (s == 0 || (s & (s - 1)) != 0) return -1;
-    for (int i = 0; i < 15; i++) if (s == ((JitKindSet)1 << i)) return i;
+    for (int i = 0; i <= (int)NumKind::U64; i++) if (s == ((JitKindSet)1 << i)) return i;
     return -1;
 }
 
@@ -388,6 +413,31 @@ public:
         u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
         u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
     }
+    // Call a C helper with two integers plus a constant third argument.  Everything else is the
+    // same as callC2; the third argument is an immediate, which is what `print` needs to tell the
+    // VM whether the values are one operand list or a tuple.
+    void callC3(uint64_t addr, int32_t imm3) {
+        const int savedBase = 32, savedOut = 40;
+        int N = 48;
+        if ((N % 16) != 8) N += 8 - (N % 16);
+        u8(0x48); u8(0x81); u8(0xEC); u32((uint32_t)N);                       // sub rsp, N
+        u8(0x48); u8(0x89); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // save kBase
+        u8(0x48); u8(0x89); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // save kOut
+        u8(0x4C); u8(0x89); u8(kBase == 0x01 ? 0xD1 : 0xD7);                  // mov rcx/rdi, r10
+        u8(0x4C); u8(0x89); u8(kOut == 0x02 ? 0xDA : 0xDE);                   // mov rdx/rsi, r11
+        if (kBase == 0x01) { u8(0x41); u8(0xB8); } else { u8(0xBA); }
+        u32((uint32_t)imm3);                                                  // mov r8d/edx, imm3
+        u8(0x48); u8(0xB8);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // mov rax, addr
+        u8(0xFF); u8(0xD0);                                                   // call rax
+        u8(0x48); u8(0x8B); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // restore kBase
+        u8(0x48); u8(0x8B); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
+        u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
+    }
     // The C helper above reports a failure (a zero divisor) through a global flag; the caller
     // follows this with a conditional jump over a cold `errorReturn()` block.
     void loadFlagToR10(uint64_t addr) {
@@ -395,7 +445,23 @@ public:
         for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // movabs r10, addr
         u8(0x41); u8(0x83); u8(0x3A); u8(0x00);                               // cmp dword [r10], 0
     }
-    // a short conditional jump whose displacement is filled in once the target offset is known
+    // Frame-relative helpers for the temporary `Value` array that `print` hands to the VM.
+    void storeRaxToFrame(size_t off) { u8(0x48); u8(0x89); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void storeAlToFrame(size_t off) { u8(0x88); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void storeByteToFrame(size_t off, uint8_t v) {
+        u8(0xC6); u8(0x84); u8(0x24); u32((uint32_t)off); u8(v);
+    }
+    void storeZeroQwordToFrame(size_t off) {
+        u8(0x48); u8(0xC7); u8(0x84); u8(0x24); u32((uint32_t)off); u32(0);
+    }
+    void leaR10FromFrame(size_t off) { u8(0x4C); u8(0x8D); u8(0x94); u8(0x24); u32((uint32_t)off); }
+    void leaRaxFromFrame(size_t off) { u8(0x48); u8(0x8D); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    void setneAl() { u8(0x0F); u8(0x95); u8(0xC0); }
+    void movR11Imm64(uint64_t v) {
+        u8(0x49); u8(0xBB);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((v >> (8 * b)) & 0xff));
+    }
+    // A short conditional jump whose displacement is filled in once the target offset is known
     size_t jccRel8(uint8_t cc) { u8(cc); size_t p = c.size(); u8(0); return p; }
     size_t jmpRel8() { u8(0xEB); size_t p = c.size(); u8(0); return p; }   // short jmp, patched later
     void patchRel8(size_t at, size_t target) {
@@ -467,6 +533,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     // ---- decode and classify (only the integer subset is translatable)
     std::vector<JitIns> ins;
     std::unordered_map<size_t, size_t> indexOf;
+    int maxPrintArgs = 0;                              // frame space for the values `print` passes
+    bool hasPrint = false;
     size_t ip = 0;
     while (ip < code.size()) {
         JitIns x;
@@ -475,6 +543,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         x.next = ip;
         switch (x.op) {
             case OP_NOP: x.next = ip + 1; break;
+            case OP_TRUE: case OP_FALSE: case OP_NULL: x.next = ip + 1; break;
             case OP_INT1: x.next = ip + 2; x.imm = (int8_t)code[ip + 1]; break;
             case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_INIT_LOCAL:
                 x.next = ip + 2; x.a = code[ip + 1]; break;
@@ -508,6 +577,17 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_RETURN: case OP_RETURN_NULL: x.next = ip + 1; break;
             case OP_CONST: x.next = ip + 3; x.a = (code[ip + 1] << 8) | code[ip + 2]; break;
             case OP_CONVERT: x.next = ip + 2; x.imm = code[ip + 1]; break;
+            case OP_PRINT:
+                x.next = ip + 3; x.a = code[ip + 1]; x.b = code[ip + 2];
+                maxPrintArgs = std::max(maxPrintArgs, (int)x.a);
+                hasPrint = true;
+                break;
+            case OP_BUILD_TUPLE:
+                // `print(a, b)` compiles to a tuple followed by a one-operand print; the backend
+                // recognizes exactly that pair and never lets a tuple value exist on its own
+                x.next = ip + 3; x.a = (code[ip + 1] << 8) | code[ip + 2];
+                maxPrintArgs = std::max(maxPrintArgs, (int)x.a);
+                break;
             case OP_CALL_DIRECT:
                 x.next = ip + 4;
                 x.a = (code[ip + 1] << 8) | code[ip + 2];        // name constant
@@ -601,6 +681,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     std::vector<std::vector<JitKindSet>> kindAt(n, std::vector<JitKindSet>(ch->numLocals, kJitAllInts));
     std::vector<std::vector<uint8_t>> assignedAt(n, std::vector<uint8_t>(ch->numLocals, 0));
     std::vector<std::vector<JitKindSet>> vrKind(n);            // kinds of the operand stack per entry
+    std::vector<int> packedPrint(n, 0);                        // print whose operands are a tuple
+    std::vector<std::vector<JitKindSet>> printKinds(n);        // the operand kinds of each print
     int maxDepth = 0;
     depth[0] = 0;
     for (size_t i = 0; i < ch->numLocals; i++) {
@@ -642,6 +724,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             switch (x.op) {
                 case OP_NOP: break;
                 case OP_INT1: pushKind(kJitNone); break;
+                case OP_TRUE: case OP_FALSE: case OP_NULL: pushKind(kJitConst); break;
                 case OP_GET_LOCAL: pushKind(kindOfLocal(x.a)); break;
                 case OP_NEW_ARRAY:
                     // 1-D numeric array: the dimension on the stack becomes a raw buffer pointer
@@ -651,6 +734,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     break;
                 case OP_GET_INDEX: {
                     if (d < 2) return jitFail(__LINE__);
+                    if (!jitPlainKind(vk[(size_t)d - 1]) || !jitPlainKind(vk[(size_t)d - 2]))
+                        return jitFail(__LINE__);
                     int gObj = d - 2;
                     int gEk = -1;
                     for (size_t k = i; k-- > 0;) {
@@ -666,10 +751,13 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 }
                 case OP_SET_INDEX:
                     if (d < 3) return jitFail(__LINE__);
+                    if (!jitPlainKind(vk[(size_t)d - 1]) || !jitPlainKind(vk[(size_t)d - 2]) ||
+                        !jitPlainKind(vk[(size_t)d - 3]))
+                        return jitFail(__LINE__);
                     vk.pop_back(); vk.pop_back(); vk.pop_back();
                     break;
                 case OP_SET_LOCAL: case OP_INIT_LOCAL:
-                    if (d < 1) return jitFail(__LINE__);
+                    if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
                     vk.pop_back();
                     break;
                 case OP_LOCAL_ADD_IMM: case OP_LOCAL_SUB_IMM:
@@ -679,30 +767,37 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_DIV: case OP_MOD: {
                     if (d < 2) return jitFail(__LINE__);
                     JitKindSet ka = vk[(size_t)d - 2], kb = vk[(size_t)d - 1];
+                    if (!jitPlainKind(ka) || !jitPlainKind(kb)) return jitFail(__LINE__);
                     vk.pop_back();
                     vk.back() = jitPromoteSet(ka, kb);
                     break;
                 }
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
                     if (d < 2) return jitFail(__LINE__);
+                    if (!jitPlainKind(vk[(size_t)d - 2]) || !jitPlainKind(vk[(size_t)d - 1]))
+                        return jitFail(__LINE__);
                     vk.pop_back();
                     vk.back() = kJitBool;
                     break;
                 }
                 case OP_JUMP: case OP_LOOP: break;
                 case OP_JUMP_IF_FALSE: {
-                    if (d < 1) return jitFail(__LINE__);
+                    if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
                     vk.pop_back();
                     break;
                 }
                 case OP_JUMP_IF_NOT_LT_LOCAL_LOCAL: case OP_JUMP_IF_NOT_LT_LOCAL_IMM: break;
                 case OP_CONST: {
-                    // pool constants that are plain 64 bit integers; strings, floats, containers and
-                    // the 128 bit widths stay interpreted
+                    // pool constants that are plain 64 bit integers take part in the arithmetic; any
+                    // other constant is a real Value the backend cannot hold, but a `print` can
+                    // still refer to it, so it becomes a marker instead of rejecting the function
                     if ((size_t)x.a >= ch->consts.size()) return jitFail(__LINE__);
                     const Value& c0 = ch->consts[(size_t)x.a];
-                    if (c0.t != VT::Int || c0.o || (int)c0.k > (int)NumKind::U64) return jitFail(__LINE__);
-                    pushKind(jitBit(c0.k));
+                    if (c0.t == VT::Int && !c0.o && (int)c0.k <= (int)NumKind::U64) {
+                        pushKind(jitBit(c0.k));
+                    } else {
+                        pushKind(kJitConst);
+                    }
                     break;
                 }
                 case OP_CONVERT: {
@@ -733,9 +828,54 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     }
                 }
                 case OP_RETURN:
-                    if (d < 1) return jitFail(__LINE__);
+                    if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
                     break;                                   // exact kind handled at emit time
                 case OP_RETURN_NULL: break;
+                case OP_PRINT: {
+                    // `print` hands its operands to the VM as ordinary Values, so every one of them
+                    // needs one static kind: a sole width (or the None/int64 pair, which print
+                    // identically).  A separator is a value of its own and stays interpreted.
+                    if (x.b) return jitFail(__LINE__);
+                    if (x.a == 1 && i > 0 && ins[i - 1].op == OP_BUILD_TUPLE && !vk.empty() &&
+                        vk.back() == kJitTuple) {
+                        // the operands are the tuple the previous instruction built
+                        packedPrint[i] = ins[i - 1].a;
+                        vk.pop_back();
+                        break;
+                    }
+                    if (d < x.a) return jitFail(__LINE__);
+                    for (int k = 0; k < x.a; k++) {
+                        JitKindSet ks = vk[(size_t)(d - x.a + k)];
+                        if (ks == kJitConst) { printKinds[i].push_back(ks); continue; }
+                        if (!jitPlainKind(ks)) return jitFail(__LINE__);
+                        if (jitSoleKind(ks) < 0 &&
+                            (ks & ~(jitBit(NumKind::None) | jitBit(NumKind::I64))) != 0)
+                            return jitFail(__LINE__);
+                        printKinds[i].push_back(ks);
+                    }
+                    for (int k = 0; k < x.a; k++) vk.pop_back();
+                    break;
+                }
+                case OP_BUILD_TUPLE: {
+                    // Only ever the operand list of the `print` that follows it: the tuple itself
+                    // never becomes a value the backend would have to represent.
+                    if (x.a < 1 || i + 1 >= n) return jitFail(__LINE__);
+                    if (ins[i + 1].op != OP_PRINT || ins[i + 1].a != 1 || ins[i + 1].b)
+                        return jitFail(__LINE__);
+                    if (d < x.a) return jitFail(__LINE__);
+                    for (int k = 0; k < x.a; k++) {
+                        JitKindSet ks = vk[(size_t)(d - x.a + k)];
+                        if (ks == kJitConst) { printKinds[i].push_back(ks); continue; }
+                        if (!jitPlainKind(ks)) return jitFail(__LINE__);
+                        if (jitSoleKind(ks) < 0 &&
+                            (ks & ~(jitBit(NumKind::None) | jitBit(NumKind::I64))) != 0)
+                            return jitFail(__LINE__);
+                        printKinds[i].push_back(ks);
+                    }
+                    for (int k = 0; k < x.a; k++) vk.pop_back();
+                    vk.push_back(kJitTuple);
+                    break;
+                }
                 default:
                     if (std::getenv("ANNOTA_JIT_DEBUG"))
                         std::fprintf(stderr, "[jit] analyze: unsupported op %d at ip %zu in %s\n",
@@ -938,6 +1078,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     const size_t localsBase = e.frameBytes;
     const size_t localsBytes = ((size_t)ch->numLocals * 8 + 15) / 16 * 16;
     e.frameBytes += localsBytes;
+    // `print` builds a real Value per operand here, inside the frame, so nothing is allocated and
+    // the VM keeps owning the formatting rules.  A pool constant is referred to directly (its
+    // address is stable for as long as the code is), everything else is materialized.
+    const size_t printCount = hasPrint ? (size_t)std::max(1, maxPrintArgs) : 0;
+    const size_t printValuesBytes = ((printCount * sizeof(Value) + 15) / 16) * 16;
+    const size_t printRefsBytes = ((printCount * 8 + 15) / 16) * 16;
+    const size_t printBase = e.frameBytes;
+    const size_t printRefBase = printBase + printValuesBytes;
+    e.frameBytes += printValuesBytes + printRefsBytes;
     e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);      // sub rsp, frameBytes
     e.localsPrologue((int)ch->numLocals, localsBase);                        // private copy of L[]
     // The analysis proved that the only instruction which can have produced the array in a virtual
@@ -980,6 +1129,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         int d = depth[i];
         switch (x.op) {
             case OP_NOP: break;
+            case OP_TRUE: case OP_FALSE: case OP_NULL:
+                break;                                  // only reachable as a print operand
             case OP_INT1:
                 e.movRaxImm(x.imm);
                 e.storeRaxToVr(d);
@@ -1263,15 +1414,76 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_CONVERT:
-                // an integer conversion only wraps into the target width; a raw 32 bit slot has to
-                // be widened first so the wrap sees the exact value
+                // an integer conversion wraps into the target width and *stores* the result: the
+                // slot now holds a value of the new kind, so every later read sees the wrapped one
+                e.loadVrToRax(d - 1);
+                // a raw 32 bit slot has to be widened first so the wrap sees the exact value
                 if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::I32) e.sextRaxFromI32();
                 e.wrapRax(x.imm);
+                e.storeRaxToVr(d - 1);
                 break;
             case OP_RETURN_NULL:
                 e.nullReturn();
                 noteRetByte(3);
                 break;
+            case OP_BUILD_TUPLE:
+                break;                                  // folded into the `print` that follows it
+            case OP_PRINT: {
+                // One reference per operand: a pool constant is used as it is, an integer in a
+                // virtual register is materialized as a real Value with its static kind.  The VM
+                // then formats them with the interpreter's own rules.
+                int arity = packedPrint[i] ? packedPrint[i] : x.a;
+                int firstVr = packedPrint[i] ? d - 1 : d - x.a;
+                const std::vector<JitKindSet>& oks = printKinds[packedPrint[i] ? (size_t)i - 1 : i];
+                for (int k = 0; k < arity; k++) {
+                    int src = firstVr + k;
+                    int ks = jitSoleKind(oks[(size_t)k]);
+                    size_t vb = printBase + (size_t)k * sizeof(Value);
+                    size_t rb = printRefBase + (size_t)k * 8;
+                    // the producer of this virtual register: a pool constant or one of the
+                    // constant opcodes is a Value the code can refer to directly
+                    int ck = -1;
+                    uint8_t cop = 0;
+                    for (size_t s = i; s-- > 0;) {
+                        if (depth[s] != src) continue;
+                        if (ins[s].op == OP_CONST) ck = ins[s].a;
+                        else if (ins[s].op == OP_TRUE || ins[s].op == OP_FALSE || ins[s].op == OP_NULL)
+                            cop = ins[s].op;
+                        break;
+                    }
+                    if (ck >= 0) {
+                        e.movRaxImm64((uint64_t)(uintptr_t)&ch->consts[(size_t)ck]);
+                    } else if (cop) {
+                        e.movRaxImm64((uint64_t)(uintptr_t)&jitPrintConstant(cop));
+                    } else {
+                        e.loadVrToRax(src);
+                        if (ks == (int)NumKind::I32) e.sextRaxFromI32();
+                        e.storeRaxToFrame(vb + offsetof(Value, i));
+                        // the shared_ptr the Value holds must read as null; nothing ever releases it
+                        for (size_t z = offsetof(Value, o); z < sizeof(Value); z += 8)
+                            e.storeZeroQwordToFrame(vb + z);
+                        if (ks == 15) {
+                            e.testRaxRax();
+                            e.setneAl();
+                            e.storeAlToFrame(vb + offsetof(Value, b));
+                            e.storeByteToFrame(vb + offsetof(Value, t), (uint8_t)VT::Bool);
+                            e.storeByteToFrame(vb + offsetof(Value, k), 0);
+                        } else {
+                            e.storeByteToFrame(vb + offsetof(Value, b), 0);
+                            e.storeByteToFrame(vb + offsetof(Value, t), (uint8_t)VT::Int);
+                            // a non-sole set can only be {None, int64} here, which prints the same
+                            e.storeByteToFrame(vb + offsetof(Value, k),
+                                               (uint8_t)(ks < 0 ? (int)NumKind::None : ks));
+                        }
+                        e.leaRaxFromFrame(vb);
+                    }
+                    e.storeRaxToFrame(rb);
+                }
+                e.leaR10FromFrame(printRefBase);
+                e.movR11Imm64((uint64_t)arity);
+                e.callC3((uint64_t)(uintptr_t)&annotaJitPrint, packedPrint[i] ? 1 : 0);
+                break;
+            }
             default:
                 if (std::getenv("ANNOTA_JIT_DEBUG"))
                     std::fprintf(stderr, "[jit] emit: unsupported op %d at ip %zu in %s\n",
