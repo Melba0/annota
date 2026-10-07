@@ -1157,6 +1157,13 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
     optimizeChunk(ch, eagerJit);
     if (eagerJit) {
         ch->jit = jitCompileX64(ch);          // eager whole-function machine code
+        // Silence here is what makes `[[jit]]` look like it simply had no effect, so an opt-in notice
+        // says why the whole function stays interpreted (ANNOTA_JIT_VERBOSE=1; off by default because
+        // the examples deliberately include a function the backend cannot compile).
+        if (!ch->jit && std::getenv("ANNOTA_JIT_VERBOSE"))
+            warn("[[jit]] 函数 '" + ch->fnName + "' 未能编译为机器码，继续解释执行：后端只支持局部变量"
+                 "（顶层全局量不行）、64 位以内整数（128 位与浮点不行）、while 循环（for 区间迭代不行）"
+                 "以及一组有限的操作（/ 与 % 不行）；详见 docs/jit.md 的支持范围");
     }
     return ch;
 }
