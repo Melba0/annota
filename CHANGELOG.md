@@ -138,6 +138,27 @@ major change, and a new check is a minor one.
 
 ### Fixed
 
+* **The fused compare-and-branch compared unsigned values as signed.**  The compiler emits
+  `jump_if_not_lt_local_local` (and the immediate form) only in `[[jit]]` functions, so the marker
+  really did change meaning: `uint64 a = 0; uint64 b = 2^64-1; a < b` was **true** through
+  `binaryResult` but the fusion's bare `x.i < y.i` said false.  The fused path now asks the language
+  itself (`intLessThan` uses `promoteNum` / `numIsUnsigned`), which is what the backend had been
+  doing all along.  Found by a width matrix that runs every declared width through both a compiled
+  and an interpreted twin of the same function; that matrix is now part of `examples/jit.ant`
+  (144 checks).
+* **A raw 32 bit slot was read as 64 bits.**  After the "raw 32 bit slot" optimisation, `+ - *` (and
+  `local += local`) widened nothing, so `int32` arithmetic that the language promotes to a 64 bit
+  result produced the wrong value: `n:int32 = -7; new s = n + 3; new d = s * 1` gave
+  `4294967293` where the interpreter gave `-3` (the low 32 bits were right, the sign extension was
+  missing).  Both paths now widen a raw `int32` operand exactly the way the comparison and call
+  paths already did.  Same matrix.
+* **A typed narrow parameter kept the whole function interpreted.**  `[[jit]] f(n:int)` compiled and
+  then never ran natively, because the entry check required the *caller* to hand over a value whose
+  kind was exactly `int32` - while `int` is the default integer type of the language and callers pass
+  ordinary untyped expressions.  An untyped integer is now accepted for any declared integer width:
+  the first instruction of such a body is the `convert` the compiler emits, and for an integer a
+  `convert` is exactly the `wrapToKind` the machine code wraps with.  `f(n:int)` therefore runs
+  natively now.
 * **A `thread_local` container with a destructor corrupted the heap at thread exit.**  Giving the
   native call's scratch state (the arena of arrays built by compiled code) a `thread_local`
   `std::vector` registered a TLS callback; with `libwinpthread` that callback's `free` ran into

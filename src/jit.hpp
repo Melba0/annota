@@ -1341,7 +1341,9 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     e.addEaxLocal(x.b);
                 } else {
                     e.loadLocalToRax(x.a);
+                    if (jitSoleKind(kindAt[i][(size_t)x.a]) == (int)NumKind::I32) e.sextRaxFromI32();
                     e.loadLocalToR8(x.b);
+                    if (jitSoleKind(kindAt[i][(size_t)x.b]) == (int)NumKind::I32) e.sextR8FromI32();
                     e.addRaxR8();
                     if (pkl >= 0) e.wrapRax(pkl);
                 }
@@ -1368,6 +1370,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     else if (x.op == OP_SUB) { e.u8(0x44); e.u8(0x29); e.u8(0xC0); }   // sub eax, r8d
                     else { e.u8(0x44); e.u8(0x0F); e.u8(0xAF); e.u8(0xC0); }           // imul eax, r8d
                 } else {
+                    // A raw 32 bit slot only carries the low half, so it has to be made exact before
+                    // any 64 bit operation reads it.  A raw uint32 slot is already zero-extended.
+                    if (jitSoleKind(vrKind[i][(size_t)d - 2]) == (int)NumKind::I32) e.sextRaxFromI32();
+                    if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::I32) e.sextR8FromI32();
                     if (x.op == OP_ADD) e.addRaxR8();
                     else if (x.op == OP_SUB) e.subRaxR8();
                     else e.imulRaxR8();

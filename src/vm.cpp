@@ -687,9 +687,12 @@ static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
             NumKind want = (NumKind)(jc->slotKind[s] - 1);
             NumKind got = fr.locals[s]->k;
             if (got == want) continue;
-            // `long`/`int64` does not wrap, so an untyped integer behaves identically there;
-            // narrow declarations keep requiring their exact kind
-            if (want == NumKind::I64 && got == NumKind::None) continue;
+            // An untyped integer is always acceptable: the first instruction of the body for a typed
+            // parameter is the `convert` the compiler emits, and for an integer a `convert` is exactly
+            // `wrapToKind` - which is what the machine code wraps with.  A narrow declaration
+            // therefore no longer forces the *caller* to produce that exact kind, which is what used
+            // to keep `f(n:int)` interpreted even though the function compiled.
+            if (got == NumKind::None) continue;
             return false;
         } else {
             NumKind k = fr.locals[s]->k;
@@ -748,6 +751,17 @@ static bool jitOsrOk(const std::shared_ptr<JitCode>& jc, size_t ip, const Frame&
         if (!jitOsrDescOk(desc[i], v.numKind())) return false;
     }
     return true;
+}
+
+// The fused compare-and-branch has to answer exactly what `binaryResult(OP_LT, ...)` answers, so it
+// uses the language's own promotion instead of a plain signed compare: a bare `x.i < y.i` is wrong
+// for the unsigned widths (`uint64(0) < uint64(2^64-1)` is true, the signed compare says false).
+// The compiler only emits this fusion in `[[jit]]` functions, so getting it wrong made the marker
+// change what a program means.
+static inline bool intLessThan(const Value& x, const Value& y) {
+    NumKind k = promoteNum(x.numKind(), y.numKind());
+    if (numIsUnsigned(k)) return (uint64_t)x.i < (uint64_t)y.i;
+    return x.i < y.i;
 }
 
 // how many backward jumps a loop needs before the interpreter compiles it (0 disables)
@@ -1454,7 +1468,7 @@ Value VM::execute(size_t stopDepth) {
                         const Value& x = cellValue(f.locals[a]);
                         const Value& y = cellValue(f.locals[b]);
                         if (x.t == VT::Int && y.t == VT::Int) {
-                            if (!(x.i < y.i)) f.ip += j;
+                            if (!intLessThan(x, y)) f.ip += j;
                         } else {
                             bool ok = truthy(binaryResult(OP_LT, x, y, "<"));
                             if (!ok) frames.back().ip = (int64_t)nextIp + j;
@@ -1469,7 +1483,7 @@ Value VM::execute(size_t stopDepth) {
                         const size_t nextIp = f.ip;
                         const Value& x = cellValue(f.locals[a]);
                         if (x.t == VT::Int) {
-                            if (!(x.i < (int64_t)imm)) f.ip += j;
+                            if (!intLessThan(x, Value::integer(imm))) f.ip += j;
                         } else {
                             bool ok = truthy(binaryResult(OP_LT, x, Value::integer(imm), "<"));
                             if (!ok) frames.back().ip = (int64_t)nextIp + j;

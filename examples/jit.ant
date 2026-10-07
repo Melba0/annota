@@ -235,4 +235,200 @@ range_auto(n)(
 Test.eq(range_auto(10), 55, "小输入正确")
 Test.eq(range_auto(2000000), 2000001000000, "大输入（中途接管）正确")
 
+
+Test.suite("JIT: width matrix (every declared width, machine code vs interpreter)")
+
+[[jit]]
+n_Int8(a:int8, b:int8)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Int8(a, b)(
+    a = int8(a)
+    b = int8(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Int8(v, 3), p_Int8(v, 3), "int8 b=3 v=" + str(v))
+    Test.eq(n_Int8(v, 0 - 1), p_Int8(v, 0 - 1), "int8 b=-1 v=" + str(v))
+    Test.eq(n_Int8(v, v), p_Int8(v, v), "int8 a=b v=" + str(v))
+)
+[[jit]]
+n_Int16(a:int16, b:int16)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Int16(a, b)(
+    a = int16(a)
+    b = int16(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Int16(v, 3), p_Int16(v, 3), "int16 b=3 v=" + str(v))
+    Test.eq(n_Int16(v, 0 - 1), p_Int16(v, 0 - 1), "int16 b=-1 v=" + str(v))
+    Test.eq(n_Int16(v, v), p_Int16(v, v), "int16 a=b v=" + str(v))
+)
+[[jit]]
+n_Int32(a:int32, b:int32)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Int32(a, b)(
+    a = int32(a)
+    b = int32(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Int32(v, 3), p_Int32(v, 3), "int32 b=3 v=" + str(v))
+    Test.eq(n_Int32(v, 0 - 1), p_Int32(v, 0 - 1), "int32 b=-1 v=" + str(v))
+    Test.eq(n_Int32(v, v), p_Int32(v, v), "int32 a=b v=" + str(v))
+)
+[[jit]]
+n_Int64(a:int64, b:int64)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Int64(a, b)(
+    a = int64(a)
+    b = int64(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Int64(v, 3), p_Int64(v, 3), "int64 b=3 v=" + str(v))
+    Test.eq(n_Int64(v, 0 - 1), p_Int64(v, 0 - 1), "int64 b=-1 v=" + str(v))
+    Test.eq(n_Int64(v, v), p_Int64(v, v), "int64 a=b v=" + str(v))
+)
+[[jit]]
+n_Uint8(a:uint8, b:uint8)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Uint8(a, b)(
+    a = uint8(a)
+    b = uint8(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Uint8(v, 3), p_Uint8(v, 3), "uint8 b=3 v=" + str(v))
+    Test.eq(n_Uint8(v, 0 - 1), p_Uint8(v, 0 - 1), "uint8 b=-1 v=" + str(v))
+    Test.eq(n_Uint8(v, v), p_Uint8(v, v), "uint8 a=b v=" + str(v))
+)
+[[jit]]
+n_Uint16(a:uint16, b:uint16)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Uint16(a, b)(
+    a = uint16(a)
+    b = uint16(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Uint16(v, 3), p_Uint16(v, 3), "uint16 b=3 v=" + str(v))
+    Test.eq(n_Uint16(v, 0 - 1), p_Uint16(v, 0 - 1), "uint16 b=-1 v=" + str(v))
+    Test.eq(n_Uint16(v, v), p_Uint16(v, v), "uint16 a=b v=" + str(v))
+)
+[[jit]]
+n_Uint32(a:uint32, b:uint32)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Uint32(a, b)(
+    a = uint32(a)
+    b = uint32(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Uint32(v, 3), p_Uint32(v, 3), "uint32 b=3 v=" + str(v))
+    Test.eq(n_Uint32(v, 0 - 1), p_Uint32(v, 0 - 1), "uint32 b=-1 v=" + str(v))
+    Test.eq(n_Uint32(v, v), p_Uint32(v, v), "uint32 a=b v=" + str(v))
+)
+[[jit]]
+n_Uint64(a:uint64, b:uint64)(
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+p_Uint64(a, b)(
+    a = uint64(a)
+    b = uint64(b)
+    new s = a + b
+    new d = a * 3 - b
+    new q = a / (b - 2)
+    new r = a % (b - 2)
+    if a < b( =s + 1 )
+    =d + q * 1000 + r - s
+)
+for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
+    Test.eq(n_Uint64(v, 3), p_Uint64(v, 3), "uint64 b=3 v=" + str(v))
+    Test.eq(n_Uint64(v, 0 - 1), p_Uint64(v, 0 - 1), "uint64 b=-1 v=" + str(v))
+    Test.eq(n_Uint64(v, v), p_Uint64(v, v), "uint64 a=b v=" + str(v))
+)
+
 Test.check()
