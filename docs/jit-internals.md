@@ -1,21 +1,26 @@
 # JIT 后端：现状、设计债与改造规格
 
-这份文档记录机器码后端（`src/jit.hpp`）的当前约定、已知的设计债，以及两件已知未做的工作的
-**可执行规格**。目的是让"为什么这么写"和"下一步具体改哪里"都有据可查，而不是靠记忆。
+这份文档记录机器码后端（`src/jit.hpp`）的当前约定、已知的设计债，以及**尚未完成的工作的
+可执行规格**。目的是让"为什么这么写"和"下一步具体改哪里"都有据可查，而不是靠记忆。
+
+已完成：§5（除法与取模）、§6（全局变量、区间迭代、OSR 描述符）。未完成：§4（128 位）、§3 的
+剩余部分（窄宽度的原生指令）、以及 §8 列出的几处小事。
 
 ## 1. 当前约定（必须遵守的不变量）
 
 | 项 | 约定 |
 |---|---|
 | 函数 ABI | `int64_t (*)(const int64_t* L, void* out)`；`L` 是局部量数组，`out` 是 `JitOut` |
-| `JitOut` | `{ int64_t value; int64_t kind; }`；`kind`: 0 int / 1 int64 / 2 bool / 3 null / 4 运行时错误 |
-| 局部量 | **直接读写 VM 的 `int64_t L[64]`**（`kBase` = rcx/rdi 指向它），与解释器共享内存 |
+| `JitOut` | `{ int64_t value; int64_t kind; Value* const* ctx; }`；`kind`: 0/6..11 = 各整数宽度，1 int64，2 bool，3 null，4 数组越界，12/13 除零/取模零；`ctx` = VM 每次调用填好的全局量槽位表 |
+| 局部量 | 原生帧里有一份**私有副本**（`localsPrologue` 从 `L` 拷贝并把 `kBase` 指过去），所以槽里可以放"原始 32 位"这类解释器不该看到的形式 |
 | 虚拟栈 | `[rsp + vr*8]`，每槽 8 字节 |
-| 槽内取值 | **规范化 64 位**：值精确等于其数学值（按种类符号/零扩展） |
-| 种类格 | `JitKindSet`（`uint16`，位 = `NumKind`），`kJitBool = 1<<15`，`kJitAllInts` = 任意整数宽度 |
+| 槽内取值 | 窄宽度槽可以是**原始值的低半部分**（`I32`/`U32`），其余宽度是精确的 64 位值；需要 64 位时先 `sextRaxFromI32` |
+| 种类格 | `JitKindSet`（`uint16`，位 = `NumKind`），`kJitBool = 1<<15`，`kJitAllInts` = 任意整数宽度，`kJitRange/kJitTuple/kJitConst = 1<<14/13/12` 是"不是整数"的标记 |
 | 逐槽种类 | `JitCode::slotKind[i]` = `NumKind+1`（0 = 不关心）；入口按此精确校验（I64 额外接受无类型） |
 | 值宽度 | 支持 `None/I8/I16/I32/I64/U8/U16/U32/U64`；**128 位与浮点不进入后端** |
-| 数组（实验） | 仅函数内自建、不逃逸的 1 维整型数组；缓冲区来自 arena（VM 在最外层原生调用后释放） |
+| 全局量 | 进程级索引 + `JitOut::ctx` 里的槽位数组；读内联、写走 `annotaJitSetGlobal`（触发 `state` 回调） |
+| 数组（实验） | 仅函数内自建、不逃逸的 1 维整型数组；缓冲区来自 VM 的 arena（最外层原生调用后释放） |
+| 线程 | 机器码挂在 `Chunk` 上，可能被两个线程上的两个 VM 同时执行；**任何跨线程状态都必须来自参数/栈**，见 §7 |
 
 ## 2. 已修的历史坑（都曾是"静默错误"）
 
@@ -28,6 +33,11 @@
 * `OP_CONST` 不被支持 → 只要用到超出 `int1` 立即数的字面量（模数、掩码）整块不可翻译。
 * `new x:int64 = 1` 的"无类型 → 声明宽度"转换被判成非恒等 → 常见写法不可翻译。
 * 直接调用时 `kBase`/`kOut` 被调用破坏、callee 的 `L[]` 起点算错。
+* 结果种类字节只有 int/int64/bool/null/uint64 → `new x:int8 = 127; =x` 让 `typeof` 报 `int`
+  而不是 `int8`（值对、类型错）。
+* `convert` 只收窄寄存器、**不写回槽** → `new a:int8 = n`（n=300）槽里留着 300，解释器是 44。
+* `INT64_MIN % -1` 让**解释器挂死**（硬件除法故障、操作数是运行期值）→ 解释器显式返回 0。
+
 
 ## 3. 设计债一：值宽度
 
@@ -98,128 +108,66 @@
 
 ## 5. 除法与取模：用 C 辅助函数，不要手写 `idiv` 分支
 
-`OP_DIV` / `OP_MOD` 目前完全不在后端里（`fastIntBinary` 不处理它们，走 `binaryResult`），
-所以带 `%` 的函数**整块**退回解释器——`examples/jit.ant` 里的 `sum_even_jit` 就是这样。
+**已完成。** `OP_DIV` / `OP_MOD` 走 `callC2`（两个整数参数），语义留在 C++（`annotaJitDiv` /
+`annotaJitMod`）。除数为零不进辅助函数：机器码自己 `test r11, r11` + `jz`，走一条冷路径用
+`JitOut.kind = 12/13` 返回，VM 在原生调用返回后抛 `division by zero` / `modulo by zero`。
+起初用"全局标志 + 机器码读固定地址"实现，后来发现那在多线程下是共享可写状态（见 §7），
+于是把错误种类放进了 `JitOut`。这样就不需要 `test/jz/cmp -1/cqo/idiv` 和两个短路补丁，
+带 `%` 的循环因此可以整块进机器码。
 
-手写 `idiv` 序列要处理三件事，每一件都容易出错（我第一次尝试就是崩在这里）：
+### 5.1 解释器的精确语义（`vm.cpp` 的 `binaryResult`）
 
-1. 除数为零：解释器抛可捕获错误，而硬件触发 `#DE` 故障；
-2. `INT_MIN / -1`：`idiv` 溢出故障，而解释器的环绕语义给出 `-dividend`、余数 0；
-3. `%` 的符号约定必须与解释器（`binaryResult`）逐位一致。
-
-**更稳的做法**：把语义留在 C++ 里，机器码只调一次现成的 `callC`（数组分配器已经在用这套）：
-
-```
-// vm.cpp
-int64_t annotaJitDiv(int64_t a, int64_t b);   // 与解释器 binaryResult 完全一致的语义
-int64_t annotaJitMod(int64_t a, int64_t b);   // 除零时置位 jitDivByZero 并返回 0
-```
-
-* 发射侧：`loadVrToRax(d-2)` → `mov rcx, rax`；`loadVrToRax(d-1)` → `mov rdx, rax`（第二参数），
-  然后 `callC(&annotaJitDiv, ...)`，结果是 `rax`。宽度规则沿用第 3 节：
-  32 位种类直接存 `eax`（写 32 位寄存器即得原始值），其他种类按提升宽度 `wrapRax`。
-* 除零：C 辅助函数置位，VM 在两个原生入口（`runNativeIfReady`、OSR）检查该标志后抛
-  `除数为零`，与 `JitOut.kind == 4` 同一条通道。
-* 这样就不需要在机器码里生成 `test/jz/cmp -1/cqo/idiv` 和两个短路补丁——那三处正是崩溃的来源。
-
-代价是每次除法多一次调用（`idiv` 本身也要 20–40 周期），换来的是语义由一处 C++ 代码定义，
-并且 `%` 密集的代码从此可以进机器码。
-
-### 5.1 解释器的精确语义（`vm.cpp:2136` 起，已核对）
-
-```cpp
-bool intMode = (a.t == VT::Int && b.t == VT::Int);
-NumKind kr = promoteNum(a.numKind(), b.numKind());     // 结果种类
-// OP_MOD:  b.i == 0 -> throwError("modulo by zero");  否则 Value::typedInt(a.i % b.i, kr)
-// OP_DIV:  同上，除数为零时报 "division by zero"（见同一条分支）
-```
-
-即：**C 式截断**（不是向下取整）✓；结果按 `promoteNum` 的种类回绕 ✓；除零抛可捕获错误 ✓。
-注意 `INT64_MIN / -1` 在解释器里是 C++ 未定义行为，所以 JIT 侧**显式定义**它更安全：
-
-```cpp
-// vm.cpp（与数组分配器同一套：机器码用 callC 调用，VM 在原生入口检查标志）
-namespace { int gJitDivErr = 0; }                       // 1 = 除零, 2 = 取模零
-int64_t annotaJitDiv(int64_t a, int64_t b) {
-    if (b == 0) { gJitDivErr = 1; return 0; }
-    if (b == -1) return (int64_t)(0 - (uint64_t)a);      // 环绕语义，避免 UB
-    return a / b;
-}
-int64_t annotaJitMod(int64_t a, int64_t b) {
-    if (b == 0) { gJitDivErr = 2; return 0; }
-    if (b == -1) return 0;
-    return a % b;
-}
-```
-
-VM 两个原生入口（`runNativeIfReady`、OSR）在现有 `JitOut.kind == 4` 检查旁加：
-
-```cpp
-if (gJitDivErr) { int e = gJitDivErr; gJitDivErr = 0;
-                  throwError(e == 1 ? "division by zero" : "modulo by zero"); }
-```
-
-发射侧（`jit.hpp`）：解码把 `OP_DIV`/`OP_MOD` 当作无操作数指令；分析把它们并入
-`OP_ADD/SUB/MUL` 那条（弹 2、推 `jitPromoteSet`）；发射是
-
-```
-loadVrToRax(d-2) -> mov rcx, rax          // 被除数
-loadVrToRax(d-1) -> mov rdx, rax          // 除数
-callC(&annotaJitDiv 或 &annotaJitMod, ...) // 结果在 rax；kBase/kOut 由 callC 保存恢复
-32 位种类直接存 eax（写 32 位寄存器即得原始值）；其他种类 wrapRax(提升种类)
-```
-
-三处改动（两个 C 函数 + 一个标志检查 + 一段发射），不再有任何手写的 `test/jz/cmp -1/cqo/idiv`
-与短跳转补丁——那是上一次崩溃的来源。
+**C 式截断**（不是向下取整）✓；结果按 `promoteNum` 的种类回绕 ✓；除零抛可捕获错误 ✓。
+`INT64_MIN / -1` 在解释器里已经有显式分支（返回 `INT64_MIN`），机器码沿用它；
+`INT64_MIN % -1` 曾经会让解释器**挂死**（硬件除法故障，而操作数是运行期值），
+现在 `binaryResult` 也显式处理成 0，与机器码一致。
 
 
 
-## 6. 待做：全局变量与区间迭代
+
+## 6. 全局变量与区间迭代：都已落地
 
 这两条是用户侧影响最大的缺口：真实程序的状态几乎都在全局量上，而 `for i in a to b` 是最常用的
-循环写法。两条都会让**整个函数**退回解释器。
+循环写法。两条都会让**整个函数**退回解释器。下面是实际采用的做法（都已在 `src/jit.hpp` /
+`src/vm.cpp` 里实现，并有 `examples/jit.ant` 的对照用例守着）。
 
-### 6.1 全局变量
+### 6.1 全局变量：进程级索引 + VM 侧槽位表
 
-现在 `OP_GET_GLOBAL` / `OP_SET_GLOBAL` 不在后端里。两种做法：
+`globals` 仍然是 `std::map<std::string, Cell>`（不动解释器），但每个**名字**在
+`annotaJitGlobalIndex` 里拿到一个**进程级**索引（只追加，永不改变），机器码把索引当立即数用。
 
-**方案 A（推荐，长期正确）：全局量改成槽位数组。** VM 里 `globals` 从 `std::map<std::string, Cell>`
-变成 `std::vector<Cell> slots` 加一份"名字 → 槽位"的映射，编译器把全局名字常量换成槽位号。
-之后机器码读全局量与读局部量同构：
+值指针的数组在 VM 里：
+
+* `VM::jitGlobalCache`（按索引）由 `globals` 在**结构变化**时重建——`globalsGen` 计数器在任何
+  插入/删除处自增，缓存代次不匹配就重新按名字解析一遍；
+* 每次原生调用前 `VM::jitGlobalsOk` 检查本块（以及它直接调用的所有块，编译时合并）用到的每个全局量：
+  必须存在、`t == VT::Int`、种类是 `None`/`I64`（否则这一次调用照常解释执行）；
+* 数组指针放进**本次调用的 `JitOut::ctx`**（而不是某个固定地址），JIT→JIT 直接调用时由调用者
+  把自己的 `ctx` 抄进 callee 的 `JitOut`。读全局量因此是三条 `mov`：
 
 ```
-mov rax, [globals + slot*8]      ; Cell（shared_ptr<Value>）的裸指针
-mov rax, [rax]                   ; Value::i
+mov rax, [kOut + 16]        ; ctx = VM 填好的槽位数组
+mov rax, [rax + idx*8]      ; Value*
+mov rax, [rax + off(i)]     ; payload
 ```
 
-好处是解释器的全局访问也一起变快；代价是 VM 里所有 `globals[...]` 访问点、模块内联后的全局重命名、
-以及任何序列化/调试输出都要跟着改。
+写全局量走辅助函数 `annotaJitSetGlobal(idx, value, kind)`：`state` 变量的变更回调必须触发，
+而回调只有 C++ 知道；写路径远不如读路径热，用一次调用换语义正确是划算的。
 
-**方案 B（改动小，先落地）：把全局表指针作为第三个参数传给机器码。** Windows ABI 的第三个整数参数
-在 `r8`，而 `r8` 目前是发射器的暂存寄存器，所以必须把它放进帧内私有槽，像 `kBase` / `kOut` 那样在
-调用前后保存恢复（`callC` 已经是这个模式）。需要同时改三处传递：`JitFn` 签名、
-JIT→JIT 的直接调用、OSR 蹦床。
+为什么不用固定地址的全局指针：`_sys_spawn` 真的会在另一个线程上跑**另一个 VM**，而机器码（挂在
+Chunk 上）是共享的。详见 §7。
 
-两种方案共同的前置条件：
+### 6.2 区间迭代：后端翻译协议 + 每轮一个私有槽对
 
-* 全局量的**种类**必须静态可知（该全局在整个程序里只被赋同一种 64 位以内的整数值），否则退回解释器；
-* 入口检查要覆盖全局量——现在 `jitLocalsOk` / `readSlots` 只看局部量，全局量的 Cell 可能在运行时
-  是别的类型，必须在原生代码执行前验证；
-* 未初始化或类型不符要走错误通道（`JitOut.kind`），不能直接读内存。
+`for i in a to b` 的三条指令都在后端里，用 **JIT 私有的两个槽**（每个虚拟寄存器 16 字节：
+当前值、上界）代替堆对象，`step` 恒为 +1：
 
-### 6.2 区间迭代 `for i in a to b [step s]`
-
-编译器目前把它展开成迭代器协议指令（`OP_ITER_*`）。两条路：
-
-1. **在后端翻译这套协议**：解码 `OP_ITER_*`，分析里建模成"循环头 + 每轮 next 的比较与自增"，
-   发射成普通 `cmp` / `jcc` / `add`（与 `while` 同一套）。要逐个核对协议指令的栈效果与边界语义：
-   `step` 为负、`a > b` 的空区间、循环变量在体内被改写。
-2. **在编译器里把 `for i in a to b` 降级成等价的 `while`**（当上下界都是整型表达式时）。
-   后端一行都不用改，解释器也少几条指令；风险是 `for` 的语义细节（循环变量作用域、
-   体内修改循环变量的行为）必须与现在逐位一致，需要解释器与分析器两边的对照测试。
-
-**建议顺序**：先做 2（改动集中在编译器、收益立刻可见），再用 1 覆盖 `step` 与负步长等形态；
-全局量按 6.1 的方案 B 先打通，再视需要迁移到方案 A。
+* `iter_range`：弹掉 (下界, 上界)，上界进 `stop` 槽，下界进 `cur` 槽，栈上原位留一个
+  `kJitRange` 标记（**不**占真实值），于是所有深度仍然与解释器逐位对齐；
+* `iter_next -> X`：`cmp cur, stop` + `jg X`（耗尽边，深度 d），否则压入 `cur`（`Value::integer`，
+  种类 `None`）并把 `cur` 加一（落空边，深度 d+1）。**这是唯一一条两条边栈深不同的指令**，
+  分析器的边传播必须分别处理（`jumpDepth`/`jumpVk`）；
+* `pop`：什么都不发。
 
 ### 6.3 已核实的字节码形态（`for i in 1 to n`，`check --dump-bc` 实测）
 
@@ -227,30 +175,19 @@ JIT→JIT 的直接调用、OSR 蹦床。
     int1 1                ; 下界
     get_local n           ; 上界
     iter_range            ; 弹 (start, stop) -> 压入迭代器对象
-    iter_next -> 32       ; 迭代器耗尽则跳到 32；否则压入当前值
+    iter_next -> 30       ; 迭代器耗尽则跳到 30；否则压入当前值
     init_local i          ; 每轮重新初始化循环变量
     ... 循环体 ...
-    loop -> 17
-32  pop                   ; 丢弃迭代器
+    loop -> 15            ; 回跳目标是 iter_next 本身
+30  pop                   ; 丢弃迭代器
 ```
 
-**关键事实**：迭代器状态是**堆对象**（`vm.cpp:1612` 推入 `Value::iterRange(cur, stop, step)`，
-`vm.cpp:1634` 里读写 `Obj::iterKind/iterCur/iterStop/iterStep`），不是能放进 64 位槽的整数。
-所以两条路的代价差别很大：
+**关键事实**：回跳目标是 `iter_next`，而它进入时操作数栈里**留着迭代器**（深度 1）。
+这正是"循环头栈非空 ⇒ 原来没有 OSR 入口"的原因，所以 §6.4 之后还必须做 §6.5。
 
-* **后端翻译协议**（§6.2 第 1 条）：要把"迭代器对象指针"当成一种新槽种类，并硬编码 `Obj` 的字段
-  偏移与 `iter_next` 的推进逻辑。对象是引用计数的，而机器码的私有槽不持有引用，只能依赖解释器栈上
-  那个 `Value` 在整段原生代码执行期间活着。可行但脆，且 `Obj` 布局一变就要同步。
-* **编译器降级**（§6.2 第 2 条，推荐先做）：换成语义等价的
-  `i = 下界; <隐藏局部量> = 上界; while i <= 上界( ... i += 1 )`（上下界在协议里只求值一次，
-  所以上界必须存进一个隐藏局部量）。产出的字节码只用整数局部量 + 比较/跳转，
-  后端**一行都不用改**就能编译。唯一要注意的差异：协议每轮 `init_local i` 表示循环变量
-  **每轮新建**（被闭包捕获时每轮各有一个 cell），降级成 `while` 会变成同一个变量 ——
-  所以只在循环体里**没有创建闭包**（AST 无函数表达式）时降级，否则保留原协议。
+### 6.4 不要在编译器降级（会静默改语义）
 
-### 6.4 结论修正：不要在编译器降级（会静默改语义）
-
-`vm.cpp:1111` 的 `OP_INIT_LOCAL` 是
+`OP_INIT_LOCAL` 是
 
 ```cpp
 f.locals[s] = std::make_shared<Value>(copyIfShared(v));   // 每轮分配新的 cell
@@ -258,16 +195,58 @@ f.locals[s] = std::make_shared<Value>(copyIfShared(v));   // 每轮分配新的 
 
 也就是说协议里每轮 `init_local i` 让循环变量**每轮都是一个新变量**：闭包在循环体里捕获它时，
 每轮各拿到自己的 cell（与 Python/Rust 的按轮捕获一致）。把它降级成 `while` 会变成**同一个 cell**，
-闭包看到的就是最后一次的值 —— 这是**静默的语义改变**，比它换来的性能严重得多。所以 §6.3 里
-"推荐先做编译器降级"这句话作废，正确做法是下面两条之一：
+闭包看到的就是最后一次的值 —— 这是**静默的语义改变**，比它换来的性能严重得多。
+所以采用"在后端翻译协议"（§6.2），语义零改动。
 
-1. **只在循环体里不创建闭包时降级**（AST 里没有函数表达式；递归检查必须对未知节点保守返回
-   "有函数"，否则漏一个节点就是不安全的）。收益：后端零改动。
-2. **在后端翻译协议，用 JIT 私有的暂存槽代替堆对象**（推荐，语义零改动）：
-   * `iter_range`：弹掉 (下界, 上界)，把**上界**写进一个 JIT 私有暂存槽（私有局部量区可以多留几个槽），
-     把**下界**作为"当前值"压栈；
-   * `iter_next`：比较栈顶与暂存槽（`step > 0` 时用 `jg`），未耗尽则**再压一份当前值**并把栈顶
-     自增（等价于"压入当前值 + 推进"），耗尽则跳到字节码目标（用现成的 `pending` 补丁机制）；
-   * `iter_range_step`：`step` 是运行期值，先不翻译（退回解释器）；
-   * `pop`：丢弃栈顶的"当前值"。
-   解释器仍用它自己的堆对象，所以**完全不动语言语义**；机器码只是把同一套推进逻辑放在自己的槽里。
+### 6.5 OSR 不再要求空栈：描述符 + VM 侧重建
+
+原来的 trampoline 只在"回跳目标且操作数栈为空"时生成。现在编译期给每个 OSR 入口写一张
+**每活跃虚拟寄存器一个字节**的描述符（`JitCode::osrDesc`，同时以数据的形式贴在代码缓冲区末尾，
+trampoline 用 RIP 相对 `lea` 拿它的地址）：
+
+| 描述符 | 含义 | VM 侧的检查 | 重建 |
+|---|---|---|---|
+| `0` | 任意整型 | `t == VT::Int` | `vr[i] = v.i` |
+| `1` | 无类型整数或 int64 | `k ∈ {None, I64}` | `vr[i] = v.i` |
+| `2..12` | 某一个精确宽度 | `k` 必须是那个宽度 | `vr[i] = v.i` |
+| `254` | 比较结果 | `t == VT::Bool` | `vr[i] = v.b ? 1 : 0` |
+| `255` | 区间迭代器 | `t == VT::Iter && iterKind == Range && iterStep == 1` | `iter[2i] = iterCur; iter[2i+1] = iterStop` |
+
+`VM::jitOsrOk` 在调用 trampoline 之前逐条核对（不满足就继续解释执行），trampoline 再做栈帧开场
+并调用 `annotaJitOsrInit`（读 `gJitStackBase`）把值搬进原生帧，最后跳到循环头。
+效果：`for i in 1 to n` 跑 200 万次从 950 ms 降到 64 ms，嵌套区间循环（栈上同时有两个迭代器）
+也逐位一致。
+
+## 7. 线程：两条真实存在的共享状态
+
+`_sys_spawn` 会在**另一个线程**上创建**另一个 VM**并执行同一个函数值——而 `Chunk`（以及挂在它上面
+的 `JitCode`）是共享的，所以同一份机器码可以同时被两个线程执行。目前的后端对这件事有两条硬约定：
+
+1. **机器码只能从参数/栈上取状态。** 全局量因此走 `JitOut::ctx`（每次调用由 VM 填），
+   而不是某个固定的全局变量地址。早期版本用"全局指针 + `movabs` 固定地址"，单线程测试全绿，
+   但两个 VM 并发时读到的就是对方的全局量。
+2. **每次原生调用需要的线程状态必须是"裸指针"。** `gJitVm` / `gJitStackBase` / `gJitGlobalSlots`
+   都是 `thread_local` 的**指针**（可平凡析构，不注册 TLS 回调）。
+   反例是数组 arena：它曾经是 `thread_local std::vector<void*>`，于是 MinGW + libwinpthread 下
+   线程退出时 TLS 回调里的 `free` 会触发 `STATUS_HEAP_CORRUPTION`（约 40% 的运行会崩，
+   而且只在"有 `Thread.spawn` **且**真的执行了机器码"时出现）。现在 arena 放在 VM 里
+   （每个线程有自己的 VM），`jitArena()` 只是取 `gJitVm->jitArena`。
+
+还有一处**已知的、与后端无关**的隐患：`Chunk::directCache` / `directSelf` 是解释器的
+"`call_direct` 名字缓存"，由 VM 在运行期惰性填充，而 `Chunk` 是跨线程共享的。两个 worker
+VM 同时首次调用同一个 `call_direct` 目标时会并发写这个 vector。它先于本次改动存在，
+目前靠"两个 worker 的填充时机通常错开"侥幸躲过；正确做法是把这份缓存搬到 VM 侧
+（以 `Chunk*` 为键），或加一把锁。
+
+## 8. 还没做的小事（都不是正确性问题，但值得知道）
+
+| 位置 | 现状 |
+|---|---|
+| `OP_DEF_GLOBAL` / `OP_DEL_GLOBAL` | 整块不可翻译（`del` 会作废全局量指针缓存，所以删除时必须 `globalsGen++`） |
+| `for i in a to b step s` | `iter_range_step` 不可翻译（`step` 是运行期值） |
+| `for x in xs`（容器迭代） | `iter_value` 不可翻译 |
+| `print` 的分隔符实参 | 不可翻译（分隔符是字符串值，不是常量引用） |
+| 窄宽度参数 | 入口要求实参种类**精确匹配**（`int64` 额外接受无类型），所以 `f(x:int32)` 从无类型实参调用时走解释器 |
+| 返回全局量 | 支持（运行期读全局量的种类字节），但 `retByte` 因此是"-2 随运行期变化"，函数不能作为直接调用目标 |
+| 128 位（`longlong`/`ulonglong`） | §4 的规格仍然有效，未实现 |
+| 数组（`ANNOTA_JIT_ARRAYS`） | 仍有一个已知的模式错误（`=a[0]` 取到旧元素），默认关闭 |

@@ -139,4 +139,100 @@ print ""
 print "自动 JIT 第一次 ->", t1 - t0, "ms"
 print "自动 JIT 第二次 ->", t2 - t1, "ms"
 
+Test.suite("JIT：除法、宽度、print、区间与全局量")
+
+-- 除法和取模由 C 辅助函数负责语义，机器码只检查除数是否为零
+[[jit]]
+div_jit(a:int64, b:int64)(
+    new q = a / b
+    new r = a % b
+    =q * 1000000 + r
+)
+div_plain(a, b)(
+    new q = a / b
+    new r = a % b
+    =q * 1000000 + r
+)
+Test.eq(div_jit(-17, 5), div_plain(-17, 5), "除法取模与解释器一致")
+Test.eq(div_jit(-17, 5), -3000002, "-17/5 与 -17%5")
+Test.eq(div_jit(17, -5), div_plain(17, -5), "负除数一致")
+
+-- 每个声明宽度都必须原样穿过机器码（回绕和 typeof 都要一致）
+[[jit]]
+widths_jit(n:int64)(
+    new a: int8 = int8(n)
+    new b: uint32 = uint32(n)
+    new c: uint64 = uint64(n)
+    print(a, b, c)
+    print(a < b, b < c, a == a)
+    =int64(a)
+)
+widths_plain(n)(
+    new a: int8 = int8(n)
+    new b: uint32 = uint32(n)
+    new c: uint64 = uint64(n)
+    print(a, b, c)
+    print(a < b, b < c, a == a)
+    =int64(a)
+)
+Test.eq(widths_jit(300), widths_plain(300), "窄宽度回绕一致")
+Test.eq(typeof(widths_jit(300)), typeof(widths_plain(300)), "窄宽度 typeof 一致")
+Test.eq(widths_jit(300), 44, "300 收进 int8 是 44")
+
+-- 区间迭代：机器码把迭代器状态放在自己的私有槽里
+[[jit]]
+range_jit(n:int64)(
+    new total = 0
+    for i in 1 to n(
+        for j in 1 to 3(
+            total = total + i * j
+        )
+    )
+    =total
+)
+range_plain(n)(
+    new total = 0
+    for i in 1 to n(
+        for j in 1 to 3(
+            total = total + i * j
+        )
+    )
+    =total
+)
+Test.eq(range_jit(100), range_plain(100), "区间迭代（嵌套）一致")
+Test.eq(range_jit(100), 30300, "区间迭代结果")
+Test.eq(range_jit(0), 0, "空区间")
+Test.eq(range_jit(1), 6, "单次迭代")
+
+-- 全局量：机器码读它、写它，值必须和解释器一模一样
+new gtotal = 0
+new gcount = 0
+[[jit]]
+user_shape(n:int64)(
+    for i in 1 to n(
+        gtotal = gtotal + i
+        gcount = gcount + 1
+    )
+    print("gtotal", gtotal, "gcount", gcount)
+    =gtotal
+)
+Test.eq(user_shape(1000), 500500, "全局量累加（机器码里写全局量）")
+Test.eq(gcount, 1000, "全局量计数")
+Test.eq(gtotal, 500500, "全局量在调用结束后可见")
+print "全局量在 [[jit]] 函数里被改写：", gtotal, gcount
+Test.eq(user_shape(0), gtotal, "零次迭代不改动全局量")
+
+Test.suite("自动 JIT：区间循环的中途接管")
+
+-- 没有标注：区间循环跑热之后在 iter_next 处直接换成机器码（栈上还留着迭代器）
+range_auto(n)(
+    new total = 0
+    for i in 1 to n(
+        total = total + i
+    )
+    =total
+)
+Test.eq(range_auto(10), 55, "小输入正确")
+Test.eq(range_auto(2000000), 2000001000000, "大输入（中途接管）正确")
+
 Test.check()
