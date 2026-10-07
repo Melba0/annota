@@ -125,3 +125,51 @@ int64_t annotaJitMod(int64_t a, int64_t b);   // 除零时置位 jitDivByZero �
 代价是每次除法多一次调用（`idiv` 本身也要 20–40 周期），换来的是语义由一处 C++ 代码定义，
 并且 `%` 密集的代码从此可以进机器码。
 
+### 5.1 解释器的精确语义（`vm.cpp:2136` 起，已核对）
+
+```cpp
+bool intMode = (a.t == VT::Int && b.t == VT::Int);
+NumKind kr = promoteNum(a.numKind(), b.numKind());     // 结果种类
+// OP_MOD:  b.i == 0 -> throwError("modulo by zero");  否则 Value::typedInt(a.i % b.i, kr)
+// OP_DIV:  同上，除数为零时报 "division by zero"（见同一条分支）
+```
+
+即：**C 式截断**（不是向下取整）✓；结果按 `promoteNum` 的种类回绕 ✓；除零抛可捕获错误 ✓。
+注意 `INT64_MIN / -1` 在解释器里是 C++ 未定义行为，所以 JIT 侧**显式定义**它更安全：
+
+```cpp
+// vm.cpp（与数组分配器同一套：机器码用 callC 调用，VM 在原生入口检查标志）
+namespace { int gJitDivErr = 0; }                       // 1 = 除零, 2 = 取模零
+int64_t annotaJitDiv(int64_t a, int64_t b) {
+    if (b == 0) { gJitDivErr = 1; return 0; }
+    if (b == -1) return (int64_t)(0 - (uint64_t)a);      // 环绕语义，避免 UB
+    return a / b;
+}
+int64_t annotaJitMod(int64_t a, int64_t b) {
+    if (b == 0) { gJitDivErr = 2; return 0; }
+    if (b == -1) return 0;
+    return a % b;
+}
+```
+
+VM 两个原生入口（`runNativeIfReady`、OSR）在现有 `JitOut.kind == 4` 检查旁加：
+
+```cpp
+if (gJitDivErr) { int e = gJitDivErr; gJitDivErr = 0;
+                  throwError(e == 1 ? "division by zero" : "modulo by zero"); }
+```
+
+发射侧（`jit.hpp`）：解码把 `OP_DIV`/`OP_MOD` 当作无操作数指令；分析把它们并入
+`OP_ADD/SUB/MUL` 那条（弹 2、推 `jitPromoteSet`）；发射是
+
+```
+loadVrToRax(d-2) -> mov rcx, rax          // 被除数
+loadVrToRax(d-1) -> mov rdx, rax          // 除数
+callC(&annotaJitDiv 或 &annotaJitMod, ...) // 结果在 rax；kBase/kOut 由 callC 保存恢复
+32 位种类直接存 eax（写 32 位寄存器即得原始值）；其他种类 wrapRax(提升种类)
+```
+
+三处改动（两个 C 函数 + 一个标志检查 + 一段发射），不再有任何手写的 `test/jz/cmp -1/cqo/idiv`
+与短跳转补丁——那是上一次崩溃的来源。
+
+
