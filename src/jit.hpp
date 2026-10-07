@@ -256,6 +256,11 @@ public:
     void movRaxImm(int32_t v) { u8(0x48); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
     void movRaxImm64(uint64_t v) { u8(0x48); u8(0xB8); for (int b = 0; b < 8; b++) u8((uint8_t)((v >> (8 * b)) & 0xff)); }
     void movR8Imm(int32_t v) { u8(0x49); u8(0xC7); u8(0xC0); u32((uint32_t)v); }
+    // A slot whose kind is 32 bit may hold a raw value: a 32 bit operation leaves the low half exact
+    // and zeroes the upper half, so anything that needs the 64 bit value widens it first.  This is
+    // what lets `int32` arithmetic skip the narrowing fixup.
+    void sextRaxFromI32() { u8(0x48); u8(0x63); u8(0xC0); }             // movsxd rax, eax
+    void sextR8FromI32() { u8(0x4D); u8(0x63); u8(0xC0); }              // movsxd r8, r8d
     void cmpEaxR8d() { u8(0x44); u8(0x39); u8(0xC0); }                 // cmp eax, r8d
     void addRaxR8() { u8(0x4C); u8(0x01); u8(0xC0); }
     void subRaxR8() { u8(0x4C); u8(0x29); u8(0xC0); }
@@ -939,9 +944,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.loadVrToR8(d - 1);
                 int pk = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
                                                    vrKind[i][(size_t)d - 1]));
-                if (pk == (int)NumKind::U32) {
-                    // A write to a 32 bit register zeroes the upper half, which is already the
-                    // canonical form of a uint32, so the fixup the other widths need is free here.
+                if (pk == (int)NumKind::U32 || pk == (int)NumKind::I32) {
+                    // A write to a 32 bit register zeroes the upper half, so the low 32 bits already
+                    // are the exact value and no narrowing fixup is needed.  A slot written this way
+                    // holds a "raw" 32 bit value; every consumer that needs 64 bits widens it first.
                     if (x.op == OP_ADD) { e.u8(0x44); e.u8(0x01); e.u8(0xC0); }        // add eax, r8d
                     else if (x.op == OP_SUB) { e.u8(0x44); e.u8(0x29); e.u8(0xC0); }   // sub eax, r8d
                     else { e.u8(0x44); e.u8(0x0F); e.u8(0xAF); e.u8(0xC0); }           // imul eax, r8d
@@ -963,7 +969,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 int pkC = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
                                                     vrKind[i][(size_t)d - 1]));
                 if (pkC == (int)NumKind::I32 || pkC == (int)NumKind::U32) e.cmpEaxR8d();
-                else e.cmpRaxR8();
+                else {
+                    // a raw 32 bit operand has to be widened before a 64 bit comparison
+                    if (jitSoleKind(vrKind[i][(size_t)d - 2]) == (int)NumKind::I32) e.sextRaxFromI32();
+                    if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::I32) e.sextR8FromI32();
+                    e.cmpRaxR8();
+                }
                 int uns = jitUnsignedCmp(vrKind[i][(size_t)d - 2], vrKind[i][(size_t)d - 1]);
                 uint8_t cc;
                 if (x.op == OP_EQ) cc = 0x94;
@@ -1080,6 +1091,9 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 for (int k = 0; k < x.imm; k++) {
                     int src = N + (d - x.imm + k) * 8;                        // the argument's VR
                     e.u8(0x48); e.u8(0x8B); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)src);
+                    // the callee checks kinds against L[], so a raw 32 bit argument must be exact
+                    if (jitSoleKind(vrKind[i][(size_t)(d - x.imm + k)]) == (int)NumKind::I32)
+                        e.sextRaxFromI32();
                     e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24); e.u32((uint32_t)(k * 8));
                 }
                 if (JitEmitter::kBase == 0x01) { e.u8(0x48); e.u8(0x89); e.u8(0xE1); }   // mov rcx, rsp (L)
@@ -1109,6 +1123,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_RETURN: {
                 e.loadVrToRax(d - 1);
                 int sole = jitSoleKind(vrKind[i][(size_t)d - 1]);
+                // a raw 32 bit slot only carries the low half: make the value exact for the VM
+                if (sole == (int)NumKind::I32) e.sextRaxFromI32();
                 if (i > 0 && ins[i - 1].op == OP_GET_LOCAL &&
                     tracked[(size_t)ins[i - 1].a]) {
                     // the value came straight from a tracked local: its kind byte is exact
