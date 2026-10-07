@@ -95,3 +95,33 @@
 
 **建议顺序**：先做第 3 节（私有帧 + 宽度表示），因为"宽值跨槽"依赖同一套槽位规则；
 再把 128 位作为"两个槽 + 两个新种类"接上去。
+
+## 5. 除法与取模：用 C 辅助函数，不要手写 `idiv` 分支
+
+`OP_DIV` / `OP_MOD` 目前完全不在后端里（`fastIntBinary` 不处理它们，走 `binaryResult`），
+所以带 `%` 的函数**整块**退回解释器——`examples/jit.ant` 里的 `sum_even_jit` 就是这样。
+
+手写 `idiv` 序列要处理三件事，每一件都容易出错（我第一次尝试就是崩在这里）：
+
+1. 除数为零：解释器抛可捕获错误，而硬件触发 `#DE` 故障；
+2. `INT_MIN / -1`：`idiv` 溢出故障，而解释器的环绕语义给出 `-dividend`、余数 0；
+3. `%` 的符号约定必须与解释器（`binaryResult`）逐位一致。
+
+**更稳的做法**：把语义留在 C++ 里，机器码只调一次现成的 `callC`（数组分配器已经在用这套）：
+
+```
+// vm.cpp
+int64_t annotaJitDiv(int64_t a, int64_t b);   // 与解释器 binaryResult 完全一致的语义
+int64_t annotaJitMod(int64_t a, int64_t b);   // 除零时置位 jitDivByZero 并返回 0
+```
+
+* 发射侧：`loadVrToRax(d-2)` → `mov rcx, rax`；`loadVrToRax(d-1)` → `mov rdx, rax`（第二参数），
+  然后 `callC(&annotaJitDiv, ...)`，结果是 `rax`。宽度规则沿用第 3 节：
+  32 位种类直接存 `eax`（写 32 位寄存器即得原始值），其他种类按提升宽度 `wrapRax`。
+* 除零：C 辅助函数置位，VM 在两个原生入口（`runNativeIfReady`、OSR）检查该标志后抛
+  `除数为零`，与 `JitOut.kind == 4` 同一条通道。
+* 这样就不需要在机器码里生成 `test/jz/cmp -1/cqo/idiv` 和两个短路补丁——那三处正是崩溃的来源。
+
+代价是每次除法多一次调用（`idiv` 本身也要 20–40 周期），换来的是语义由一处 C++ 代码定义，
+并且 `%` 密集的代码从此可以进机器码。
+
