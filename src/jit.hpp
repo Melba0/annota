@@ -37,10 +37,50 @@ using JitFn = int64_t (*)(const int64_t*, void*);
 // 3 = null, 4 = runtime error to be raised by the VM after the native call returns.
 constexpr int64_t kJitOutError = 4;
 
+// The kind byte a compiled function writes next to its result.  The first six codes are the
+// original set; the widths that used to collapse into "int" (0) now have their own code, because
+// the interpreter's `typeof` distinguishes them and a native result must be indistinguishable:
+//   0 = int, 1 = int64, 2 = bool, 3 = null, 4 = runtime error, 5 = uint64,
+//   6 = int8, 7 = int16, 8 = int32, 9 = uint8, 10 = uint16, 11 = uint32
+static inline int jitKindCode(NumKind k) {
+    switch (k) {
+        case NumKind::I8:  return 6;
+        case NumKind::I16: return 7;
+        case NumKind::I32: return 8;
+        case NumKind::I64: return 1;
+        case NumKind::U8:  return 9;
+        case NumKind::U16: return 10;
+        case NumKind::U32: return 11;
+        case NumKind::U64: return 5;
+        default: return 0;                     // None, and everything a JIT result cannot be
+    }
+}
+static inline bool jitKindFromCode(int code, NumKind& out) {
+    switch (code) {
+        case 0:  out = NumKind::None; return true;
+        case 1:  out = NumKind::I64;  return true;
+        case 5:  out = NumKind::U64;  return true;
+        case 6:  out = NumKind::I8;   return true;
+        case 7:  out = NumKind::I16;  return true;
+        case 8:  out = NumKind::I32;  return true;
+        case 9:  out = NumKind::U8;   return true;
+        case 10: out = NumKind::U16;  return true;
+        case 11: out = NumKind::U32;  return true;
+        default: return false;                 // 2 = bool, 3 = null, 4 = error
+    }
+}
+
 // Backing store for arrays created inside compiled code.  The code calls this function while it
 // runs; the VM frees everything it handed out once the outermost native invocation returns.
 int64_t* annotaJitArrayAlloc(int64_t bytes);   // implemented by the VM
 void jitArenaReset();
+
+// Division and modulo are the two operations whose semantics (signed truncation, a divisor of
+// zero, `INT64_MIN / -1`) are kept in C++: the machine code calls these and then checks the flag
+// they set.  A non-zero flag after a native call becomes a catchable Annota error.
+int64_t annotaJitDiv(int64_t a, int64_t b);
+int64_t annotaJitMod(int64_t a, int64_t b);
+extern int gJitDivErr;
 
 // The native code writes the returned value here.  `kind`: 0 = int (untyped), 1 = int64,
 // 2 = bool, 3 = null - the same Value the interpreter would have produced.
@@ -105,14 +145,19 @@ static const JitKindSet kJitAllInts =
 
 static const JitKindSet kJitNone = jitBit(NumKind::None);
 static const JitKindSet kJitBool = (JitKindSet)1 << 15;      // a comparison result
+// A range iterator is not an integer: the machine code keeps its state in private slots and this
+// marker only says "the value on the virtual stack at this position is such a state".
+static const JitKindSet kJitRange = (JitKindSet)1 << 14;
 
 // promote every pair and collect the outcomes
 static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
     JitKindSet out = 0;
     for (int i = 0; i < 16; i++) {
         if (!(a & ((JitKindSet)1 << i))) continue;
+        if (i > (int)NumKind::U64 && i != 15) continue;      // bool, or a marker: no numeric width
         for (int j = 0; j < 16; j++) {
             if (!(b & ((JitKindSet)1 << j))) continue;
+            if (j > (int)NumKind::U64 && j != 15) continue;
             NumKind ka = i == 15 ? NumKind::None : (NumKind)i;
             NumKind kb = j == 15 ? NumKind::None : (NumKind)j;
             if (i == 15 || j == 15) { out |= kJitBool; continue; }     // comparisons produce bool
@@ -126,6 +171,7 @@ static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
 // -1 when the set does not pin down exactly one kind
 static inline int jitSoleKind(JitKindSet s) {
     if (s == kJitBool) return 15;
+    if (s == kJitRange) return -1;                   // not a value the arithmetic can use
     if (s == 0 || (s & (s - 1)) != 0) return -1;
     for (int i = 0; i < 15; i++) if (s == ((JitKindSet)1 << i)) return i;
     return -1;
@@ -307,10 +353,47 @@ public:
         if (vr * 8 < 128) { u8(0x5C); u8(0x24); u8((uint8_t)(vr * 8)); }
         else { u8(0x9C); u8(0x24); u32((uint32_t)(vr * 8)); }
     }
+    void loadVrToR10(int vr) {
+        u8(0x4C); u8(0x8B);
+        if (vr * 8 < 128) { u8(0x54); u8(0x24); u8((uint8_t)(vr * 8)); }
+        else { u8(0x94); u8(0x24); u32((uint32_t)(vr * 8)); }
+    }
+    void sextR10FromI32() { u8(0x4D); u8(0x63); u8(0xD2); }             // movsxd r10, r10d
+    void sextR11FromI32() { u8(0x4D); u8(0x63); u8(0xDB); }             // movsxd r11, r11d
     void storeR11ToVr(int vr) {
         u8(0x4C); u8(0x89);
         if (vr * 8 < 128) { u8(0x5C); u8(0x24); u8((uint8_t)(vr * 8)); }
         else { u8(0x9C); u8(0x24); u32((uint32_t)(vr * 8)); }
+    }
+    // Call a C helper that takes two integers: r10 holds the first, r11 the second (both must be
+    // loaded before the frame moves), and the result comes back in rax.  kBase and kOut are saved
+    // around the call exactly as in callC; rax carries the callee address so r10/r11 stay live.
+    void callC2(uint64_t addr) {
+        const int savedBase = 32, savedOut = 40;
+        int N = 48;
+        if ((N % 16) != 8) N += 8 - (N % 16);
+        u8(0x48); u8(0x81); u8(0xEC); u32((uint32_t)N);                       // sub rsp, N
+        u8(0x48); u8(0x89); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // save kBase
+        u8(0x48); u8(0x89); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // save kOut
+        u8(0x4C); u8(0x89); u8(kBase == 0x01 ? 0xD1 : 0xD7);                  // mov rcx/rdi, r10
+        u8(0x4C); u8(0x89); u8(kOut == 0x02 ? 0xDA : 0xDE);                   // mov rdx/rsi, r11
+        u8(0x48); u8(0xB8);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // mov rax, addr
+        u8(0xFF); u8(0xD0);                                                   // call rax
+        u8(0x48); u8(0x8B); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // restore kBase
+        u8(0x48); u8(0x8B); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
+        u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
+    }
+    // The C helper above reports a failure (a zero divisor) through a global flag; the caller
+    // follows this with a conditional jump over a cold `errorReturn()` block.
+    void loadFlagToR10(uint64_t addr) {
+        u8(0x49); u8(0xBA);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // movabs r10, addr
+        u8(0x41); u8(0x83); u8(0x3A); u8(0x00);                               // cmp dword [r10], 0
     }
     // a short conditional jump whose displacement is filled in once the target offset is known
     size_t jccRel8(uint8_t cc) { u8(cc); size_t p = c.size(); u8(0); return p; }
@@ -399,8 +482,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 x.next = ip + 1; break;
             case OP_NEW_ARRAY:
                 x.next = ip + 3; x.a = code[ip + 1]; x.b = code[ip + 2]; break;
-            case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_NE:
-            case OP_LT: case OP_GT: case OP_LE: case OP_GE:
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+            case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 x.next = ip + 1; break;
             case OP_LOCAL_ADD_IMM: case OP_LOCAL_SUB_IMM:
                 x.next = ip + 3; x.a = code[ip + 1]; x.imm = (int8_t)code[ip + 2]; break;
@@ -498,9 +581,14 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         if (std::getenv("ANNOTA_JIT_DEBUG") && (!t.code || !t.chunk || !t.code->fn))
             std::fprintf(stderr, "[jit] call target %s not compiled\n", nm.c_str());
         if (!t.code || !t.chunk || !t.code->fn) return none;
-        if (std::getenv("ANNOTA_JIT_DEBUG") && (t.code->retByte < 0 || t.code->retByte > 2))
-            std::fprintf(stderr, "[jit] call target %s retByte %d\n", nm.c_str(), t.code->retByte);
-        if (t.code->retByte < 0 || (t.code->retByte > 2 && t.code->retByte != 5)) return none;
+        // the result kind has to be a single, known one - otherwise this callee cannot be a direct
+        // call target (a `null` body, an error return, or two returns that disagree)
+        { NumKind rk;
+          if (t.code->retByte != 2 && !jitKindFromCode(t.code->retByte, rk)) {
+              if (std::getenv("ANNOTA_JIT_DEBUG"))
+                  std::fprintf(stderr, "[jit] call target %s retByte %d\n", nm.c_str(), t.code->retByte);
+              return none;
+          } }
         if (std::getenv("ANNOTA_JIT_DEBUG") && (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm))
             std::fprintf(stderr, "[jit] call target %s arity %zu vs %d (method %d)\n", nm.c_str(), t.chunk->params.size(), x.imm, (int)t.chunk->isMethod);
         if (t.chunk->isMethod || (int)t.chunk->params.size() != x.imm) return none;
@@ -587,7 +675,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_LOCAL_ADD_IMM: case OP_LOCAL_SUB_IMM:
                 case OP_LOCAL_ADD_LOCAL:
                     break;                                  // raw int64 work, verified at call time
-                case OP_ADD: case OP_SUB: case OP_MUL: {
+                case OP_ADD: case OP_SUB: case OP_MUL:
+                case OP_DIV: case OP_MOD: {
                     if (d < 2) return jitFail(__LINE__);
                     JitKindSet ka = vk[(size_t)d - 2], kb = vk[(size_t)d - 1];
                     vk.pop_back();
@@ -617,15 +706,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     break;
                 }
                 case OP_CONVERT: {
-                    // the compiler converts every typed parameter at entry; the JIT's entry check
-                    // already requires exactly that kind, so the conversion is the identity here -
-                    // any other conversion (a real `int(x)`, a boxed width) stays interpreted
+                    // An integer conversion is `wrapToKind` and nothing else (the interpreter's
+                    // convertNum wraps an Int into the target width), so the machine code just wraps
+                    // the raw value.  Any non-integer target - a float, a 128 bit width, a string -
+                    // stays interpreted.
                     if (d < 1 || x.imm > (int)NumKind::U64) return jitFail(__LINE__);
-                    int sole = jitSoleKind(vk.back());
-                    // the identity (the entry check already guarantees a typed parameter's kind), or an
-                    // untyped integer being given a declared width - which is a wrap and nothing else
-                    if (sole < 0) return jitFail(__LINE__);
-                    if (sole != x.imm && sole != (int)NumKind::None) return jitFail(__LINE__);
+                    if (jitSoleKind(vk.back()) < 0) return jitFail(__LINE__);
                     vk.back() = jitBit((NumKind)x.imm);
                     break;
                 }
@@ -639,9 +725,12 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                         if (ks == 0 || (ks & ~kArgOk) != 0) return jitFail(__LINE__);
                     }
                     for (int k = 0; k < x.imm; k++) vk.pop_back();
-                    pushKind(t.code->retByte == 2 ? kJitBool
-                             : t.code->retByte == 5 ? jitBit(NumKind::U64)
-                             : t.code->retByte == 1 ? jitBit(NumKind::I64) : kJitNone);
+                    if (t.code->retByte == 2) pushKind(kJitBool);
+                    else {
+                        NumKind rk;
+                        if (!jitKindFromCode(t.code->retByte, rk)) return jitFail(__LINE__);
+                        pushKind(jitBit(rk));
+                    }
                 }
                 case OP_RETURN:
                     if (d < 1) return jitFail(__LINE__);
@@ -681,9 +770,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             };
             int newDepth = x.op == OP_SET_LOCAL || x.op == OP_INIT_LOCAL ? d - 1
                          : x.op == OP_JUMP_IF_FALSE ? d - 1
-                         : (x.op == OP_ADD || x.op == OP_SUB || x.op == OP_MUL || x.op == OP_EQ ||
-                            x.op == OP_NE || x.op == OP_LT || x.op == OP_GT || x.op == OP_LE ||
-                            x.op == OP_GE) ? d - 1
+                         : (x.op == OP_ADD || x.op == OP_SUB || x.op == OP_MUL ||
+                            x.op == OP_DIV || x.op == OP_MOD ||
+                            x.op == OP_EQ || x.op == OP_NE || x.op == OP_LT || x.op == OP_GT ||
+                            x.op == OP_LE || x.op == OP_GE) ? d - 1
                          : (int)vk.size();
             if ((int)vk.size() != newDepth) return jitFail(__LINE__);   // codegen safety net
             if (!jumpOnly && to < n) {
@@ -864,7 +954,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     // 0 = int, 1 = int64, 2 = bool, 5 = uint64 (the bits are the value, but the interpreter must
     // build the right Value from it - a uint64 result of -4 bits prints as 18446744073709551612).
     auto retCodeOf = [](int sole) -> int {
-        return sole == 15 ? 2 : sole == (int)NumKind::I64 ? 1 : sole == (int)NumKind::U64 ? 5 : 0;
+        return sole == 15 ? 2 : jitKindCode((NumKind)sole);
     };
     auto jitUnsignedCmp = [](JitKindSet a, JitKindSet b) -> int {
         int ka = jitSoleKind(a), kb = jitSoleKind(b);
@@ -961,6 +1051,29 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
                 break;
+            case OP_DIV: case OP_MOD: {
+                // The semantics live in the two C helpers (a zero divisor is a catchable error the
+                // hardware would instead turn into a fault), so the machine code just calls one.
+                int ka = jitSoleKind(vrKind[i][(size_t)d - 2]);
+                int kb = jitSoleKind(vrKind[i][(size_t)d - 1]);
+                int pkD = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
+                                                    vrKind[i][(size_t)d - 1]));
+                if (pkD < 0) return jitFail(__LINE__);
+                e.loadVrToR10(d - 2);
+                if (ka == (int)NumKind::I32) e.sextR10FromI32();      // a raw 32 bit slot
+                e.loadVrToR11(d - 1);
+                if (kb == (int)NumKind::I32) e.sextR11FromI32();
+                e.callC2((uint64_t)(uintptr_t)(x.op == OP_DIV ? &annotaJitDiv : &annotaJitMod));
+                e.loadFlagToR10((uint64_t)(uintptr_t)&gJitDivErr);
+                size_t noErr = e.jccRel8(0x74);                       // jz -> the result is valid
+                e.errorReturn();                                      // otherwise report and return
+                e.patchRel8(noErr, e.c.size());
+                // 32 bit kinds already have their exact value in the low half (which is all their
+                // slot uses); every other width wraps the way the interpreter's typedInt would
+                if (pkD != (int)NumKind::I32 && pkD != (int)NumKind::U32) e.wrapRax(pkD);
+                e.storeRaxToVr(d - 2);
+                break;
+            }
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
@@ -1150,9 +1263,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_CONVERT:
-                // a typed parameter's conversion is the identity (the entry check proved it); an
-                // untyped integer being given a declared width only wraps into that width
-                if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::None) e.wrapRax(x.imm);
+                // an integer conversion only wraps into the target width; a raw 32 bit slot has to
+                // be widened first so the wrap sees the exact value
+                if (jitSoleKind(vrKind[i][(size_t)d - 1]) == (int)NumKind::I32) e.sextRaxFromI32();
+                e.wrapRax(x.imm);
                 break;
             case OP_RETURN_NULL:
                 e.nullReturn();

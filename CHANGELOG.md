@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to this project are documented in this file.
 
@@ -43,6 +43,20 @@ major change, and a new check is a minor one.
   working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
 * `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
   `examples/jit.ant`.
+* **Division and modulo inside compiled code.**  `OP_DIV` / `OP_MOD` used to make a whole function
+  fall back to the interpreter, so the most common arithmetic still ran interpreted.  The machine
+  code now calls one of two C helpers (`annotaJitDiv` / `annotaJitMod`) that own the semantics -
+  C truncation, per-width wrapping, the `INT64_MIN / -1` case, and a zero divisor that must stay a
+  catchable error instead of a hardware fault - and checks the flag they set, returning through
+  `JitOut` when it is raised.  A `%`-heavy loop that the backend previously rejected is now
+  compiled.
+* **Integer conversions of any width.**  `convert` was only translated when the target width was
+  the value's own kind or when the value was an untyped literal, so `new x: int8 = a` (an `int64`
+  parameter narrowed into a typed local) rejected the whole function.  An integer conversion is
+  `wrapToKind` and nothing else, so the machine code now wraps whatever it has - widening a raw
+  32 bit slot first when it needs the exact value.  This is what makes the narrow and unsigned
+  widths reachable in compiled code at all; every one of the nine integer widths is now exercised
+  against the interpreter (see `docs/jit-internals.md`).
 
 ### Documentation
 
@@ -95,6 +109,18 @@ major change, and a new check is a minor one.
 * `examples/ffi.ant` and `examples/jit.ant`, plus `docs/ffi.md` and `docs/jit.md`.
 
 ### Fixed
+
+* **A value coming out of machine code now keeps its exact width.**  The result kind byte only had
+  codes for int/int64/bool/null/uint64, so returning a local of any other declared width reported
+  `int`: `new x: int8 = 127` then `=x` made `typeof` print `int` where the interpreter printed
+  `int8` (the value itself was right).  The byte now has a code per integer width (0 int, 1 int64,
+  2 bool, 3 null, 4 error, 5 uint64, 6..11 the remaining widths) with `jitKindCode` /
+  `jitKindFromCode` as the single source of truth for both the emitter and the VM.
+* **`INT64_MIN % -1` hung the interpreter.**  The hardware division faults on that overflow, and
+  the operands are runtime values, so the interpreter's `a.i % b.i` reached it: the process spun
+  instead of answering (the mathematical answer is 0, which is also what the compiled path
+  returns).  `binaryResult` now handles the case explicitly, the way the `OP_DIV` branch already
+  handled `INT64_MIN / -1`.
 
 * **Unsigned 64 bit results lost their signedness on the way back.**  The result code in `JitOut` only
   distinguished int/int64/bool/null, so a `uint64` value whose top bit was set came back as a signed

@@ -32,6 +32,25 @@ void jitArenaReset() {
     for (void* p : jitArena()) std::free(p);
     jitArena().clear();
 }
+
+// Division and modulo stay in C++: the exact semantics (C truncation, per-kind wrapping, the
+// `INT64_MIN / -1` case the interpreter defines, and a division by zero that must become a
+// catchable error rather than a hardware fault) live in one place, and the machine code only
+// calls these two functions.  A zero divisor sets `gJitDivErr`; the VM turns that into the same
+// error the interpreter raises once the native call has returned.
+int gJitDivErr = 0;                       // 1 = division by zero, 2 = modulo by zero
+
+int64_t annotaJitDiv(int64_t a, int64_t b) {
+    if (b == 0) { gJitDivErr = 1; return 0; }
+    if (b == -1) return (int64_t)(0 - (uint64_t)a);       // INT64_MIN / -1 stays defined
+    return a / b;
+}
+
+int64_t annotaJitMod(int64_t a, int64_t b) {
+    if (b == 0) { gJitDivErr = 2; return 0; }
+    if (b == -1) return 0;
+    return a % b;
+}
 } // namespace annota
 namespace annota {
 
@@ -746,6 +765,17 @@ Value VM::directCallee(Chunk& ch, uint16_t nameIdx, Cell& selfOut) {
     return found;
 }
 
+// The interpreter's view of a native result: the kind byte carries either one of the special cases
+// (null, bool, error) or an exact NumKind, so a value coming out of machine code is indistinguishable
+// from one the interpreter computed - including for `typeof`.
+static inline Value jitValueOfOut(const JitOut& out) {
+    if (out.kind == 3) return Value::null();
+    if (out.kind == 2) return Value::boolean(out.value != 0);
+    NumKind k = NumKind::None;
+    if (jitKindFromCode((int)out.kind, k)) return Value::typedInt(out.value, k);
+    return Value::integer(out.value);
+}
+
 // Runs the callee's machine code when it has some and the locals it reads are plain ints; the
 // result is pushed and the frame is recycled.  Returns false when the interpreter must run it.
 bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
@@ -780,14 +810,16 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     for (size_t i = 0; i < count; i++)
         L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
     JitOut out;
+    gJitDivErr = 0;
     jc->fn(L, &out);
     jitArenaReset();
+    if (gJitDivErr) {
+        int e = gJitDivErr;
+        gJitDivErr = 0;
+        throwError(e == 1 ? "division by zero" : "modulo by zero");
+    }
     if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
-    Value r = out.kind == 3 ? Value::null()
-            : out.kind == 2 ? Value::boolean(out.value != 0)
-            : out.kind == 5 ? Value::typedInt(out.value, NumKind::U64)
-                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
-                            : Value::integer(out.value);
+    Value r = jitValueOfOut(out);
     stack.resize(fr.stackBase);
     recycleFrame(fr);
     frames.pop_back();
@@ -1496,14 +1528,16 @@ Value VM::execute(size_t stopDepth) {
                                 size_t base = f.stackBase;
                                 bool discard = f.discardResult;
                                 JitOut out;
+                                gJitDivErr = 0;
                                 entry->second(L, &out);
                                 jitArenaReset();
+                                if (gJitDivErr) {
+                                    int e = gJitDivErr;
+                                    gJitDivErr = 0;
+                                    throwError(e == 1 ? "division by zero" : "modulo by zero");
+                                }
                                 if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
-                                Value r = out.kind == 3 ? Value::null()
-                                        : out.kind == 2 ? Value::boolean(out.value != 0)
-                                        : out.kind == 5 ? Value::typedInt(out.value, NumKind::U64)
-                        : out.kind == 1 ? Value::typedInt(out.value, NumKind::I64)
-                                                        : Value::integer(out.value);
+                                Value r = jitValueOfOut(out);
                                 Frame fr = std::move(frames.back());
                                 frames.pop_back();
                                 while (!tryFrames.empty() &&
@@ -2141,6 +2175,8 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
             if (op == OP_MOD) {
                 if (intMode) {
                     if (b.i == 0) throwError("modulo by zero");
+                    // `INT64_MIN % -1` overflows a hardware division; the mathematical answer is 0
+                    if (b.i == -1) return Value::typedInt(0, kr);
                     return Value::typedInt(a.i % b.i, kr);
                 }
                 if (b.asFloat() == 0.0) throwError("modulo by zero");
