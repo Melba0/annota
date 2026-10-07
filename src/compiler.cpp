@@ -1,4 +1,4 @@
-﻿// Annota - compiler.cpp : AST -> bytecode.
+// Annota - compiler.cpp : AST -> bytecode.
 #include <cstdio>
 #include <cstdlib>
 #include "compiler.hpp"
