@@ -12,13 +12,20 @@
 
 namespace annota {
 namespace {
-// Arrays that compiled code creates live for exactly one native invocation: the VM frees every
-// block when the outermost native call returns, so nothing the machine code handed out can dangle.
-std::vector<void*>& jitArena() {
-    static std::vector<void*> arena;
-    return arena;
-}
+// The state a native call needs on the thread that runs it.  `_sys_spawn` really runs another VM on
+// another thread while a shared JitCode can be executing in both, so this cannot be a plain global.
+// It is a bare pointer on purpose: a `thread_local` object with a destructor registers a TLS
+// callback, and libwinpthread runs that callback into a heap corruption during thread exit.
+thread_local VM* gJitVm = nullptr;
 } // namespace
+
+// Arrays that compiled code creates live for exactly one native invocation: the VM frees every block
+// when the outermost native call returns, so nothing the machine code handed out can dangle.  The
+// list lives in the VM that is running the code.
+std::vector<void*>& jitArena() {
+    static std::vector<void*> unreachable;     // only used if a helper ran without a VM (never does)
+    return gJitVm ? gJitVm->jitArena : unreachable;
+}
 
 int64_t* annotaJitArrayAlloc(int64_t bytes) {
     if (bytes < 8) bytes = 8;
@@ -33,21 +40,18 @@ void jitArenaReset() {
     jitArena().clear();
 }
 
-// Division and modulo stay in C++: the exact semantics (C truncation, per-kind wrapping, the
-// `INT64_MIN / -1` case the interpreter defines, and a division by zero that must become a
-// catchable error rather than a hardware fault) live in one place, and the machine code only
-// calls these two functions.  A zero divisor sets `gJitDivErr`; the VM turns that into the same
-// error the interpreter raises once the native call has returned.
-int gJitDivErr = 0;                       // 1 = division by zero, 2 = modulo by zero
-
+// Division and modulo stay in C++: the exact semantics (C truncation, per-kind wrapping and the
+// `INT64_MIN / -1` case the interpreter defines) live in one place, and the machine code checks the
+// divisor itself before calling these, so a zero divisor becomes an error through `JitOut` instead
+// of the hardware fault it would otherwise be.
 int64_t annotaJitDiv(int64_t a, int64_t b) {
-    if (b == 0) { gJitDivErr = 1; return 0; }
+    if (b == 0) return 0;                                 // never reached: the code checks first
     if (b == -1) return (int64_t)(0 - (uint64_t)a);       // INT64_MIN / -1 stays defined
     return a / b;
 }
 
 int64_t annotaJitMod(int64_t a, int64_t b) {
-    if (b == 0) { gJitDivErr = 2; return 0; }
+    if (b == 0) return 0;                                 // never reached: the code checks first
     if (b == -1) return 0;
     return a % b;
 }
@@ -55,7 +59,8 @@ int64_t annotaJitMod(int64_t a, int64_t b) {
 // `print` from compiled code.  The machine code built one `Value` per operand in its own frame with
 // the static kind each one carries, so this is the interpreter's OP_PRINT body - one string, one
 // write - with the VM the native call belongs to.
-VM* gJitVm = nullptr;                     // the VM a native call runs inside (single threaded)
+thread_local const Value* gJitStackBase = nullptr;    // the operand stack, for on-stack replacement
+thread_local Value* const* gJitGlobalSlots = nullptr; // the global value pointers, by index
 
 void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed) {
     if (!gJitVm) return;
@@ -77,10 +82,59 @@ void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed) {
     gJitVm->write(out);
 }
 
-// The interpreter's operand stack, as seen by a trampoline that takes over in the middle of a loop.
-// It is set right before an on-stack-replacement entry is called and holds values that stay alive
-// for the whole native call.
-const Value* gJitStackBase = nullptr;
+// ---- globals
+// The name -> index map is process wide (indices only have to be stable), the value pointers are per
+// VM and refreshed whenever the globals map changes shape, and the machine code reaches both through
+// the helpers below.
+std::unordered_map<std::string, int>& jitGlobalIndexMap() {
+    static std::unordered_map<std::string, int> m;
+    return m;
+}
+std::vector<std::string>& jitGlobalNames() {
+    static std::vector<std::string> v;
+    return v;
+}
+
+int annotaJitGlobalIndex(const std::string& name) {
+    auto& m = jitGlobalIndexMap();
+    auto it = m.find(name);
+    if (it != m.end()) return it->second;
+    if (jitGlobalNames().size() > 60000) return -1;
+    int idx = (int)jitGlobalNames().size();
+    m[name] = idx;
+    jitGlobalNames().push_back(name);
+    return idx;
+}
+
+static inline Value* jitGlobalCell(int64_t idx) {
+    if (idx < 0 || !gJitGlobalSlots) return nullptr;
+    if ((size_t)idx >= jitGlobalNames().size()) return nullptr;
+    return gJitGlobalSlots[(size_t)idx];
+}
+
+int64_t annotaJitGetGlobal(int64_t idx) {
+    Value* c = jitGlobalCell(idx);
+    return c && c->t == VT::Int ? c->i : 0;
+}
+
+// the kind byte, for the one case where the backend cannot know it statically: `return g`
+int64_t annotaJitGlobalKind(int64_t idx) {
+    Value* c = jitGlobalCell(idx);
+    if (!c || c->t != VT::Int) return jitKindCode(NumKind::None);
+    return jitKindCode(c->k);
+}
+
+void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode) {
+    Value* c = jitGlobalCell(idx);
+    if (!c) return;
+    NumKind k = NumKind::None;
+    if (!jitKindFromCode((int)kindCode, k)) k = NumKind::None;
+    *c = Value::typedInt(value, k);
+    // a declared `state` variable drives a callback on assignment, exactly as OP_SET_GLOBAL does
+    if (gJitVm && !gJitVm->stateNames.empty() &&
+        gJitVm->stateNames.count(jitGlobalNames()[(size_t)idx]) && gJitVm->onStateChange)
+        gJitVm->onStateChange(*gJitVm);
+}
 
 // Rebuild the live virtual registers a loop header expects.  The VM has already checked each one
 // against its descriptor, so this only has to move the values: an integer becomes its payload, a
@@ -256,7 +310,7 @@ bool VM::truthy(const Value& v) {
 void VM::defineGlobal(const std::string& name, const Value& v) {
     auto it = globals.find(name);
     if (it != globals.end() && it->second) { *it->second = v; }
-    else globals[name] = std::make_shared<Value>(v);
+    else { globals[name] = std::make_shared<Value>(v); globalsGen++; }
     if (stateNames.count(name) && onStateChange) onStateChange(*this);
 }
 
@@ -645,6 +699,31 @@ static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
     return true;
 }
 
+// The globals a chunk (and every chunk it calls directly) touches, by index.  Machine code reads
+// them as plain 64 bit ints, so each one has to be one *right now*: the interpreter may have changed
+// a global's type since the code was compiled, and the answer is then to keep interpreting.  The
+// resolved pointers are cached and only rebuilt when the globals map changed shape.
+bool VM::jitGlobalsOk(const std::shared_ptr<JitCode>& jc) {
+    if (jc->globals.empty()) return true;
+    if (jitGlobalCacheGen != globalsGen ||
+        jitGlobalCache.size() < jitGlobalNames().size()) {
+        jitGlobalCache.assign(jitGlobalNames().size(), nullptr);
+        for (size_t i = 0; i < jitGlobalCache.size(); i++) {
+            auto it = globals.find(jitGlobalNames()[i]);
+            if (it != globals.end() && it->second) jitGlobalCache[i] = it->second.get();
+        }
+        jitGlobalCacheGen = globalsGen;
+    }
+    gJitGlobalSlots = jitGlobalCache.data();
+    for (int idx : jc->globals) {
+        if (idx < 0 || (size_t)idx >= jitGlobalCache.size()) return false;
+        const Value* c = jitGlobalCache[(size_t)idx];
+        if (!c || c->t != VT::Int) return false;
+        if (c->k != NumKind::None && c->k != NumKind::I64) return false;
+    }
+    return true;
+}
+
 // Can the interpreter hand this loop header over to the native code right now?  Every live virtual
 // register has to hold what the backend's descriptor expects, so a loop whose operands changed type
 // since the last check simply keeps running interpreted.
@@ -845,6 +924,12 @@ Value VM::directCallee(Chunk& ch, uint16_t nameIdx, Cell& selfOut) {
 // The interpreter's view of a native result: the kind byte carries either one of the special cases
 // (null, bool, error) or an exact NumKind, so a value coming out of machine code is indistinguishable
 // from one the interpreter computed - including for `typeof`.
+static inline void jitThrowIfError(const JitOut& out) {
+    if (out.kind == kJitOutError) throw VMError("数组下标越界（由 JIT 编译的代码检测到）");
+    if (out.kind == kJitOutDivZero) throw VMError("division by zero");
+    if (out.kind == kJitOutModZero) throw VMError("modulo by zero");
+}
+
 static inline Value jitValueOfOut(const JitOut& out) {
     if (out.kind == 3) return Value::null();
     if (out.kind == 2) return Value::boolean(out.value != 0);
@@ -876,6 +961,7 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     const std::shared_ptr<JitCode>& jc = fn.o->chunk->jit;
     if (!jc) return false;
     if (!jitLocalsOk(jc, fr)) return false;
+    if (!jitGlobalsOk(jc)) return false;
     static const bool dbgNative = std::getenv("ANNOTA_JIT_DEBUG") != nullptr;
     if (dbgNative) {
         static std::set<std::string> logged;
@@ -887,16 +973,10 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     for (size_t i = 0; i < count; i++)
         L[i] = (fr.locals[i] && fr.locals[i]->t == VT::Int) ? fr.locals[i]->i : 0;
     JitOut out;
-    gJitDivErr = 0;
     gJitVm = this;
     jc->fn(L, &out);
     jitArenaReset();
-    if (gJitDivErr) {
-        int e = gJitDivErr;
-        gJitDivErr = 0;
-        throwError(e == 1 ? "division by zero" : "modulo by zero");
-    }
-    if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
+    jitThrowIfError(out);
     Value r = jitValueOfOut(out);
     stack.resize(fr.stackBase);
     recycleFrame(fr);
@@ -1287,6 +1367,7 @@ Value VM::execute(size_t stopDepth) {
                     case OP_DEL_GLOBAL: {
                         uint16_t k = (uint16_t)((code[f.ip] << 8) | code[f.ip + 1]); f.ip += 2;
                         globals.erase(f.chunk->consts[k].o->str);
+                        globalsGen++;               // the JIT's resolved pointers are now stale
                         break;
                     }
                     case OP_GET_FIELD: {
@@ -1353,7 +1434,7 @@ Value VM::execute(size_t stopDepth) {
                                 throwError("lend: 未初始化的局部变量");
                             shared = f.locals[src];
                         }
-                        if (dstG) globals[f.chunk->consts[dst].o->str] = shared;
+                        if (dstG) { globals[f.chunk->consts[dst].o->str] = shared; globalsGen++; }
                         else {
                             if (dst >= f.locals.size()) throwError("internal: lend slot out of range");
                             f.locals[dst] = shared;
@@ -1597,6 +1678,7 @@ Value VM::execute(size_t stopDepth) {
                         if (f.chunk->jit) {
                             auto entry = f.chunk->jit->osrEntries.find(back);
                             if (entry != f.chunk->jit->osrEntries.end() && jitLocalsOk(f.chunk->jit, f) &&
+                                jitGlobalsOk(f.chunk->jit) &&
                                 jitOsrOk(f.chunk->jit, back, f, stack) &&
                                 !(f.buildOnReturn && f.klass)) {
                                 int64_t L[64];
@@ -1607,7 +1689,6 @@ Value VM::execute(size_t stopDepth) {
                                 size_t base = f.stackBase;
                                 bool discard = f.discardResult;
                                 JitOut out;
-                                gJitDivErr = 0;
                                 gJitVm = this;
                                 gJitStackBase = stack.data() + base;
                                 entry->second(L, &out);
@@ -1616,12 +1697,7 @@ Value VM::execute(size_t stopDepth) {
                                     std::fprintf(stderr, "[jit] osr entry: %s at %zu\n",
                                                  f.chunk->fnName.c_str(), back);
                                 jitArenaReset();
-                                if (gJitDivErr) {
-                                    int e = gJitDivErr;
-                                    gJitDivErr = 0;
-                                    throwError(e == 1 ? "division by zero" : "modulo by zero");
-                                }
-                                if (out.kind == kJitOutError) throwError("数组下标越界（由 JIT 编译的代码检测到）");
+                                jitThrowIfError(out);
                                 Value r = jitValueOfOut(out);
                                 Frame fr = std::move(frames.back());
                                 frames.pop_back();

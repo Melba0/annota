@@ -33,10 +33,12 @@ namespace annota {
 
 using JitFn = int64_t (*)(const int64_t*, void*);
 
-// Machine code cannot raise an Annota error by itself, so the two conditions it can still detect
-// (an out-of-range array index, a failed allocation) are reported through `JitOut::kind`:
-// 3 = null, 4 = runtime error to be raised by the VM after the native call returns.
+// Machine code cannot raise an Annota error by itself, so the conditions it can detect are reported
+// through `JitOut::kind`: 3 = null, 4 = runtime error to be raised by the VM after the native call
+// returns (an out-of-range array index), 12/13 = a zero divisor.
 constexpr int64_t kJitOutError = 4;
+constexpr int64_t kJitOutDivZero = 12;
+constexpr int64_t kJitOutModZero = 13;
 
 // The kind byte a compiled function writes next to its result.  The first six codes are the
 // original set; the widths that used to collapse into "int" (0) now have their own code, because
@@ -82,12 +84,21 @@ void jitArenaReset();
 // interpreter would have printed as a tuple.
 void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed);
 
-// Division and modulo are the two operations whose semantics (signed truncation, a divisor of
-// zero, `INT64_MIN / -1`) are kept in C++: the machine code calls these and then checks the flag
-// they set.  A non-zero flag after a native call becomes a catchable Annota error.
+// Division and modulo: the machine code checks the divisor itself and calls one of these two for
+// the semantics (C truncation, per-width wrapping, and the `INT64_MIN / -1` case the interpreter
+// defines).  A zero divisor never reaches them - it returns through JitOut instead, because the
+// hardware would fault where Annota raises a catchable error.
 int64_t annotaJitDiv(int64_t a, int64_t b);
 int64_t annotaJitMod(int64_t a, int64_t b);
-extern int gJitDivErr;
+
+// Globals.  Every name gets a process-wide index; the VM keeps the value pointers in an array it
+// fills before a native call and checks there, and the machine code reads and writes single slots
+// through these two.  A helper (rather than a fixed address) keeps the backend safe when two VMs
+// run on two threads - something `_sys_spawn` really does.
+int annotaJitGlobalIndex(const std::string& name);   // -1 when the name may not be compiled
+int64_t annotaJitGetGlobal(int64_t idx);
+int64_t annotaJitGlobalKind(int64_t idx);
+void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode);
 
 // The native code writes the returned value here.  `kind`: 0 = int (untyped), 1 = int64,
 // 2 = bool, 3 = null - the same Value the interpreter would have produced.
@@ -104,6 +115,8 @@ struct JitCode {
     std::map<size_t, JitFn> osrEntries;
     // what each such entry needs on the interpreter's operand stack (one byte per live register)
     std::map<size_t, std::vector<uint8_t>> osrDesc;
+    // the globals (by index) this code - and everything it calls - reads or writes
+    std::vector<int> globals;
     JitFn fn = nullptr;
     // kind byte every `return` writes (0 int, 1 int64, 2 bool, 3 null); -2 when it varies, which
     // makes the function unusable as a direct call target from other native code
@@ -484,6 +497,15 @@ public:
         for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // movabs r10, addr
         u8(0x41); u8(0x83); u8(0x3A); u8(0x00);                               // cmp dword [r10], 0
     }
+    void testR11R11() { u8(0x4D); u8(0x85); u8(0xDB); }                       // test r11, r11
+    void movR8Rax() { u8(0x49); u8(0x89); u8(0xC0); }                         // mov r8, rax
+    void movR10Imm(int32_t v) { u8(0x49); u8(0xC7); u8(0xC2); u32((uint32_t)v); }
+    // The first integer argument of a C helper, set from an immediate (the callee is told which
+    // global slot to look at, and the call frame has already moved so a register is the only way).
+    void movArg1Imm(int32_t v) {
+        if (kBase == 0x01) { u8(0xB9); u32((uint32_t)v); }                    // mov ecx, imm32
+        else { u8(0xBF); u32((uint32_t)v); }                                  // mov edi, imm32
+    }
     // Frame-relative helpers for the temporary `Value` array that `print` hands to the VM.
     void storeRaxToFrame(size_t off) { u8(0x48); u8(0x89); u8(0x84); u8(0x24); u32((uint32_t)off); }
     void loadFrameToRax(size_t off) { u8(0x48); u8(0x8B); u8(0x84); u8(0x24); u32((uint32_t)off); }
@@ -514,6 +536,8 @@ public:
     // Machine code cannot raise an Annota error itself: it reports one through JitOut and returns,
     // and the VM raises it once the native call is over.
     void errorReturn() { movRaxImm(0); storeResult((int)kJitOutError); epilogue(); }
+    // the same, for an error whose kind the VM turns into a different message (a zero divisor)
+    void errorReturnKind(int kind) { movRaxImm(0); storeResult(kind); epilogue(); }
     // Call a C helper.  `setArgs` fills the first integer argument (rcx/rdi) - it runs inside the
     // call frame, so it must not read virtual registers by stack offset.  The two registers the
     // backend keeps live (kBase, kOut) are saved around the call, and 32 bytes of shadow space are
@@ -640,6 +664,9 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 x.next = ip + 3; x.a = (code[ip + 1] << 8) | code[ip + 2];
                 maxPrintArgs = std::max(maxPrintArgs, (int)x.a);
                 break;
+            case OP_GET_GLOBAL: case OP_SET_GLOBAL:
+                x.next = ip + 3; x.a = (code[ip + 1] << 8) | code[ip + 2];
+                break;
             case OP_CALL_DIRECT:
                 x.next = ip + 4;
                 x.a = (code[ip + 1] << 8) | code[ip + 2];        // name constant
@@ -727,7 +754,24 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         if (t.chunk->numLocals > 64) return none;
         return t;
     };
+    // The globals this chunk touches, by process-wide index.  Compiled code reads and writes them as
+    // plain 64 bit ints, so the VM checks each one at every native entry (see VM::jitGlobalsOk).
     size_t n = ins.size();
+    std::vector<uint8_t> usedGlobals;
+    std::vector<int> insGlobal(n, -1);
+    auto markGlobal = [&](int gi) {
+        if (gi < 0) return;
+        if ((size_t)gi >= usedGlobals.size()) usedGlobals.resize((size_t)gi + 1, 0);
+        usedGlobals[(size_t)gi] = 1;
+    };
+    auto globalIndexOf = [&](const JitIns& x) -> int {
+        if ((size_t)x.a >= ch->consts.size() || ch->consts[(size_t)x.a].t != VT::Str) return -1;
+        int gi = annotaJitGlobalIndex(ch->consts[(size_t)x.a].o->str);
+        if (gi < 0 && std::getenv("ANNOTA_JIT_DEBUG"))
+            std::fprintf(stderr, "[jit] global %s not indexable\n",
+                         ch->consts[(size_t)x.a].o->str.c_str());
+        return gi;
+    };
     const int kUnset = -1;
     std::vector<int> depth(n, kUnset);
     std::vector<std::vector<JitKindSet>> kindAt(n, std::vector<JitKindSet>(ch->numLocals, kJitAllInts));
@@ -833,6 +877,28 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     break;
                 }
                 case OP_JUMP: case OP_LOOP: break;
+                case OP_GET_GLOBAL: {
+                    int gi = globalIndexOf(x);
+                    if (gi < 0) return jitFail(__LINE__);
+                    insGlobal[i] = gi;
+                    markGlobal(gi);
+                    // the entry check guarantees an untyped or int64 value, the two widths whose
+                    // arithmetic and printing machine code reproduces exactly
+                    pushKind(jitBit(NumKind::None) | jitBit(NumKind::I64));
+                    break;
+                }
+                case OP_SET_GLOBAL: {
+                    int gi = globalIndexOf(x);
+                    if (gi < 0 || d < 1) return jitFail(__LINE__);
+                    // only a plain 64 bit width may be stored: a wider set would make every later
+                    // read of this global ambiguous
+                    int ks = jitSoleKind(vk.back());
+                    if (ks != (int)NumKind::None && ks != (int)NumKind::I64) return jitFail(__LINE__);
+                    insGlobal[i] = gi;
+                    markGlobal(gi);
+                    vk.pop_back();
+                    break;
+                }
                 case OP_ITER_RANGE: {
                     // `for i in a to b`: the interpreter builds a heap iterator whose bounds are
                     // evaluated once; the backend keeps the same state in two private slots (the
@@ -899,6 +965,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                         if (!jitKindFromCode(t.code->retByte, rk)) return jitFail(__LINE__);
                         pushKind(jitBit(rk));
                     }
+                    // the callee runs on this native frame without passing the VM's entry checks, so
+                    // whatever it needs has to be validated here as well
+                    for (size_t gi = 0; gi < t.code->globals.size(); gi++)
+                        markGlobal(t.code->globals[gi]);
                 }
                 case OP_RETURN:
                     if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
@@ -1296,7 +1366,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             case OP_DIV: case OP_MOD: {
                 // The semantics live in the two C helpers (a zero divisor is a catchable error the
-                // hardware would instead turn into a fault), so the machine code just calls one.
+                // hardware would instead turn into a fault), so the machine code checks the divisor
+                // itself and calls one of them.
                 int ka = jitSoleKind(vrKind[i][(size_t)d - 2]);
                 int kb = jitSoleKind(vrKind[i][(size_t)d - 1]);
                 int pkD = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
@@ -1306,11 +1377,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 if (ka == (int)NumKind::I32) e.sextR10FromI32();      // a raw 32 bit slot
                 e.loadVrToR11(d - 1);
                 if (kb == (int)NumKind::I32) e.sextR11FromI32();
+                e.testR11R11();
+                size_t noZero = e.jccRel8(0x75);                      // jnz -> the divisor is fine
+                e.errorReturnKind((int)(x.op == OP_DIV ? kJitOutDivZero : kJitOutModZero));
+                e.patchRel8(noZero, e.c.size());
                 e.callC2((uint64_t)(uintptr_t)(x.op == OP_DIV ? &annotaJitDiv : &annotaJitMod));
-                e.loadFlagToR10((uint64_t)(uintptr_t)&gJitDivErr);
-                size_t noErr = e.jccRel8(0x74);                       // jz -> the result is valid
-                e.errorReturn();                                      // otherwise report and return
-                e.patchRel8(noErr, e.c.size());
                 // 32 bit kinds already have their exact value in the low half (which is all their
                 // slot uses); every other width wraps the way the interpreter's typedInt would
                 if (pkD != (int)NumKind::I32 && pkD != (int)NumKind::U32) e.wrapRax(pkD);
@@ -1445,6 +1516,21 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.patchRel8(badSet, afterSet);
                 break;
             }
+            case OP_GET_GLOBAL: {
+                // one helper call per read: it resolves the slot in the *calling* VM, which is what
+                // keeps two threads running the same machine code correct
+                e.callC((uint64_t)(uintptr_t)&annotaJitGetGlobal, [&] { e.movArg1Imm(insGlobal[i]); });
+                e.storeRaxToVr(d);
+                break;
+            }
+            case OP_SET_GLOBAL: {
+                e.movR10Imm(insGlobal[i]);
+                e.loadVrToR11(d - 1);
+                int ksG = jitSoleKind(vrKind[i][(size_t)d - 1]);
+                e.callC3((uint64_t)(uintptr_t)&annotaJitSetGlobal,
+                         ksG == 15 ? (int)jitKindCode(NumKind::None) : jitKindCode((NumKind)ksG));
+                break;
+            }
             case OP_CALL_DIRECT: {
                 // A native call to another compiled function: its L[] and JitOut live on this native
                 // frame (so recursion works) and the arguments are copied out of the virtual
@@ -1504,7 +1590,17 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 int sole = jitSoleKind(vrKind[i][(size_t)d - 1]);
                 // a raw 32 bit slot only carries the low half: make the value exact for the VM
                 if (sole == (int)NumKind::I32) e.sextRaxFromI32();
-                if (i > 0 && ins[i - 1].op == OP_GET_LOCAL &&
+                if (i > 0 && ins[i - 1].op == OP_GET_GLOBAL && insGlobal[i - 1] >= 0) {
+                    // a global read may be an untyped int or an int64 - which one it is, only the
+                    // value itself knows, so the kind byte is read from the global
+                    e.loadVrToRax(d - 1);                      // reload: the call below clobbers rax
+                    e.callC((uint64_t)(uintptr_t)&annotaJitGlobalKind,
+                            [&] { e.movArg1Imm(insGlobal[i - 1]); });
+                    e.movR8Rax();
+                    e.loadVrToRax(d - 1);
+                    e.storeResultWithKindInR8();
+                    noteRetByte(-2);
+                } else if (i > 0 && ins[i - 1].op == OP_GET_LOCAL &&
                     tracked[(size_t)ins[i - 1].a]) {
                     // the value came straight from a tracked local: its kind byte is exact
                     e.loadKindByteToR8(e.kindBase + (size_t)ins[i - 1].a);
@@ -1708,6 +1804,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     for (size_t s = 0; s < readSlots.size(); s++)
         if (readSlots[s]) jc->readSlots.push_back((uint8_t)s);
     jc->retByte = seenRetByte;                 // -2 when the returns disagree
+    for (size_t gi = 0; gi < usedGlobals.size(); gi++)
+        if (usedGlobals[gi]) jc->globals.push_back((int)gi);
     jc->slotKind = expectKind;
     return jc;
 }

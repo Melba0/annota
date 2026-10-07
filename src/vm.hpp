@@ -46,6 +46,14 @@ public:
     bool contracts = false;
     std::set<std::string> stateNames;
     std::function<void(VM&)> onStateChange;
+    // Compiled code reaches globals by index (see annotaJitGlobalIndex).  `globalsGen` counts the
+    // structural changes of `globals` - an entry added or removed - because those are what can
+    // invalidate a resolved value pointer; every site that inserts or erases has to bump it.
+    uint64_t globalsGen = 0;
+    std::vector<Value*> jitGlobalCache;         // resolved by index, for the JIT's slot array
+    uint64_t jitGlobalCacheGen = ~0ull;
+    // arrays built by compiled code during the current native invocation (freed when it returns)
+    std::vector<void*> jitArena;
     // How `input` (and `_stdin_line`) obtains a line. Left empty in console programs, where a
     // line is read from stdin; a GUI host installs a provider that asks the user instead.
     std::function<std::string(const std::string& hint)> inputProvider;
@@ -59,6 +67,8 @@ public:
 
     // ---- entry points
     Value run();
+    // machine code entry checks: the locals and the globals a chunk reads have to be plain ints
+    bool jitGlobalsOk(const std::shared_ptr<JitCode>& jc);
     Value execute(size_t stopDepth);
     Value callSync(const Value& callee, std::vector<Value> args);
     Value callFunction(const Value& callee, const Value& pos, const Value& named,

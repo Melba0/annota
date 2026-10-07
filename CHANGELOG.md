@@ -43,6 +43,16 @@ major change, and a new check is a minor one.
   working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
 * `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
   `examples/jit.ant`.
+* **Globals in compiled code.**  Reading or writing a top-level variable used to make the whole
+  function fall back to the interpreter, which is exactly what a real program is made of.  Every
+  global name now has a process-wide index, the VM keeps the value pointers in an array it checks
+  and hands to the code before each native call, and the machine code reaches single slots through
+  two helpers.  A global that is not a plain 64 bit integer at that moment (a string, a float, a
+  `del`eted variable) simply keeps the function interpreted, and a global a declared `state` drives
+  still fires its change callback.  Integers, `for` loops, division, `print` and globals now work
+  together: the shape `for i in 1 to n ( total = total + i; count = count + 1 )` with a `print`
+  inside the function compiles as a whole and runs in **138 ms where the interpreter needs 241 ms**
+  (300 000 iterations, three globals touched per iteration).
 * **Range iteration in compiled code, and on-stack replacement for it.**  `for i in a to b` compiled
   to the iterator protocol (`iter_range` / `iter_next`), which the backend did not translate - so a
   `for` loop sent the whole function back to the interpreter, and because the iterator sat on the
@@ -128,6 +138,15 @@ major change, and a new check is a minor one.
 
 ### Fixed
 
+* **A `thread_local` container with a destructor corrupted the heap at thread exit.**  Giving the
+  native call's scratch state (the arena of arrays built by compiled code) a `thread_local`
+  `std::vector` registered a TLS callback; with `libwinpthread` that callback's `free` ran into
+  `STATUS_HEAP_CORRUPTION` in roughly 40% of the runs of a program that used `Thread.spawn` **and**
+  executed compiled code, while the same program without machine code was fine.  The arena now lives
+  in the VM (one per running thread, because a worker gets its own VM) and the remaining per-thread
+  state is a set of bare pointers, which register no destructor at all.  Twelve consecutive runs of
+  the two-worker test are clean, including two worker VMs whose compiled loops read and write
+  globals.
 * **A narrowing conversion silently kept the wide value.**  The translated `convert` only wrapped the
   register and never wrote the result back to the slot, which was correct while the only conversion
   the backend accepted was an identity - but `new a: int8 = n` with `n == 300` then left `300` in the
