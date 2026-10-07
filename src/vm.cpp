@@ -1,4 +1,4 @@
-﻿// Annota - vm.cpp
+// Annota - vm.cpp
 #include "vm.hpp"
 #include "jit.hpp"
 #include "ffi.hpp"
@@ -2174,6 +2174,22 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
             throwError("bad arithmetic");
         }
         case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
+            // 128 bit integers: the same operators in the boxed domain (a shift of 128 or more
+            // saturates, and shifting is defined for every amount here)
+            if (a.t == VT::Wide || b.t == VT::Wide) {
+                bool uns = a.wideUnsigned() || b.wideUnsigned();
+                __int128 x = a.asWide(), y = b.asWide();
+                switch (op) {
+                    case OP_BAND: return Value::wide(x & y, uns);
+                    case OP_BOR:  return Value::wide(x | y, uns);
+                    case OP_BXOR: return Value::wide(x ^ y, uns);
+                    case OP_SHL:  return Value::wide((y < 0 || y >= 128) ? 0 : (x << (int)y), uns);
+                    default:
+                        if (y < 0) throwError("negative shift count");
+                        return Value::wide(y >= 128 ? (x < 0 ? (__int128)-1 : (__int128)0)
+                                                    : (x >> (int)y), uns);
+                }
+            }
             auto toI = [&](const Value& v) -> int64_t {
                 if (v.t == VT::Int) return v.i;
                 if (v.t == VT::Bool) return v.b ? 1 : 0;
