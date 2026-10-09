@@ -46,6 +46,10 @@ public:
     bool contracts = false;
     std::set<std::string> stateNames;
     std::function<void(VM&)> onStateChange;
+    // `_sys_frame(ms)`: sleep and let the host do its own work for up to `ms` (the GUI repaints and
+    // collects input here).  Returning false asks the running loop to stop, which is how a window
+    // that was closed ends a `while running(...)` game loop instead of hanging on it.
+    std::function<bool(int64_t)> onFrame;
     // Compiled code reaches globals by index (see annotaJitGlobalIndex).  `globalsGen` counts the
     // structural changes of `globals` - an entry added or removed - because those are what can
     // invalidate a resolved value pointer; every site that inserts or erases has to bump it.

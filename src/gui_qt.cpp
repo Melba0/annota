@@ -12,6 +12,8 @@
 #include "builtins.hpp"
 #include <cstdlib>
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QThread>
 #include <QWidget>
 #include <QPainter>
 #include <QPainterPath>
@@ -148,7 +150,28 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         setMouseTracking(true);
         vm_.onStateChange = [this](VM&) { dirty_ = true; };
+        // `_sys_frame(ms)`: the host half of a real-time loop - repaint what the loop changed and
+        // deliver the clicks the player makes while the loop is running, then come back.
+        vm_.onFrame = [this](int64_t ms) {
+            // `processEvents(..., ms)` returns as soon as the queue is empty, so pace the frame here:
+            // pump in short slices until the frame budget is used up.  That keeps a real-time game
+            // loop at a steady rate (and off 100% of a core) instead of spinning.
+            update();
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 2);
+                QThread::msleep(t.elapsed() + 2 < ms ? 1 : 0);
+            }
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+            return !closed_;
+        };
         rebuild();
+    }
+
+    void closeEvent(QCloseEvent* e) override {
+        closed_ = true;                      // a running `_sys_frame` loop sees this and stops
+        QWidget::closeEvent(e);
     }
 
     void rebuild() {
@@ -218,8 +241,7 @@ protected:
         update();
     }
 
-    void mouseReleaseEvent(QMouseEvent* e) override {
-        int i = hitTest(e->pos(), true);
+    void mouseReleaseEvent(QMouseEvent* e) override {        int i = hitTest(e->pos(), true);
         const Obj* o = (i >= 0) ? items_[(size_t)i].node.o.get() : nullptr;
         if (o && o == pressed_ && S(o->str) == "Button") {
             callHandler(items_[(size_t)i].node, "click", {});
@@ -302,6 +324,7 @@ private:
     const Obj* pressed_ = nullptr;
     const Obj* focused_ = nullptr;
     QString focusedKey_;
+    bool closed_ = false;
     QString editText_;
 
     // ---- view model

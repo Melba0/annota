@@ -2943,6 +2943,7 @@ void Flow::run() {
                           // low level system primitives (lib/time.mod, lib/os.mod,
                           // lib/thread.mod and lib/net.mod wrap them; docs/reference.md lists them)
                           "_sys_clock", "_sys_time", "_sys_sleep", "_sys_local_time",
+                          "_sys_frame",
                           "_sys_make_time", "_sys_info", "_sys_env", "_sys_env_set",
                           "_sys_env_all", "_sys_exec", "_sys_spawn", "_sys_join",
                           "_sys_task_done", "_sys_socket",

@@ -159,6 +159,12 @@ major change, and a new check is a minor one.
   registry, so the reference manual lists every linked module and member automatically.
 * `examples/ffi.ant` and `examples/jit.ant`, plus `docs/ffi.md` and `docs/jit.md`.
 
+* **`_sys_frame(ms)`：让实时循环成为可能。**  视图系统原来没有任何定时/帧回调，所以"实时"界面
+  只能靠点击驱动，或者在一个 handler 里死循环（窗口直接卡住）。现在 `_sys_frame(ms)` 睡到这一帧
+  的预算用完，并把这段时间交给宿主：`--gui`/studio 会在此期间重绘、派发点击，返回 false 表示窗口
+  已经关了（所以关闭窗口能结束游戏循环，而不是把它挂住）。没有界面时它就是一次普通 sleep。
+  用它写的实时循环按真实毫秒推进物理量，帧率与机器快慢无关。GUI 侧按 1~2ms 切片 pump 并补齐
+  预算，实测 ~65 fps 而不是 11000 fps 的空转。
 ### Fixed
 
 * **A local assigned a comparison result was still required at entry.**  The entry check's "read

@@ -395,6 +395,15 @@ void registerSysPrimitives(VM& vm) {
 
     // ------------------------------------------------------------ clock
     reg("_sys_clock", [](VM&, std::vector<Value>&) { return Value::integer(steadyMillis()); });
+    reg("_sys_frame", [](VM& v, std::vector<Value>& a) {
+        // One frame of a real-time loop: let the host repaint / collect input for up to `ms`, or just
+        // sleep when there is no host (a plain `annota run`).  false means "the host is gone", so the
+        // caller's loop should end.
+        int64_t ms = asInt(v, argAt(a, 0), "_sys_frame");
+        if (v.onFrame) return Value::boolean(v.onFrame(ms < 0 ? 0 : ms));
+        if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        return Value::boolean(true);
+    });
     reg("_sys_time", [](VM&, std::vector<Value>&) { return Value::integer(wallMillis()); });
     reg("_sys_sleep", [](VM& v, std::vector<Value>& a) {
         int64_t ms = asInt(v, argAt(a, 0), "_sys_sleep");
