@@ -91,7 +91,9 @@ int guiShowView(VM&, const std::string& viewName) {
 }
 
 int guiRenderPng(VM&, const std::string&, const std::string&,
-                 const std::vector<std::pair<int, int>>&, const std::vector<std::string>&) {
+                 const std::vector<std::pair<int, int>>&, const std::vector<std::string>&,
+                 int waitMs) {
+    (void)waitMs;
     std::fprintf(stderr, "annota: --gui-shot 不可用：当前构建没有 Qt 支持。%s", noQtAdvice().c_str());
     return 2;
 }

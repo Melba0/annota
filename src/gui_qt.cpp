@@ -730,8 +730,9 @@ private:
                         QPainter gp(&pm);
                         gp.setFont(fnt);
                         gp.setPen(col);
-                        gp.drawText(QRect(0, 0, (int)std::ceil(box * dpr), (int)std::ceil(box * dpr)),
-                                    Qt::AlignCenter, glyph);
+                        // logical rect: the painter on a pixmap with a device pixel ratio applies the
+                        // ratio itself, so multiplying here would scale twice and cut the glyph
+                        gp.drawText(QRect(0, 0, box, box), Qt::AlignCenter, glyph);
                         gp.end();
                         if (glyphs_.size() > 800) glyphs_.clear();      // bounded memory
                         glyphs_.insert(gkey, pm);
@@ -763,8 +764,8 @@ private:
                 QPainter tp(&tpm);
                 tp.setFont(fontOf(st));
                 tp.setPen(st.fg);
-                tp.drawText(QRect(0, 0, (int)std::ceil(r.width() * dpr), (int)std::ceil(r.height() * dpr)),
-                            flags, st.text);
+                // logical rect again: see the Canvas cache above
+                tp.drawText(QRect(0, 0, r.width(), r.height()), flags, st.text);
                 tp.end();
                 if (textCache_.size() > 600) textCache_.clear();
                 textCache_.insert(tkey, tpm);
