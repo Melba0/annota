@@ -39,10 +39,11 @@ int guiShowView(VM& vm, const std::string& viewName);
 
 // render the view into a PNG file without opening a window.  `clicks` are synthetic
 // (x, y) button presses and `keys` synthetic keystrokes dispatched before rendering,
-// which makes event handling testable.
+// which makes event handling testable; `waitMs` keeps the event loop running that long
+// first, so a view that declares `every`/`tick` (or `keys`) is exercised for real.
 int guiRenderPng(VM& vm, const std::string& viewName, const std::string& path,
                  const std::vector<std::pair<int, int>>& clicks = {},
-                 const std::vector<std::string>& keys = {});
+                 const std::vector<std::string>& keys = {}, int waitMs = 0);
 
 // the size the window should have for a given view class (0x0 when unknown)
 void guiViewSize(VM& vm, const std::string& viewName, int& w, int& h, std::string& title);

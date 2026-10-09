@@ -159,6 +159,15 @@ major change, and a new check is a minor one.
   registry, so the reference manual lists every linked module and member automatically.
 * `examples/ffi.ant` and `examples/jit.ant`, plus `docs/ffi.md` and `docs/jit.md`.
 
+* **视图的宿主钩子：`every` / `tick` / `keys`（实时界面）。**  机器码后端之外，界面一侧原来
+  没有任何按时间推进的入口：`view` 只能在点击事件的 handler 里跑循环，而 handler 里不返回就
+  不会重绘（窗口冻住），于是"实时"只能靠宿主在每个 handler 结束时刷一次——看起来就是"点一下
+  跳一格"。现在 view 可以自己声明 `every=16, tick=frame`：宿主 `ViewWindow` 持有 `QTimer`，
+  按间隔调用 `frame()`，中间走正常事件循环，重绘与输入由 Qt 保证，不空转也不卡窗口；
+  `keys=onKey` 把键盘交给视图（"Left"/"Right"/"Space"/"Enter"/"Escape"/"Tab" 或键入字符），
+  在 `Input` 内建处理之前派发。两者都从视图实例拷到根节点（`applyRootMeta`），自动重建后
+  自动重挂。`--gui-shot --gui-wait <ms>` 让事件循环先跑一段时间再截图，因此这两类钩子可以被
+  真正验证（实测 `every=16` 下 60 帧 / 946 ms ≈ 63 fps）。
 * **`_sys_frame(ms)`：让实时循环成为可能。**  视图系统原来没有任何定时/帧回调，所以"实时"界面
   只能靠点击驱动，或者在一个 handler 里死循环（窗口直接卡住）。现在 `_sys_frame(ms)` 睡到这一帧
   的预算用完，并把这段时间交给宿主：`--gui`/studio 会在此期间重绘、派发点击，返回 false 表示窗口

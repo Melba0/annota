@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <QApplication>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <QThread>
 #include <QWidget>
 #include <QPainter>
@@ -169,6 +170,58 @@ public:
         rebuild();
     }
 
+    // ---- host-owned hooks: a repeating timer and keyboard routing declared by the view itself
+    //
+    // A view that needs to run in real time should not have to sit in a `while` loop inside a click
+    // handler (that freezes the window unless the handler pumps events itself, and it burns a core
+    // doing it).  Instead the *host* owns a QTimer: the view declares
+    //
+    //     view Game(title="...", every=16, tick=frame, keys=onKey)( ... )
+    //
+    // and gets `frame()` called ~every 16 ms with a normal event loop in between, so repaints and
+    // input are guaranteed.  `keys=onKey` receives the pressed key as a string ("Left", "Right",
+    // "Up", "Down", "Space", "Return", "Escape", or the typed character), before the built-in
+    // Input handling, and only when the root asks for it.
+    void startHooks() {
+        int ms = iattr(root_, "every", -1);
+        const Value* tk = attrOf(root_, "tick");
+        bool wantTick = ms > 0 && tk && (tk->t == VT::Function || tk->t == VT::Native || tk->t == VT::Bound);
+        if (!wantTick) {
+            if (ticker_) ticker_->stop();
+            tickMs_ = -1;
+            return;
+        }
+        if (!ticker_) {
+            ticker_ = new QTimer(this);
+            connect(ticker_, &QTimer::timeout, this, [this] {
+                if (root_.t != VT::UiNode || dirty_) rebuild();   // pick up the newest handlers
+                callHandler(root_, "tick", {});
+            });
+        }
+        if (ms != tickMs_) {
+            tickMs_ = ms;
+            ticker_->start(ms);
+        }
+    }
+
+    static QString keyName(QKeyEvent* e) {
+        switch (e->key()) {
+            case Qt::Key_Left: return QStringLiteral("Left");
+            case Qt::Key_Right: return QStringLiteral("Right");
+            case Qt::Key_Up: return QStringLiteral("Up");
+            case Qt::Key_Down: return QStringLiteral("Down");
+            case Qt::Key_Space: return QStringLiteral("Space");
+            case Qt::Key_Return:
+            case Qt::Key_Enter: return QStringLiteral("Return");
+            case Qt::Key_Escape: return QStringLiteral("Escape");
+            case Qt::Key_Tab: return QStringLiteral("Tab");
+            default: break;
+        }
+        QString t = e->text();
+        if (!t.isEmpty()) return t;
+        return QString(QChar((ushort)e->key()));
+    }
+
     void closeEvent(QCloseEvent* e) override {
         closed_ = true;                      // a running `_sys_frame` loop sees this and stops
         QWidget::closeEvent(e);
@@ -205,6 +258,7 @@ public:
             resize(sz.expandedTo(QSize(160, 80)));
         }
         setWindowTitle(sattr(root_, "title", QStringLiteral("Annota")));
+        startHooks();
         restoreFocus();
         relayout();
     }
@@ -265,6 +319,11 @@ protected:
     }
 
     void keyPressEvent(QKeyEvent* e) override {
+        const Value* kh = (root_.t == VT::UiNode) ? attrOf(root_, "keys") : nullptr;
+        if (kh && (kh->t == VT::Function || kh->t == VT::Native || kh->t == VT::Bound)) {
+            callHandler(root_, "keys", {Value::str(keyName(e).toUtf8().constData())});
+            return;
+        }
         if (!focused_) { QWidget::keyPressEvent(e); return; }
         if (e->key() == Qt::Key_Backspace) {
             if (!editText_.isEmpty()) editText_.chop(1);
@@ -325,6 +384,8 @@ private:
     const Obj* focused_ = nullptr;
     QString focusedKey_;
     bool closed_ = false;
+    QTimer* ticker_ = nullptr;          // view-declared `every`/`tick` hook
+    int tickMs_ = -1;
     QString editText_;
 
     // ---- view model
@@ -722,7 +783,7 @@ int guiShowView(VM& vm, const std::string& viewName) {
 
 int guiRenderPng(VM& vm, const std::string& viewName, const std::string& path,
                  const std::vector<std::pair<int, int>>& clicks,
-                 const std::vector<std::string>& keys) {
+                 const std::vector<std::string>& keys, int waitMs) {
     ensureQtPaths();
     int argc = qtArgc();
     QApplication app(argc, qtArgv());
@@ -743,6 +804,15 @@ int guiRenderPng(VM& vm, const std::string& viewName, const std::string& path,
             QString t = (ch == '\n') ? QString() : QString(QChar(QLatin1Char(ch)));
             QKeyEvent ev(QEvent::KeyPress, key, Qt::NoModifier, t);
             QApplication::sendEvent(&win, &ev);
+        }
+    }
+    if (waitMs > 0) {
+        // let host-owned hooks (the `every`/`tick` timer, key handlers) actually run for a while
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < waitMs) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
         }
     }
     QPixmap pm = win.grab();

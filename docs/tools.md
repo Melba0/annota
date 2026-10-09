@@ -64,6 +64,7 @@ build\annota.exe examples\algorithms.ant           # 等价于 run
 | `--gui-tree` | 以文本打印组件树（不需要 Qt） |
 | `--gui-shot <png>` | 不开窗，把 `view` 渲染成 PNG |
 | `--gui-click X,Y` / `--gui-key <键>` | 在截图前派发一次合成点击 / 按键 |
+| `--gui-wait <ms>` | 截图前先让事件循环跑 ms 毫秒（这样 `every`/`tick` 定时器和按键处理会被真正执行） |
 | `--features` | 报告本二进制的可选能力 |
 | `-h` / `--help` | 用法 |
 

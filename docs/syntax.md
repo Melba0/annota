@@ -1,4 +1,4 @@
-﻿# Annota 语法规范
+# Annota 语法规范
 
 本文件是 Annota 的语法参考：词法、语句、表达式、类型与预定义结构。工具链实现与本文不一致时，
 以本文为准并视为 bug。标注、诊断码与底层原语的完整清单见
@@ -507,6 +507,25 @@ view Counter(title="Counter", width=400, height=300)(
 )
 ```
 
+视图还能声明**宿主钩子**，不必在 handler 里自己写实时循环：
+
+```annota
+view Game(title="游戏", width=460, height=700, every=16, tick=frame, keys=onKey)(
+    Text("t = " + str(t))()
+)
+
+frame()( t = t + 1 )                       -- 宿主每 16ms 调一次
+onKey(k)(                                  -- 键盘：收到 "Left"/"Right"/"Space"/"Enter"/"Escape"/"Tab"
+    if k == "Left"( ... )                  --   或者被键入的字符
+)
+```
+
+* `every=<毫秒>` + `tick=<函数>`：宿主（窗口）自己持有 `QTimer`，按间隔调用 `tick`。中间走正常
+  事件循环，所以**重绘和输入都由 Qt 保证**，画面不会卡住，也不会空转烧 CPU；
+* `keys=<函数>`：把按键交给它（在 `Input` 的内建处理之前），参数是按键名字符串；
+* `--gui-shot --gui-wait <ms>` 可以先让事件循环跑一段时间再截图，用来验证这两类钩子；
+* 需要更自由的循环时，`_sys_frame(ms)` 会睡满这一帧的预算并把时间交给宿主重绘、收事件，
+  返回 `false` 表示窗口已关闭（`while running && _sys_frame(8)( ... )`）。
 `view` 是特殊的类：外层 `state` 变化会触发界面重建；组件（`Column` / `Row` / `Text` /
 `Button` / …）是内建构件。`annota <file> --gui` 打开窗口，IDE 里按 `F7` 预览。
 

@@ -1230,7 +1230,7 @@ static void applyRootMeta(Value& result, const Value& inst) {
         node = &result.o->items[0];
     if (!node) return;
     ClassInfo* k = inst.o->klass.get();
-    for (const char* key : {"title", "width", "height"}) {
+    for (const char* key : {"title", "width", "height", "every", "tick", "keys"}) {
         if (node->o->map.count(key)) continue;
         int idx = k->findField(key);
         if (idx < 0 || idx >= (int)inst.o->fields.size()) continue;

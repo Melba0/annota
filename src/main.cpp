@@ -1,4 +1,4 @@
-﻿// Annota - main.cpp : command line driver.
+// Annota - main.cpp : command line driver.
 //
 //   annota run   <file.ant>        execute a program            (default)
 //   annota check <file.ant>        parse + compile + report annotations
@@ -339,6 +339,7 @@ int main(int argc, char** argv) {
     std::string guiOut;
     bool dumpTokens = false, dumpAst = false, dumpBc = false, dumpAnn = false;
     bool contracts = false, guiWindow = false, guiShot = false, guiTree = false;
+    int guiWait = 0;
     std::vector<std::pair<int, int>> clicks;
     std::vector<std::string> keys;
     std::vector<std::string> plugins;          // C++ modules to load before the program runs
@@ -355,6 +356,7 @@ int main(int argc, char** argv) {
         if (a == "--gui") { guiWindow = true; continue; }
         if (a == "--gui-tree") { guiTree = true; continue; }
         if (a == "--gui-shot" && i + 1 < argc) { guiOut = argv[++i]; guiShot = true; continue; }
+        if (a == "--gui-wait" && i + 1 < argc) { guiWait = std::atoi(argv[++i]); continue; }
         if (a == "--gui-click" && i + 1 < argc) {
             std::string spec = argv[++i];
             size_t comma = spec.find(',');
@@ -387,6 +389,7 @@ int main(int argc, char** argv) {
                         "  --gui                open the view in a window (Qt build)\n"
                         "  --gui-shot <path>    render the view to a PNG file\n"
                         "  --gui-click X,Y      dispatch a synthetic click before --gui-shot\n"
+        "  --gui-wait MS        keep the event loop running for MS before --gui-shot\n"
                         "  --gui-key <text>     dispatch synthetic keystrokes before --gui-shot\n"
                         "  --gui-tree           print the view tree as text\n"
                         "  --features           list the optional features of this build\n"
@@ -565,7 +568,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!viewName.empty() && guiShot) {
-        int grc = guiRenderPng(vm, viewName, guiOut, clicks, keys);
+        int grc = guiRenderPng(vm, viewName, guiOut, clicks, keys, guiWait);
         if (grc != 0) rc = grc;
     }
     if (!viewName.empty() && guiWindow && !guiAvailable()) {
