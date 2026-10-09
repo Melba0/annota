@@ -174,7 +174,13 @@ major change, and a new check is a minor one.
   已经关了（所以关闭窗口能结束游戏循环，而不是把它挂住）。没有界面时它就是一次普通 sleep。
   用它写的实时循环按真实毫秒推进物理量，帧率与机器快慢无关。GUI 侧按 1~2ms 切片 pump 并补齐
   预算，实测 ~65 fps 而不是 11000 fps 的空转。
-### Fixed
+* **`Canvas` 组件：每帧重画的画面不再需要"一个精灵一个节点"。**  视图把 `items`（`[x, y, 字形,
+  颜色, 字号]` 的列表）交给宿主，宿主一次画完：不建 UiNode、不做逐节点度量、不跑逐节点原生调用，
+  画布外的项直接跳过。渲染出的字形按（字形/字号/颜色/格子/DPR）缓存成 pixmap，所以一帧基本只是
+  位图搬运 —— 真窗口里 emoji 的栅格化与字体回退才是卡顿来源。同时 `Text` 在同时给了 `width` 和
+  `height` 时不再调用 `QFontMetrics::boundingRect`（帧内最贵的调用之一），`ViewWindow` 打开
+  `WA_OpaquePaintEvent` 免得 Qt 每帧再刷一遍背景。实测（离屏光栅）：`every=16` 恒定 62 fps，
+  `every=4` + 60 个 emoji 精灵约 250 fps。### Fixed
 
 * **A local assigned a comparison result was still required at entry.**  The entry check's "read
   slots" test only recognised *integer* value kinds, so a local holding a `bool` (or a 128 bit pair)

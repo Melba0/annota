@@ -388,7 +388,8 @@ Value builtinMethod(VM& vm, const Value& obj, const std::string& name) {
 
 // ---------------------------------------------------------------- GUI components
 static const char* kComponents[] = {
-    "Text", "Button", "Input", "Image", "Column", "Row", "Stack", "Scroll", "Spacer", "Slider", "Checkbox", "Link"
+    "Text", "Button", "Input", "Image", "Column", "Row", "Stack", "Scroll", "Spacer", "Slider",
+    "Checkbox", "Link", "Canvas"
 };
 
 bool isBuiltinComponent(const std::string& name) {

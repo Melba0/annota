@@ -145,6 +145,8 @@ class ViewWindow : public QWidget {
 public:
     ViewWindow(VM& vm, Value cls) : vm_(vm), cls_(std::move(cls)) {
         setAutoFillBackground(true);
+        // the widget paints every pixel itself; without this Qt fills the background again per frame
+        setAttribute(Qt::WA_OpaquePaintEvent, true);
         QPalette pal = palette();
         pal.setColor(QPalette::Window, QColor(255, 255, 255));
         setPalette(pal);
@@ -384,6 +386,7 @@ private:
     const Obj* focused_ = nullptr;
     QString focusedKey_;
     bool closed_ = false;
+    QHash<QString, QPixmap> glyphs_;    // pre-rendered canvas sprites (see the Canvas painter)
     QTimer* ticker_ = nullptr;          // view-declared `every`/`tick` hook
     int tickMs_ = -1;
     QString editText_;
@@ -443,12 +446,19 @@ private:
         QString type = S(n.o->str);
         QSize sz(0, 0);
         if (type == "Text") {
+            // when both sizes are given there is nothing to measure - and measuring (emoji) text is
+            // the most expensive thing an animated view does per frame
+            if (st.w > 0 && st.h > 0) sz = QSize(st.w, st.h);
+            else {
             QFontMetrics fm(fontOf(st));
             QString t = st.text;
             int maxW = st.w > 0 ? st.w : (availW < (1 << 20) ? std::max(40, availW - 2 * st.pad) : (1 << 20));
             int flags = st.wrap ? Qt::TextWordWrap : 0;
             QRect br = fm.boundingRect(QRect(0, 0, maxW, 1 << 20), flags, t);
             sz = QSize(br.width(), br.height());
+            }
+        } else if (type == "Canvas") {
+            sz = QSize(st.w > 0 ? st.w : 300, st.h > 0 ? st.h : 200);
         } else if (type == "Button") {
             QFontMetrics fm(fontOf(st));
             sz = QSize(fm.horizontalAdvance(st.label) + 26, fm.height() + 12);
@@ -575,7 +585,62 @@ private:
             path.addRoundedRect(r, st.radius, st.radius);
             p.fillPath(path, st.bg);
         }
-        if (type == "Text") {
+        if (type == "Canvas") {
+            // A canvas is drawn in one pass: `items` is a plain list of sprites, so a game frame
+            // never builds a node per sprite (no per-node measure, no per-node native call).
+            // Each item is [x, y, glyph, color, size] - `x`/`y` is the top-left of a `box` sized
+            // cell, and the glyph is centered in it.
+            int box = iattr(n, "box", -1);
+            if (box <= 0) box = st.size + 6;
+            const Value* items = attrOf(n, "items");
+            if (items && (items->t == VT::List || items->t == VT::Tuple)) {
+                for (const Value& sp : items->o->items) {
+                    if (sp.t != VT::List && sp.t != VT::Tuple) continue;
+                    const auto& f = sp.o->items;
+                    if (f.size() < 3) continue;
+                    auto num = [](const Value& v) { return v.t == VT::Int ? (double)v.i : v.f; };
+                    int x = r.x() + (int)num(f[0]);
+                    int y = r.y() + (int)num(f[1]);
+                    if (x > r.right() || y > r.bottom() || x + box < r.left() || y + box < r.top())
+                        continue;                        // off canvas, skip the glyph work entirely
+                    QString glyph = S(f[2].t == VT::Str && f[2].o ? f[2].o->str : std::string());
+                    QFont fnt = p.font();
+                    if (f.size() >= 5 && (f[4].t == VT::Int || f[4].t == VT::Float))
+                        fnt.setPointSize(std::max(6, (int)num(f[4])));
+                    else fnt.setPointSize(std::max(6, st.size));
+                    p.setFont(fnt);
+                    QColor col = st.fg;
+                    if (f.size() >= 4) {
+                        if (f[3].t == VT::Str && f[3].o) col = QColor(S(f[3].o->str));
+                        else if (f[3].t == VT::Int) col = QColor::fromRgba((QRgb)(uint32_t)f[3].i);
+                    }
+                    p.setPen(col);
+                    // Rasterizing an emoji every frame is what makes a real window stutter: DirectWrite
+                    // has to run font fallback and paint the colour glyph again and again.  Sprites repeat
+                    // frame after frame, so render each (glyph, size, colour, box) once into a pixmap and
+                    // blit it afterwards.
+                    const qreal dpr = devicePixelRatioF();
+                    QString gkey = glyph + QLatin1Char('|') + QString::number(fnt.pointSize()) +
+                                   QLatin1Char('|') + col.name() + QLatin1Char('|') + QString::number(box) +
+                                   QLatin1Char('|') + QString::number(dpr);
+                    QPixmap pm = glyphs_.value(gkey);
+                    if (pm.isNull()) {
+                        pm = QPixmap(QSize((int)std::ceil(box * dpr), (int)std::ceil(box * dpr)));
+                        pm.setDevicePixelRatio(dpr);
+                        pm.fill(Qt::transparent);
+                        QPainter gp(&pm);
+                        gp.setFont(fnt);
+                        gp.setPen(col);
+                        gp.drawText(QRect(0, 0, (int)std::ceil(box * dpr), (int)std::ceil(box * dpr)),
+                                    Qt::AlignCenter, glyph);
+                        gp.end();
+                        if (glyphs_.size() > 800) glyphs_.clear();      // bounded memory
+                        glyphs_.insert(gkey, pm);
+                    }
+                    p.drawPixmap(QPoint(x, y), pm);
+                }
+            }
+        } else if (type == "Text") {
             p.setFont(fontOf(st));
             p.setPen(st.fg);
             int flags = Qt::AlignVCenter | (st.wrap ? Qt::TextWordWrap : 0);
