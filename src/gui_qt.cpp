@@ -153,7 +153,13 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         setFocus(Qt::OtherFocusReason);      // a real window only gets keys when it has focus
         setMouseTracking(true);
-        vm_.onStateChange = [this](VM&) { dirty_ = true; };
+        // A state change has to *ask for a repaint*.  Forgetting the update() here was the whole
+        // "runs for a moment, then freezes; keys change the state but nothing happens" bug: the
+        // window only repainted when a mouse event happened to call update() itself.
+        vm_.onStateChange = [this](VM&) {
+            dirty_ = true;
+            update();
+        };
         // `_sys_frame(ms)`: the host half of a real-time loop - repaint what the loop changed and
         // deliver the clicks the player makes while the loop is running, then come back.
         vm_.onFrame = [this](int64_t ms) {
@@ -213,10 +219,26 @@ public:
         }
         if (!ticker_) {
             ticker_ = new QTimer(this);
+            // Windows' coarse timer granularity is ~15.6 ms, so a 16 ms CoarseTimer really fires
+            // every ~31 ms (30 fps and visibly choppy).  A view that asks for a frame rate wants
+            // a precise timer.
+            ticker_->setTimerType(Qt::PreciseTimer);
             connect(ticker_, &QTimer::timeout, this, [this] {
-                if (dirty_ || !rootOk_) rebuild();       // pick up the newest handlers
-                if (haveTick_) callHandlerValue(tickFn_, "tick");
-            });
+                static const bool dbg = std::getenv("ANNOTA_GUI_DEBUG") != nullptr;
+                static QElapsedTimer tclock;
+                static long long tcount = 0;
+                if (dbg) {
+                    if (tcount == 0) tclock.start();
+                    if (++tcount % 60 == 0) {
+                        qint64 ms = tclock.restart();
+                        std::fprintf(stderr,
+                                     "[gui] timer: 60 ticks in %lld ms (%.2f ms/tick) visible=%d active=%d min=%d\n",
+                                     (long long)ms, (double)ms / 60.0, (int)isVisible(),
+                                     (int)isActiveWindow(), (int)isMinimized());
+                    }
+                }
+                if (dirty_ || !rootOk_) rebuild();
+                if (haveTick_) callHandlerValue(tickFn_, "tick");            });
         }
         if (ticker_->interval() != tickMs_) ticker_->start(tickMs_);
     }
@@ -298,7 +320,11 @@ protected:
     }
 
     void paintEvent(QPaintEvent*) override {
+        static const bool guiDebug = std::getenv("ANNOTA_GUI_DEBUG") != nullptr;
+        QElapsedTimer frameClock;
+        if (guiDebug) frameClock.start();
         if (dirty_) rebuild();
+        qint64 rebuildMs = guiDebug ? frameClock.elapsed() : 0;
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         p.fillRect(rect(), QColor(255, 255, 255));
@@ -308,6 +334,22 @@ protected:
             paintNode(p, it);
         }
         p.setClipping(false);
+        if (guiDebug) {
+            qint64 drawMs = frameClock.elapsed() - rebuildMs;
+            ++dbgFrames_;
+            dbgDraw_ += drawMs;
+            dbgRebuild_ += rebuildMs;
+            dbgMaxDraw_ = std::max(dbgMaxDraw_, drawMs);
+            dbgMaxRebuild_ = std::max(dbgMaxRebuild_, rebuildMs);
+            if (dbgFrames_ % 60 == 0) {
+                std::fprintf(stderr,
+                             "[gui] %lld frames: rebuild avg %.2f max %lld, draw avg %.2f max %lld, items=%zu\n",
+                             (long long)dbgFrames_, (double)dbgRebuild_ / 60.0, (long long)dbgMaxRebuild_,
+                             (double)dbgDraw_ / 60.0, (long long)dbgMaxDraw_, items_.size());
+                dbgRebuild_ = dbgDraw_ = 0;
+                dbgMaxRebuild_ = dbgMaxDraw_ = 0;
+            }
+        }
         if (!error_.isEmpty()) {
             // a GUI run has no console: show the failure instead of looking frozen
             QRect bar(0, 0, width(), 34);
@@ -423,7 +465,10 @@ private:
     QString focusedKey_;
     bool closed_ = false;
     QHash<QString, QPixmap> glyphs_;    // pre-rendered canvas sprites (see the Canvas painter)
+    QHash<QString, QPixmap> textCache_; // pre-rendered Text nodes (see the Text branch)
     Value tickFn_, keysFn_;             // resolved hooks: survive a failed rebuild
+    long long dbgFrames_ = 0;           // ANNOTA_GUI_DEBUG counters
+    qint64 dbgRebuild_ = 0, dbgDraw_ = 0, dbgMaxRebuild_ = 0, dbgMaxDraw_ = 0;
     bool haveTick_ = false, haveKeys_ = false, rootOk_ = false;
     QString error_;                     // last view/handler error, drawn in the window
     QTimer* ticker_ = nullptr;          // view-declared `every`/`tick` hook
@@ -485,6 +530,7 @@ private:
             }
         }
         dirty_ = true;
+        update();
     }
 
     // ---- measuring
@@ -642,6 +688,7 @@ private:
             // never builds a node per sprite (no per-node measure, no per-node native call).
             // Each item is [x, y, glyph, color, size] - `x`/`y` is the top-left of a `box` sized
             // cell, and the glyph is centered in it.
+            p.setRenderHint(QPainter::Antialiasing, false);   // cached pixmaps are already smooth
             int box = iattr(n, "box", -1);
             if (box <= 0) box = st.size + 6;
             const Value* items = attrOf(n, "items");
@@ -697,7 +744,32 @@ private:
             p.setPen(st.fg);
             int flags = Qt::AlignVCenter | (st.wrap ? Qt::TextWordWrap : 0);
             flags |= st.isCenter ? Qt::AlignHCenter : (st.isEnd ? Qt::AlignRight : Qt::AlignLeft);
-            p.drawText(r, flags, st.text);
+            // Laying out a *new* string (font resolution, shaping, fallback) costs tens of
+            // milliseconds in some environments, and an animated view keeps showing the same
+            // handful of strings (a score, a frame rate, a key name).  Render each distinct
+            // (text, font, colour, box) once into a pixmap and blit it after that.
+            const qreal dpr = devicePixelRatioF();
+            QString tkey = st.text + QLatin1Char('\x1f') + QString::number(st.size) +
+                           QLatin1Char('\x1f') + QString::number(st.bold) + QString::number(st.light) +
+                           QLatin1Char('\x1f') + st.fg.name() + QLatin1Char('\x1f') +
+                           QString::number(r.width()) + QLatin1Char('x') + QString::number(r.height()) +
+                           QLatin1Char('\x1f') + QString::number(flags) + QLatin1Char('\x1f') +
+                           QString::number(dpr);
+            QPixmap tpm = textCache_.value(tkey);
+            if (tpm.isNull()) {
+                tpm = QPixmap(QSize((int)std::ceil(r.width() * dpr), (int)std::ceil(r.height() * dpr)));
+                tpm.setDevicePixelRatio(dpr);
+                tpm.fill(Qt::transparent);
+                QPainter tp(&tpm);
+                tp.setFont(fontOf(st));
+                tp.setPen(st.fg);
+                tp.drawText(QRect(0, 0, (int)std::ceil(r.width() * dpr), (int)std::ceil(r.height() * dpr)),
+                            flags, st.text);
+                tp.end();
+                if (textCache_.size() > 600) textCache_.clear();
+                textCache_.insert(tkey, tpm);
+            }
+            p.drawPixmap(r.topLeft(), tpm);
         } else if (type == "Button") {
             bool hover = (hovered_ == n.o.get());
             bool down = (pressed_ == n.o.get());
@@ -808,7 +880,15 @@ private:
 // ---------------------------------------------------------------- Qt bootstrap
 // Qt needs its platform plugin.  A deployed build finds it next to the executable
 // (see build.ps1); setting QT_PLUGIN_PATH is the manual escape hatch.
-void ensureQtPaths() {}
+void ensureQtPaths() {
+    // A GUI run's stderr is usually redirected to a file/pipe, where it is block buffered: without
+    // this, diagnostics (and `ANNOTA_GUI_DEBUG=1`) vanish when the window is closed or killed.
+    static bool unbuffered = false;
+    if (!unbuffered) {
+        unbuffered = true;
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+    }}
 
 // QApplication wants a stable argv for its whole lifetime.
 int& qtArgc() {

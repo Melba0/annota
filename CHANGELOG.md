@@ -187,7 +187,25 @@ major change, and a new check is a minor one.
   画成窗口顶部的红条（GUI 没有控制台，静默失败≈卡死）；实测一次性错误不再造成任何停顿
   （第 51 帧抛错，帧时间仍是 466/945/1424… ms 稳定 62 fps）。键盘方面：窗口以前从未拿到焦点
   （`--gui-key` 直接把事件塞给控件，掩盖了这个问题），现在 `show`/`activateWindow`/`setFocus`
-  齐全、重建后自动补焦点，并且 `--gui-key` 改为发往**焦点控件**，所以"按键可用"是被真正测过的。### Fixed
+  齐全、重建后自动补焦点，并且 `--gui-key` 改为发往**焦点控件**，所以"按键可用"是被真正测过的。* **状态变化没有请求重绘（这才是"画面跑一段就卡住、按键改了状态却没反应"的根因）。**  宿主只在
+  `onStateChange` 里置了 `dirty_`，却没有调用 `update()`：定时器每帧都在跑、状态每帧都在变、
+  `tick`/`keys` 回调也确实执行了（日志里能看到 `moveLeft -> tx=170.0`），但**没有任何一次重绘被安排**，
+  于是窗口停在最后一帧；只有鼠标事件（按钮回调）会顺手 `update()`，所以点按钮时画面才动一下、
+  看起来就是"点一下跳一格"。现在 `onStateChange` 与处理器结束都会 `update()`。这个 bug 之所以一直
+  没被测出来，是因为两个验证手段都绕过了它：截图走 `grab()` 强制渲染一次，帧率又是数 `tick` 次数
+  而不是数重绘次数 —— 现在改成数**真实的 `paintEvent`**。
+* **Windows 上 Qt 默认计时器粒度 ~15.6 ms，`every=16` 实际约 31 ms。**  视图声明的计时器改用
+  `Qt::PreciseTimer`，实测 16.1 ms/tick（≈62 fps）；同时把 `--gui-key` 从"直接塞给窗口"改成发往
+  **焦点控件**，并补上 `show`/`activateWindow`/`setFocus`——之前键盘在真窗口里根本没到过窗口
+  （测试却一直是绿的，因为合成事件绕过了焦点）。
+* **`Text` 渲染结果按（文本 / 字体 / 颜色 / 尺寸 / DPR）缓存成 pixmap。**  实测在这种环境里
+  **第一次出现的新字符串**要现场排版约 30 ms（一帧就掉了，观感是"每次按键卡一小下"），因为
+  计分板/帧率/按键名这类文字每次变化都是新字符串；缓存后稳态绘制降到平均 1.5~3 ms，
+  剩下的偶发峰值只出现在从未见过的字符串上。配合 `Canvas` 的逐字形缓存，会变的文字建议画在画布上。
+* **`ANNOTA_GUI_DEBUG=1` 诊断。**  每 60 帧打印 `rebuild`/`draw` 的平均与最大耗时、计时器间隔以及
+  窗口的可见/激活/最小化状态；同时把 GUI 运行的 stdout/stderr 改为**无缓冲**——以前重定向到文件时，
+  窗口被关或被 kill 会把这些日志整段丢掉（排查时看不到任何输出）。实测本机数据：计时器
+  16.1 ms/tick，视图重建 0.00~0.05 ms，绘制平均 1.5~3 ms（仅首次见到的字符串最高约 33 ms）。### Fixed
 
 * **A local assigned a comparison result was still required at entry.**  The entry check's "read
   slots" test only recognised *integer* value kinds, so a local holding a `bool` (or a 128 bit pair)

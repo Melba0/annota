@@ -123,6 +123,7 @@ build\annota.exe studio examples\perf.ant --check-highlight        # 只检查�
 | `ANNOTA_JIT_THRESHOLD` | 自动编译热循环所需的回跳次数（默认 4000，`0` 关闭自动提升） | `$env:ANNOTA_JIT_THRESHOLD="1000"` |
 | `ANNOTA_NO_JIT` | 设为任意值即完全关闭机器码后端（保留超指令融合） | `$env:ANNOTA_NO_JIT="1"` |
 | `ANNOTA_JIT_DEBUG` | 打印自动编译/不可翻译的原因 | `$env:ANNOTA_JIT_DEBUG="1"` |
+| `ANNOTA_GUI_DEBUG` | 每个窗口每 60 帧打印一次 rebuild / draw 的平均与最大耗时、计时器间隔、窗口可见/激活/最小化状态（排查"卡住 / 不刷新"） | `$env:ANNOTA_GUI_DEBUG="1"` |
 | `ANNOTA_INPUT` | 图形界面里预答 `input`（自动化测试用） | `$env:ANNOTA_INPUT="hello"` |
 | `QT_QPA_PLATFORM` | Qt 平台插件（无头机器用 `offscreen`） | `$env:QT_QPA_PLATFORM="offscreen"` |
 | `CXX` | `annota plugin build` 使用的编译器 | `$env:CXX="D:\Qt\Tools\mingw1310_64\bin\g++.exe"` |

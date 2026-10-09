@@ -172,6 +172,7 @@ than a rebuild. The same primitives are reachable through the `system` facade
 | `_sys_clock()` | int | monotonic milliseconds (measure elapsed time) |
 | `_sys_time()` | int | wall clock milliseconds since the epoch |
 | `_sys_sleep(ms)` | null | sleep |
+| `_sys_frame(ms)` | bool | 让出一帧：睡 `ms` 并把这段时间交给宿主重绘 / 收事件（没有界面时就是 sleep）；返回 `false` 表示宿主已关闭，循环该结束 |
 | `_sys_local_time([ms])` | List | `[year, month, day, hour, minute, second, weekday]` |
 | `_sys_make_time(y, mo, d[, h, mi, s])` | int | local time to a timestamp (ms) |
 | `_sys_info(key)` | String/int | `platform`, `arch`, `cpus`, `pid`, `home`, `temp`, `cwd` |
