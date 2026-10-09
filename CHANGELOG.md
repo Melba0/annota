@@ -180,7 +180,14 @@ major change, and a new check is a minor one.
   位图搬运 —— 真窗口里 emoji 的栅格化与字体回退才是卡顿来源。同时 `Text` 在同时给了 `width` 和
   `height` 时不再调用 `QFontMetrics::boundingRect`（帧内最贵的调用之一），`ViewWindow` 打开
   `WA_OpaquePaintEvent` 免得 Qt 每帧再刷一遍背景。实测（离屏光栅）：`every=16` 恒定 62 fps，
-  `every=4` + 60 个 emoji 精灵约 250 fps。### Fixed
+  `every=4` + 60 个 emoji 精灵约 250 fps。* **视图钩子不再被一次错误打断，键盘焦点也补上了。**  两个真实故障同源：视图体（或 `tick`/`keys`
+  处理器）抛错时，宿主原来会把 `root_` 置空并**停掉定时器** —— 画面从此定格，而且根节点没了
+  `keys` 属性，键盘也一起失效，看起来就是"跑一段，然后突然卡住、按键没反应"。现在宿主把解析到的
+  `tick`/`keys` 缓存下来（只有"成功重建且视图明确不要"才摘掉），失败时保留上一棵能用的树，并把错误
+  画成窗口顶部的红条（GUI 没有控制台，静默失败≈卡死）；实测一次性错误不再造成任何停顿
+  （第 51 帧抛错，帧时间仍是 466/945/1424… ms 稳定 62 fps）。键盘方面：窗口以前从未拿到焦点
+  （`--gui-key` 直接把事件塞给控件，掩盖了这个问题），现在 `show`/`activateWindow`/`setFocus`
+  齐全、重建后自动补焦点，并且 `--gui-key` 改为发往**焦点控件**，所以"按键可用"是被真正测过的。### Fixed
 
 * **A local assigned a comparison result was still required at entry.**  The entry check's "read
   slots" test only recognised *integer* value kinds, so a local holding a `bool` (or a 128 bit pair)

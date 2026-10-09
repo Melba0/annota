@@ -151,6 +151,7 @@ public:
         pal.setColor(QPalette::Window, QColor(255, 255, 255));
         setPalette(pal);
         setFocusPolicy(Qt::StrongFocus);
+        setFocus(Qt::OtherFocusReason);      // a real window only gets keys when it has focus
         setMouseTracking(true);
         vm_.onStateChange = [this](VM&) { dirty_ = true; };
         // `_sys_frame(ms)`: the host half of a real-time loop - repaint what the loop changed and
@@ -185,25 +186,39 @@ public:
     // "Up", "Down", "Space", "Return", "Escape", or the typed character), before the built-in
     // Input handling, and only when the root asks for it.
     void startHooks() {
+        // A view whose body throws must not silently lose its timer and its keyboard: the hooks are
+        // remembered, and a *successful* rebuild is the only thing allowed to switch them off.  That
+        // is what used to turn one transient error into a frozen window with dead keys.
         int ms = iattr(root_, "every", -1);
         const Value* tk = attrOf(root_, "tick");
-        bool wantTick = ms > 0 && tk && (tk->t == VT::Function || tk->t == VT::Native || tk->t == VT::Bound);
-        if (!wantTick) {
+        if (rootOk_) {
+            if (ms > 0) tickMs_ = ms;
+            if (tk && (tk->t == VT::Function || tk->t == VT::Native || tk->t == VT::Bound)) {
+                tickFn_ = *tk;
+                haveTick_ = true;
+            } else if (ms <= 0) {
+                haveTick_ = false;                       // rebuilt fine and asks for no timer
+            }
+            const Value* kh = attrOf(root_, "keys");
+            if (kh && (kh->t == VT::Function || kh->t == VT::Native || kh->t == VT::Bound)) {
+                keysFn_ = *kh;
+                haveKeys_ = true;
+            } else {
+                haveKeys_ = false;                       // rebuilt fine: the view handles no keys
+            }
+        }
+        if (!haveTick_ || tickMs_ <= 0) {
             if (ticker_) ticker_->stop();
-            tickMs_ = -1;
             return;
         }
         if (!ticker_) {
             ticker_ = new QTimer(this);
             connect(ticker_, &QTimer::timeout, this, [this] {
-                if (root_.t != VT::UiNode || dirty_) rebuild();   // pick up the newest handlers
-                callHandler(root_, "tick", {});
+                if (dirty_ || !rootOk_) rebuild();       // pick up the newest handlers
+                if (haveTick_) callHandlerValue(tickFn_, "tick");
             });
         }
-        if (ms != tickMs_) {
-            tickMs_ = ms;
-            ticker_->start(ms);
-        }
+        if (ticker_->interval() != tickMs_) ticker_->start(tickMs_);
     }
 
     static QString keyName(QKeyEvent* e) {
@@ -234,8 +249,10 @@ public:
         meas_.clear();
         items_.clear();
         scroll_.clear();
+        rootOk_ = false;
         try {
             Value tree = vm_.callSync(cls_, {});
+            rootOk_ = true;
             if (tree.t == VT::List || tree.t == VT::Tuple) {
                 if (tree.o->items.size() == 1) root_ = tree.o->items[0];
                 else {
@@ -247,8 +264,16 @@ public:
                 root_ = tree;
             }
         } catch (VMError& e) {
-            std::fprintf(stderr, "annota: view error: %s\n", e.message.c_str());
-            root_ = Value::null();
+            // keep the last tree that worked: the window stays readable (and shows why) instead of
+            // collapsing to an empty 320x120 box
+            if (error_ != QString::fromStdString(e.message)) {
+                std::fprintf(stderr, "annota: view error: %s\n", e.message.c_str());
+                error_ = QString::fromStdString(e.message);
+            }
+            if (root_.t != VT::UiNode) {
+                resize(320, 120);
+                return;
+            }
         }
         if (root_.t != VT::UiNode) {
             resize(320, 120);
@@ -262,6 +287,7 @@ public:
         setWindowTitle(sattr(root_, "title", QStringLiteral("Annota")));
         startHooks();
         restoreFocus();
+        if (!QApplication::focusWidget()) setFocus(Qt::OtherFocusReason);
         relayout();
     }
 
@@ -282,6 +308,17 @@ protected:
             paintNode(p, it);
         }
         p.setClipping(false);
+        if (!error_.isEmpty()) {
+            // a GUI run has no console: show the failure instead of looking frozen
+            QRect bar(0, 0, width(), 34);
+            p.fillRect(bar, QColor(197, 48, 48));
+            p.setPen(Qt::white);
+            QFont f = p.font();
+            f.setPointSize(11);
+            p.setFont(f);
+            p.drawText(bar.adjusted(8, 0, -8, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                       QFontMetrics(f).elidedText(error_, Qt::ElideRight, width() - 16));
+        }
     }
 
     void mousePressEvent(QMouseEvent* e) override {
@@ -321,9 +358,8 @@ protected:
     }
 
     void keyPressEvent(QKeyEvent* e) override {
-        const Value* kh = (root_.t == VT::UiNode) ? attrOf(root_, "keys") : nullptr;
-        if (kh && (kh->t == VT::Function || kh->t == VT::Native || kh->t == VT::Bound)) {
-            callHandler(root_, "keys", {Value::str(keyName(e).toUtf8().constData())});
+        if (haveKeys_) {
+            callHandlerValue(keysFn_, "keys", {Value::str(keyName(e).toUtf8().constData())});
             return;
         }
         if (!focused_) { QWidget::keyPressEvent(e); return; }
@@ -387,6 +423,9 @@ private:
     QString focusedKey_;
     bool closed_ = false;
     QHash<QString, QPixmap> glyphs_;    // pre-rendered canvas sprites (see the Canvas painter)
+    Value tickFn_, keysFn_;             // resolved hooks: survive a failed rebuild
+    bool haveTick_ = false, haveKeys_ = false, rootOk_ = false;
+    QString error_;                     // last view/handler error, drawn in the window
     QTimer* ticker_ = nullptr;          // view-declared `every`/`tick` hook
     int tickMs_ = -1;
     QString editText_;
@@ -427,10 +466,23 @@ private:
     void callHandler(const Value& node, const char* key, std::vector<Value> args) {
         const Value* h = attrOf(node, key);
         if (!h || (h->t != VT::Function && h->t != VT::Native && h->t != VT::Bound)) return;
+        callHandlerValue(*h, key, std::move(args));
+    }
+
+    // Same, for a handler that was already resolved (the hooks cache theirs so a broken rebuild
+    // cannot take the timer or the keyboard away).  Errors are reported once and shown in the
+    // window: a GUI run has no console, so silence is what makes a failure look like a freeze.
+    void callHandlerValue(const Value& h, const char* key, std::vector<Value> args = {}) {
+        if (h.t != VT::Function && h.t != VT::Native && h.t != VT::Bound) return;
         try {
-            vm_.callSync(*h, std::move(args));
+            vm_.callSync(h, std::move(args));
+            if (!error_.isEmpty() && key == std::string("tick")) error_.clear();
         } catch (VMError& e) {
-            std::fprintf(stderr, "annota: %s handler error: %s\n", key, e.message.c_str());
+            if (error_ != QString::fromStdString(e.message)) {
+                std::fprintf(stderr, "annota: %s handler error: %s\n", key, e.message.c_str());
+                error_ = QString::fromStdString(e.message);
+                update();
+            }
         }
         dirty_ = true;
     }
@@ -843,6 +895,7 @@ int guiShowView(VM& vm, const std::string& viewName) {
     win->show();
     win->raise();
     win->activateWindow();
+    win->setFocus(Qt::ActiveWindowFocusReason);   // without this a real window never sees the keys
     return 0;
 }
 
@@ -856,6 +909,9 @@ int guiRenderPng(VM& vm, const std::string& viewName, const std::string& path,
     if (!fetchView(vm, viewName, cls)) return 2;
     ViewWindow win(vm, cls);
     win.rebuild();
+    win.show();                                   // so focus/key handling behaves like a real window
+    win.activateWindow();
+    win.setFocus(Qt::ActiveWindowFocusReason);
     for (auto& c : clicks) {
         QPointF pt(c.first, c.second);
         QMouseEvent press(QEvent::MouseButtonPress, pt, pt, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
@@ -863,12 +919,20 @@ int guiRenderPng(VM& vm, const std::string& viewName, const std::string& path,
         QApplication::sendEvent(&win, &press);
         QApplication::sendEvent(&win, &release);
     }
+    // Send keys the way a keyboard does - to the focus widget - so a window that never took focus
+    // fails the test instead of being hidden by a shortcut.  `--gui-key` used to post straight to
+    // the window, which is exactly why "keys work" passed while a real window ignored them.
+    QWidget* keyTarget = QApplication::focusWidget();
+    if (!keyTarget) {
+        std::fprintf(stderr, "annota: --gui-key: no focus widget, sending to the window anyway\n");
+        keyTarget = &win;
+    }
     for (auto& text : keys) {
         for (char ch : text) {
             int key = (ch == '\n') ? Qt::Key_Return : 0;
             QString t = (ch == '\n') ? QString() : QString(QChar(QLatin1Char(ch)));
             QKeyEvent ev(QEvent::KeyPress, key, Qt::NoModifier, t);
-            QApplication::sendEvent(&win, &ev);
+            QApplication::sendEvent(keyTarget, &ev);
         }
     }
     if (waitMs > 0) {
