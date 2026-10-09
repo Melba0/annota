@@ -39,6 +39,9 @@ using JitFn = int64_t (*)(const int64_t*, void*);
 constexpr int64_t kJitOutError = 4;
 constexpr int64_t kJitOutDivZero = 12;
 constexpr int64_t kJitOutModZero = 13;
+constexpr int64_t kJitOutWideS = 14;       // a signed 128 bit result (value + value2)
+constexpr int64_t kJitOutWideU = 15;       // an unsigned 128 bit result
+constexpr int64_t kJitOutShift = 16;       // a negative shift count
 
 // The kind byte a compiled function writes next to its result.  The first six codes are the
 // original set; the widths that used to collapse into "int" (0) now have their own code, because
@@ -96,9 +99,24 @@ int64_t annotaJitMod(int64_t a, int64_t b);
 // through these two.  A helper (rather than a fixed address) keeps the backend safe when two VMs
 // run on two threads - something `_sys_spawn` really does.
 int annotaJitGlobalIndex(const std::string& name);   // -1 when the name may not be compiled
+// What the global holds *at compile time*: 0 = a plain integer (or not defined yet), 1 = longlong,
+// 2 = ulonglong.  It only chooses which representation the machine code uses - every native call
+// re-checks the value, so a wrong guess costs speed, never correctness.
+int annotaJitGlobalWideSign(const std::string& name);
 int64_t annotaJitGetGlobal(int64_t idx);
 int64_t annotaJitGlobalKind(int64_t idx);
 void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode);
+
+// 128 bit (`longlong` / `ulonglong`).  A wide value is a pair of 64 bit halves in the native frame;
+// every operation is one call into C++ that mirrors the interpreter's own wide path.  `opUns` packs
+// the bytecode op in its low byte and the "either side is unsigned" flag in the next one.
+int64_t annotaJitWideBin(int64_t opUns, const void* a, const void* b, void* out);   // 0 or an error kind
+int64_t annotaJitWideCmp(const void* a, const void* b, int64_t opUns);
+void annotaJitWideNeg(const void* a, void* out);
+void annotaJitGetGlobalWide(int64_t idx, void* out);
+void annotaJitSetGlobalWide(int64_t idx, const void* src, int64_t uns);
+const Value* annotaJitWideBox(const void* raw, int64_t uns);
+void annotaJitUnpackWideLocals(void* base, int64_t numLocals);
 
 // The native code writes the returned value here.  `kind`: 0 = int (untyped), 1 = int64,
 // 2 = bool, 3 = null - the same Value the interpreter would have produced.  `ctx` is filled by the
@@ -108,6 +126,7 @@ void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode);
 struct JitOut {
     int64_t value = 0;
     int64_t kind = 3;
+    int64_t value2 = 0;      // the high half of a 128 bit result
     Value* const* ctx = nullptr;
 };
 
@@ -121,6 +140,11 @@ struct JitCode {
     std::map<size_t, std::vector<uint8_t>> osrDesc;
     // the globals (by index) this code - and everything it calls - reads or writes
     std::vector<int> globals;
+    // globals it reads or writes as 128 bit values: (index, 1 = longlong, 2 = ulonglong)
+    std::vector<std::pair<int, int>> wideGlobals;
+    // locals whose 16 byte cell has to be filled from the interpreter before the code runs:
+    // (slot, 1 = longlong, 2 = ulonglong)
+    std::vector<std::pair<int, int>> wideLocals;
     JitFn fn = nullptr;
     // kind byte every `return` writes (0 int, 1 int64, 2 bool, 3 null); -2 when it varies, which
     // makes the function unusable as a direct call target from other native code
@@ -180,7 +204,16 @@ static const JitKindSet kJitRange = (JitKindSet)1 << 14;
 static const JitKindSet kJitTuple = (JitKindSet)1 << 13;
 static const JitKindSet kJitConst = (JitKindSet)1 << 12;
 static const JitKindSet kJitMarkers = kJitRange | kJitTuple | kJitConst;
+// 128 bit values (`longlong` / `ulonglong`) get their own two bits.  Such a value is *not* one
+// integer kind: in a virtual register it is a pointer to a pair of 64 bit halves, and in a local it
+// lives in the frame's own 16 byte cell (see the wide areas in the frame layout).
+static const JitKindSet kJitWideS = (JitKindSet)1 << 9;      // longlong (signed)
+static const JitKindSet kJitWideU = (JitKindSet)1 << 10;     // ulonglong (unsigned)
+static const JitKindSet kJitWides = kJitWideS | kJitWideU;
 
+// 0 = not a wide value, 1 = signed, 2 = unsigned (why 2: that is the descriptor the VM checks)
+static inline int jitWideOf(JitKindSet k) { return k == kJitWideS ? 1 : k == kJitWideU ? 2 : 0; }
+static inline bool jitHasWide(JitKindSet k) { return (k & kJitWides) != 0; }
 // an ordinary integer value: the only thing arithmetic, assignments and returns may consume
 static inline bool jitPlainKind(JitKindSet k) { return (k & kJitMarkers) == 0; }
 
@@ -202,6 +235,7 @@ constexpr uint8_t kJitOsrAny = 0;          // any integer width
 constexpr uint8_t kJitOsrWide64 = 1;       // an untyped int or an int64 (the non-wrapping widths)
 constexpr uint8_t kJitOsrBool = 254;       // a comparison result
 constexpr uint8_t kJitOsrIter = 255;       // a range iterator (state kept in the private slots)
+constexpr uint8_t kJitOsrWide = 253;       // a 128 bit value: a loop header is never entered with one
 
 // What the trampoline tells the VM's reconstruction helper; the machine code fills this in its own
 // frame and passes one pointer to it.
@@ -215,6 +249,13 @@ void annotaJitOsrInit(const JitOsrFrame* f);
 
 // promote every pair and collect the outcomes
 static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
+    // a 128 bit operand decides the result: the interpreter keeps the "unsigned" flag of either wide
+    // side (`a.wideUnsigned() || b.wideUnsigned()`), and a *narrow* unsigned kind does not set it,
+    // because a plain Int value reports `wideUnsigned() == false`.
+    if (jitHasWide(a) || jitHasWide(b)) {
+        if (a == kJitBool || b == kJitBool) return 0;          // `true + longlong` is an error
+        return (a & kJitWides) | (b & kJitWides);
+    }
     JitKindSet out = 0;
     for (int i = 0; i < 16; i++) {
         if (!(a & ((JitKindSet)1 << i))) continue;
@@ -235,7 +276,7 @@ static inline JitKindSet jitPromoteSet(JitKindSet a, JitKindSet b) {
 // -1 when the set does not pin down exactly one integer kind
 static inline int jitSoleKind(JitKindSet s) {
     if (s == kJitBool) return 15;
-    if (s & kJitMarkers) return -1;                  // not a value the arithmetic can use
+    if (s & (kJitMarkers | kJitWides)) return -1;    // a marker or a 128 bit value: not a width
     if (s == 0 || (s & (s - 1)) != 0) return -1;
     for (int i = 0; i <= (int)NumKind::U64; i++) if (s == ((JitKindSet)1 << i)) return i;
     return -1;
@@ -244,6 +285,7 @@ static inline int jitSoleKind(JitKindSet s) {
 // The on-stack-replacement descriptor for one live virtual register, and the matching check.
 static inline uint8_t jitOsrDescOf(JitKindSet k) {
     if (k == kJitRange) return kJitOsrIter;
+    if (jitHasWide(k)) return kJitOsrWide;           // a trampoline cannot rebuild a 128 bit value
     int sole = jitSoleKind(k);
     if (sole == 15) return kJitOsrBool;
     if (sole >= 0) return (uint8_t)(jitKindCode((NumKind)sole) + 2);
@@ -254,7 +296,7 @@ static inline uint8_t jitOsrDescOf(JitKindSet k) {
 static inline bool jitOsrDescOk(uint8_t d, NumKind k) {
     if (d == kJitOsrAny) return true;
     if (d == kJitOsrWide64) return k == NumKind::None || k == NumKind::I64;
-    if (d == kJitOsrBool || d == kJitOsrIter) return false;
+    if (d == kJitOsrBool || d == kJitOsrIter || d == kJitOsrWide) return false;
     return (int)d - 2 == jitKindCode(k);
 }
 
@@ -394,6 +436,7 @@ public:
     void imulRaxR8() { u8(0x49); u8(0x0F); u8(0xAF); u8(0xC0); }
     void cmpRaxR8() { u8(0x4C); u8(0x39); u8(0xC0); }
     void cmpRaxImm(int32_t v) { u8(0x48); u8(0x3D); u32((uint32_t)v); }
+    void cmpR8Imm(int8_t v) { u8(0x49); u8(0x83); u8(0xF8); u8((uint8_t)v); }   // cmp r8, imm8
     void testRaxRax() { u8(0x48); u8(0x85); u8(0xC0); }
     void setcc(uint8_t cc) { u8(0x0F); u8(cc); u8(0xC0); u8(0x0F); u8(0xB6); u8(0xC0); }
 
@@ -494,6 +537,37 @@ public:
         u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
         u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
     }
+    // Call a C helper with four arguments where the first and the last are immediates: the two
+    // pointers are already in r10 (a) and r11 (b), and the destination pointer is in rax.
+    void callWide4(uint64_t addr, int32_t firstImm) {
+        const int savedBase = 32, savedOut = 40;
+        int N = 48;
+        if ((N % 16) != 8) N += 8 - (N % 16);
+        u8(0x48); u8(0x81); u8(0xEC); u32((uint32_t)N);                       // sub rsp, N
+        u8(0x48); u8(0x89); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // save kBase
+        u8(0x48); u8(0x89); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // save kOut
+        if (kBase == 0x01) {
+            u8(0xB9); u32((uint32_t)firstImm);                                // mov ecx, imm32
+            u8(0x4C); u8(0x89); u8(0xD2);                                     // mov rdx, r10
+            u8(0x4D); u8(0x89); u8(0xD8);                                     // mov r8, r11
+            u8(0x49); u8(0x89); u8(0xC1);                                     // mov r9, rax
+        } else {
+            u8(0xBF); u32((uint32_t)firstImm);                                // mov edi, imm32
+            u8(0x4C); u8(0x89); u8(0xD6);                                     // mov rsi, r10
+            u8(0x4C); u8(0x89); u8(0xDA);                                     // mov rdx, r11
+            u8(0x48); u8(0x89); u8(0xC1);                                     // mov rcx, rax
+        }
+        u8(0x48); u8(0xB8);
+        for (int b = 0; b < 8; b++) u8((uint8_t)((addr >> (8 * b)) & 0xff));  // mov rax, addr
+        u8(0xFF); u8(0xD0);                                                   // call rax
+        u8(0x48); u8(0x8B); u8(kBase == 0x01 ? 0x8C : 0xBC);
+        u8(0x24); u32((uint32_t)savedBase);                                   // restore kBase
+        u8(0x48); u8(0x8B); u8(kOut == 0x02 ? 0x94 : 0xB4);
+        u8(0x24); u32((uint32_t)savedOut);                                    // restore kOut
+        u8(0x48); u8(0x81); u8(0xC4); u32((uint32_t)N);                       // add rsp, N
+    }
     // The C helper above reports a failure (a zero divisor) through a global flag; the caller
     // follows this with a conditional jump over a cold `errorReturn()` block.
     void loadFlagToR10(uint64_t addr) {
@@ -503,6 +577,44 @@ public:
     }
     void testR11R11() { u8(0x4D); u8(0x85); u8(0xDB); }                       // test r11, r11
     void movR8Rax() { u8(0x49); u8(0x89); u8(0xC0); }                         // mov r8, rax
+    void movR11Rax() { u8(0x49); u8(0x89); u8(0xC3); }                        // mov r11, rax
+    void sarR11Imm(uint8_t n) { u8(0x49); u8(0xC1); u8(0xFB); u8(n); }        // sar r11, n
+    // a 128 bit value in a virtual register is a pointer to its two halves
+    void loadPtrToR11(int vr) { loadVrToR11(vr); }
+    void loadRaxToR11() { u8(0x4C); u8(0x8B); u8(0x18); }                     // mov r11, [rax]
+    void loadRaxDispToR11(uint8_t off) { u8(0x4C); u8(0x8B); u8(0x58); u8(off); }
+    void orR11FromRaxDisp(uint8_t off) { u8(0x4C); u8(0x0B); u8(0x58); u8(off); }
+    void storeR11ToOutDisp(uint8_t off) {
+        u8(0x4C); u8(0x89);
+        u8(kOut == 0x02 ? 0x5A : 0x5E);
+        u8(off);                                                              // mov [kOut+off], r11
+    }
+    void storeImm32ToOutDisp(uint8_t off, int32_t v) {
+        u8(0x48); u8(0xC7);
+        u8(kOut == 0x02 ? 0x42 : 0x46);
+        u8(off); u32((uint32_t)v);                                            // mov qword [kOut+off], imm32
+    }
+    // A 128 bit result is written as two halves; the kind is a constant the emitter knows.  rax has
+    // to hold the pointer to the pair.
+    void storeResultWide(int kind) {
+        loadRaxToR11();
+        storeR11ToOutDisp((uint8_t)offsetof(JitOut, value));
+        loadRaxDispToR11(8);
+        storeR11ToOutDisp((uint8_t)offsetof(JitOut, value2));
+        storeImm32ToOutDisp((uint8_t)offsetof(JitOut, kind), kind);
+    }
+    // narrow shifts need the count in cl, and on Windows cl is the locals base register
+    void saveBaseToR10() {
+        if (kBase == 0x01) { u8(0x49); u8(0x89); u8(0xCA); }        // mov r10, rcx
+        else { u8(0x49); u8(0x89); u8(0xFA); }                      // mov r10, rdi
+    }
+    void restoreBaseFromR10() {
+        if (kBase == 0x01) { u8(0x4C); u8(0x89); u8(0xD1); }        // mov rcx, r10
+        else { u8(0x4C); u8(0x89); u8(0xD7); }                      // mov rdi, r10
+    }
+    void movRcxR8() { u8(0x4C); u8(0x89); u8(0xC1); }
+    void shlRaxCl() { u8(0x48); u8(0xD3); u8(0xE0); }
+    void sarRaxCl() { u8(0x48); u8(0xD3); u8(0xF8); }
     void movR10Imm(int32_t v) { u8(0x49); u8(0xC7); u8(0xC2); u32((uint32_t)v); }
     // The first integer argument of a C helper, set from an immediate (the callee is told which
     // global slot to look at, and the call frame has already moved so a register is the only way).
@@ -525,7 +637,19 @@ public:
         u8(0x48); u8(0xC7); u8(0x84); u8(0x24); u32((uint32_t)off); u32(0);
     }
     void leaR10FromFrame(size_t off) { u8(0x4C); u8(0x8D); u8(0x94); u8(0x24); u32((uint32_t)off); }
+    void leaR11FromFrame(size_t off) { u8(0x4C); u8(0x8D); u8(0x9C); u8(0x24); u32((uint32_t)off); }
     void leaRaxFromFrame(size_t off) { u8(0x48); u8(0x8D); u8(0x84); u8(0x24); u32((uint32_t)off); }
+    // the wide helper returns an error kind in rax: hand it to the VM through JitOut and return
+    void errorReturnFromRax() {
+        u8(0x49); u8(0x89); u8(0xC3);                                 // mov r11, rax
+        movRaxImm(0);
+        u8(0x48); u8(0x89);
+        u8(kOut == 0x02 ? 0x02 : 0x06);                               // mov [kOut], rax (the 0 value)
+        u8(0x4C); u8(0x89);
+        u8(kOut == 0x02 ? 0x5A : 0x5E);
+        u8((uint8_t)offsetof(JitOut, kind));                          // mov [kOut+kind], r11
+        epilogue();
+    }
     // rax = [kOut + sizeof(JitOut) - 8]: the global value-pointer array the VM left for us
     void loadCtxToRax() {
         u8(0x48); u8(0x8B);
@@ -641,8 +765,10 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_NEW_ARRAY:
                 x.next = ip + 3; x.a = code[ip + 1]; x.b = code[ip + 2]; break;
             case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+            case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
                 x.next = ip + 1; break;
+            case OP_NEG: x.next = ip + 1; break;
             case OP_LOCAL_ADD_IMM: case OP_LOCAL_SUB_IMM:
                 x.next = ip + 3; x.a = code[ip + 1]; x.imm = (int8_t)code[ip + 2]; break;
             case OP_LOCAL_ADD_LOCAL:
@@ -771,11 +897,26 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     // plain 64 bit ints, so the VM checks each one at every native entry (see VM::jitGlobalsOk).
     size_t n = ins.size();
     std::vector<uint8_t> usedGlobals;
+    std::vector<std::pair<int, int>> wideGlobals;    // (index, 1 = longlong, 2 = ulonglong)
     std::vector<int> insGlobal(n, -1);
-    auto markGlobal = [&](int gi) {
+    std::vector<uint8_t> insGlobalWide(n, 0);        // 0 narrow, 1 longlong, 2 ulonglong
+    std::set<int> usedNarrowGlobals, usedWideGlobals;
+    auto markGlobal = [&](int gi, int wideSign) {
         if (gi < 0) return;
-        if ((size_t)gi >= usedGlobals.size()) usedGlobals.resize((size_t)gi + 1, 0);
-        usedGlobals[(size_t)gi] = 1;
+        if (wideSign) {
+            usedWideGlobals.insert(gi);
+            auto it = std::find_if(wideGlobals.begin(), wideGlobals.end(),
+                                   [&](const std::pair<int, int>& p) { return p.first == gi; });
+            if (it == wideGlobals.end()) wideGlobals.push_back({gi, wideSign});
+        } else {
+            usedNarrowGlobals.insert(gi);
+            if ((size_t)gi >= usedGlobals.size()) usedGlobals.resize((size_t)gi + 1, 0);
+            usedGlobals[(size_t)gi] = 1;
+        }
+    };
+    auto globalsWideSign = [&](const JitIns& x) -> int {
+        if ((size_t)x.a >= ch->consts.size() || ch->consts[(size_t)x.a].t != VT::Str) return 0;
+        return annotaJitGlobalWideSign(ch->consts[(size_t)x.a].o->str);
     };
     auto globalIndexOf = [&](const JitIns& x) -> int {
         if ((size_t)x.a >= ch->consts.size() || ch->consts[(size_t)x.a].t != VT::Str) return -1;
@@ -873,18 +1014,39 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_LOCAL_ADD_LOCAL:
                     break;                                  // raw int64 work, verified at call time
                 case OP_ADD: case OP_SUB: case OP_MUL:
-                case OP_DIV: case OP_MOD: {
+                case OP_DIV: case OP_MOD:
+                case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
                     if (d < 2) return jitFail(__LINE__);
                     JitKindSet ka = vk[(size_t)d - 2], kb = vk[(size_t)d - 1];
                     if (!jitPlainKind(ka) || !jitPlainKind(kb)) return jitFail(__LINE__);
+                    JitKindSet pk = jitPromoteSet(ka, kb);
+                    // a wide result is only usable when both operands agree on signedness, and a
+                    // narrow result keeps needing a single width
+                    if (jitHasWide(pk) && jitWideOf(pk) == 0) return jitFail(__LINE__);
+                    if (pk == 0) return jitFail(__LINE__);
                     vk.pop_back();
-                    vk.back() = jitPromoteSet(ka, kb);
+                    vk.back() = pk;
                     break;
+                }
+                case OP_NEG: {
+                    if (d < 1) return jitFail(__LINE__);
+                    JitKindSet ka = vk.back();
+                    if (!jitPlainKind(ka)) return jitFail(__LINE__);
+                    if (jitHasWide(ka)) { if (jitWideOf(ka) == 0) return jitFail(__LINE__); break; }
+                    if (jitSoleKind(ka) < 0 || jitSoleKind(ka) == 15) return jitFail(__LINE__);
+                    break;                                  // narrow negation keeps the width
                 }
                 case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
                     if (d < 2) return jitFail(__LINE__);
-                    if (!jitPlainKind(vk[(size_t)d - 2]) || !jitPlainKind(vk[(size_t)d - 1]))
-                        return jitFail(__LINE__);
+                    JitKindSet ka = vk[(size_t)d - 2], kb = vk[(size_t)d - 1];
+                    if (!jitPlainKind(ka) || !jitPlainKind(kb)) return jitFail(__LINE__);
+                    if (jitHasWide(ka) || jitHasWide(kb)) {
+                        // the comparison is unsigned when either wide side is, and both sides have to
+                        // be representable in that domain
+                        JitKindSet pk = jitPromoteSet(ka, kb);
+                        if (jitWideOf((ka & kJitWides) | (kb & kJitWides)) == 0) return jitFail(__LINE__);
+                        (void)pk;
+                    }
                     vk.pop_back();
                     vk.back() = kJitBool;
                     break;
@@ -894,21 +1056,41 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     int gi = globalIndexOf(x);
                     if (gi < 0) return jitFail(__LINE__);
                     insGlobal[i] = gi;
-                    markGlobal(gi);
-                    // the entry check guarantees an untyped or int64 value, the two widths whose
-                    // arithmetic and printing machine code reproduces exactly
-                    pushKind(jitBit(NumKind::None) | jitBit(NumKind::I64));
+                    // A global is dynamically typed, so the chunk has to pin down which of the two
+                    // representations it uses.  The value *right now* decides (the VM keeps it in
+                    // step), and every native call re-checks it, so a stale answer only costs speed.
+                    int w = globalsWideSign(x);
+                    if (w) {
+                        insGlobalWide[i] = (uint8_t)w;
+                        markGlobal(gi, w);
+                        pushKind(w == 2 ? kJitWideU : kJitWideS);
+                    } else {
+                        markGlobal(gi, 0);
+                        pushKind(jitBit(NumKind::None) | jitBit(NumKind::I64));
+                    }
                     break;
                 }
                 case OP_SET_GLOBAL: {
                     int gi = globalIndexOf(x);
                     if (gi < 0 || d < 1) return jitFail(__LINE__);
-                    // only a plain 64 bit width may be stored: a wider set would make every later
-                    // read of this global ambiguous
-                    int ks = jitSoleKind(vk.back());
-                    if (ks != (int)NumKind::None && ks != (int)NumKind::I64) return jitFail(__LINE__);
+                    JitKindSet ksG = vk.back();
+                    if (!jitPlainKind(ksG)) return jitFail(__LINE__);
+                    int w = jitWideOf(ksG);
+                    if (jitHasWide(ksG) && w == 0) return jitFail(__LINE__);
+                    // the store has to agree with how the chunk reads this global, otherwise a later
+                    // read would interpret the new value as the other representation
+                    if (w && !globalsWideSign(x)) {
+                        if (usedNarrowGlobals.count(gi)) return jitFail(__LINE__);
+                    }
+                    if (!w && usedWideGlobals.count(gi)) return jitFail(__LINE__);
+                    if (!w) {
+                        int sole = jitSoleKind(ksG);
+                        if (sole != (int)NumKind::None && sole != (int)NumKind::I64)
+                            return jitFail(__LINE__);
+                    }
                     insGlobal[i] = gi;
-                    markGlobal(gi);
+                    insGlobalWide[i] = (uint8_t)w;
+                    markGlobal(gi, w);
                     vk.pop_back();
                     break;
                 }
@@ -947,6 +1129,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                     const Value& c0 = ch->consts[(size_t)x.a];
                     if (c0.t == VT::Int && !c0.o && (int)c0.k <= (int)NumKind::U64) {
                         pushKind(jitBit(c0.k));
+                    } else if (c0.t == VT::Wide && c0.o) {
+                        pushKind(c0.wideUnsigned() ? kJitWideU : kJitWideS);
                     } else {
                         pushKind(kJitConst);
                     }
@@ -955,10 +1139,23 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_CONVERT: {
                     // An integer conversion is `wrapToKind` and nothing else (the interpreter's
                     // convertNum wraps an Int into the target width), so the machine code just wraps
-                    // the raw value.  Any non-integer target - a float, a 128 bit width, a string -
-                    // stays interpreted.
-                    if (d < 1 || x.imm > (int)NumKind::U64) return jitFail(__LINE__);
-                    if (jitSoleKind(vk.back()) < 0) return jitFail(__LINE__);
+                    // the raw value.  The two 128 bit targets are `Value::wide(v.asWide(), uns)`,
+                    // which sign-extends the source.  Anything else stays interpreted - including a
+                    // 128 bit source going back to a narrow width, which the interpreter *rejects*
+                    // at run time ("cannot convert longlong to int64").
+                    if (d < 1) return jitFail(__LINE__);
+                    JitKindSet src = vk.back();
+                    if (x.imm == (int)kConvertWideS || x.imm == (int)kConvertWideU) {
+                        if (jitHasWide(src)) {
+                            if (jitWideOf(src) == 0) return jitFail(__LINE__);
+                        } else {
+                            if (jitSoleKind(src) < 0) return jitFail(__LINE__);
+                        }
+                        vk.back() = x.imm == (int)kConvertWideU ? kJitWideU : kJitWideS;
+                        break;
+                    }
+                    if (x.imm > (int)NumKind::U64) return jitFail(__LINE__);
+                    if (jitSoleKind(src) < 0) return jitFail(__LINE__);   // a wide source is refused
                     vk.back() = jitBit((NumKind)x.imm);
                     break;
                 }
@@ -978,10 +1175,16 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                         if (!jitKindFromCode(t.code->retByte, rk)) return jitFail(__LINE__);
                         pushKind(jitBit(rk));
                     }
+                    // a callee that returns a 128 bit value cannot hand it back through a virtual
+                    // register (the caller's slots hold plain 64 bit values)
+                    if (t.code->retByte == kJitOutWideS || t.code->retByte == kJitOutWideU)
+                        return jitFail(__LINE__);
                     // the callee runs on this native frame without passing the VM's entry checks, so
                     // whatever it needs has to be validated here as well
                     for (size_t gi = 0; gi < t.code->globals.size(); gi++)
-                        markGlobal(t.code->globals[gi]);
+                        markGlobal(t.code->globals[gi], 0);
+                    for (size_t gi = 0; gi < t.code->wideGlobals.size(); gi++)
+                        markGlobal(t.code->wideGlobals[gi].first, t.code->wideGlobals[gi].second);
                 }
                 case OP_RETURN:
                     if (d < 1 || !jitPlainKind(vk.back())) return jitFail(__LINE__);
@@ -990,7 +1193,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 case OP_PRINT: {
                     // `print` hands its operands to the VM as ordinary Values, so every one of them
                     // needs one static kind: a sole width (or the None/int64 pair, which print
-                    // identically).  A separator is a value of its own and stays interpreted.
+                    // identically), or a 128 bit value which is boxed for the call.  A separator is a
+                    // value of its own and stays interpreted.
                     if (x.b) return jitFail(__LINE__);
                     if (x.a == 1 && i > 0 && ins[i - 1].op == OP_BUILD_TUPLE && !vk.empty() &&
                         vk.back() == kJitTuple) {
@@ -1004,6 +1208,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                         JitKindSet ks = vk[(size_t)(d - x.a + k)];
                         if (ks == kJitConst) { printKinds[i].push_back(ks); continue; }
                         if (!jitPlainKind(ks)) return jitFail(__LINE__);
+                        if (jitHasWide(ks)) {
+                            if (jitWideOf(ks) == 0) return jitFail(__LINE__);
+                            printKinds[i].push_back(ks);
+                            continue;
+                        }
                         if (jitSoleKind(ks) < 0 &&
                             (ks & ~(jitBit(NumKind::None) | jitBit(NumKind::I64))) != 0)
                             return jitFail(__LINE__);
@@ -1023,6 +1232,11 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                         JitKindSet ks = vk[(size_t)(d - x.a + k)];
                         if (ks == kJitConst) { printKinds[i].push_back(ks); continue; }
                         if (!jitPlainKind(ks)) return jitFail(__LINE__);
+                        if (jitHasWide(ks)) {
+                            if (jitWideOf(ks) == 0) return jitFail(__LINE__);
+                            printKinds[i].push_back(ks);
+                            continue;
+                        }
                         if (jitSoleKind(ks) < 0 &&
                             (ks & ~(jitBit(NumKind::None) | jitBit(NumKind::I64))) != 0)
                             return jitFail(__LINE__);
@@ -1178,14 +1392,47 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         }
     }
 
+    // ---- local storage: a local that ever holds a 128 bit value gets its own 16 byte cell, so it
+    //      must never hold a narrow value at another point (the two representations differ)
+    std::vector<uint8_t> wideSlot(ch->numLocals, 0);
+    {
+        std::vector<uint8_t> sawNarrow(ch->numLocals, 0), sawWide(ch->numLocals, 0);
+        for (size_t i = 0; i < n; i++) {
+            if (depth[i] == kUnset) continue;
+            for (size_t s = 0; s < ch->numLocals; s++) {
+                JitKindSet ks = kindAt[i][s];
+                if (jitHasWide(ks)) {
+                    if (jitWideOf(ks) == 0) return jitFail(__LINE__);   // ambiguous 128 bit width
+                    sawWide[s] = 1;
+                } else if (ks != kJitAllInts) {
+                    sawNarrow[s] = 1;
+                }
+            }
+        }
+        for (size_t s = 0; s < ch->numLocals; s++) {
+            if (sawWide[s] && sawNarrow[s]) return jitFail(__LINE__);
+            wideSlot[s] = sawWide[s];
+        }
+    }
+
     // ---- which locals must be plain ints when the native code starts?
     std::vector<uint8_t> readSlots(ch->numLocals, 0);
+    std::vector<std::pair<int, int>> wideLocalsReq;          // (slot, 1 = longlong, 2 = ulonglong)
     auto markRead = [&](size_t i, int slot) {
         if (slot < 0 || (size_t)slot >= ch->numLocals) return;
-        // A slot is safe without a runtime check when it was definitely assigned an integer
-        // before this read (the assignment produced the value), otherwise the caller must hand
-        // us an int - e.g. a parameter that is only compared.
-        if (assignedAt[i][(size_t)slot] && (kindAt[i][(size_t)slot] & ~kJitAllInts) == 0) return;
+        // A slot is safe without a runtime check when this function produced its value before the
+        // read (any value kind: an integer, a comparison result or a 128 bit pair).
+        if (assignedAt[i][(size_t)slot] && jitPlainKind(kindAt[i][(size_t)slot])) return;
+        JitKindSet ks = kindAt[i][(size_t)slot];
+        int w = jitWideOf(ks);
+        if (jitHasWide(ks)) {
+            // a wide local that is read before it is assigned has to be unpacked from the
+            // interpreter's frame (an on-stack-replacement entry can land in that state)
+            if (w == 0) return;
+            for (auto& p : wideLocalsReq) if (p.first == slot) return;
+            wideLocalsReq.push_back({slot, w});
+            return;
+        }
         readSlots[(size_t)slot] = 1;
     };
     for (size_t i = 0; i < n; i++) {
@@ -1224,6 +1471,7 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         JitKindSet assigned = x.op == OP_LOCAL_ADD_LOCAL
                                   ? jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b])
                                   : vrKind[i][(size_t)depth[i] - 1];
+        if (jitHasWide(assigned)) continue;      // a 128 bit return carries its own pair of halves
         if (jitSoleKind(assigned) < 0) return jitFail(__LINE__);
     }
 
@@ -1260,10 +1508,36 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     // the trampoline's on-stack-replacement descriptor (a JitOsrFrame) lives here too
     const size_t osrFrameBase = e.frameBytes;
     e.frameBytes += 32;
+    // 128 bit values: one 16 byte cell per local that ever holds one, one per virtual register that
+    // is the destination of a wide operation, and two staging cells for widening a narrow operand.
+    // The areas have to exist whenever *any* 128 bit value can flow through the code - including one
+    // that only lives in a global or in a constant.
+    bool hasWide = !wideGlobals.empty();
+    for (size_t s = 0; s < wideSlot.size() && !hasWide; s++) if (wideSlot[s]) hasWide = true;
+    for (size_t k = 0; k < n && !hasWide; k++) {
+        for (auto& kk : kindAt[k]) if (jitHasWide(kk)) { hasWide = true; break; }
+        for (auto& kk : vrKind[k]) if (jitHasWide(kk)) { hasWide = true; break; }
+    }
+    const size_t wideLocalsBase = e.frameBytes;
+    e.frameBytes += hasWide ? ((size_t)ch->numLocals * 16 + 15) / 16 * 16 : 0;
+    const size_t widePoolBase = e.frameBytes;
+    e.frameBytes += hasWide ? ((size_t)std::max(1, maxDepth) * 16 + 15) / 16 * 16 : 0;
+    const size_t wideStageBase = e.frameBytes;
+    e.frameBytes += hasWide ? 32 : 0;
+    auto wideLocalOff = [&](int slot) { return wideLocalsBase + (size_t)slot * 16; };
+    auto widePoolOff = [&](int vr) { return widePoolBase + (size_t)vr * 16; };
     auto iterCurOff = [&](int vr) { return iterBase + (size_t)vr * 16; };
     auto iterStopOff = [&](int vr) { return iterBase + (size_t)vr * 16 + 8; };
     e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);      // sub rsp, frameBytes
     e.localsPrologue((int)ch->numLocals, localsBase);                        // private copy of L[]
+    // a 128 bit local cannot travel in `L[]`, so its halves are unpacked from the interpreter's boxes
+    auto widePrologue = [&] {
+        if (!hasWide || wideLocalsReq.empty()) return;
+        e.leaR10FromFrame(wideLocalsBase);
+        e.movR11Imm64((uint64_t)ch->numLocals);
+        e.callC2((uint64_t)(uintptr_t)&annotaJitUnpackWideLocals);
+    };
+    widePrologue();
     // The analysis proved that the only instruction which can have produced the array in a virtual
     // register is the `get_local` of a JIT array local: find it and report its element kind.
     // Comparisons must use the condition codes of the operands' signedness: an untyped or signed
@@ -1293,6 +1567,45 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         }
         return -1;
     };
+    // ---- 128 bit values
+    // A wide value in a virtual register is a pointer to its two halves.  A narrow operand of a wide
+    // operation is widened into one of the two staging cells first (`asWide()` sign-extends, whatever
+    // the width of the source), and every operation is then one call into C++.
+    auto widenToStage = [&](size_t ii, int vr, size_t stageOff) {
+        int sole = jitSoleKind(vrKind[ii][(size_t)vr]);
+        e.loadVrToRax(vr);
+        if (sole == (int)NumKind::I32) e.sextRaxFromI32();
+        e.storeRaxToFrame(stageOff);
+        e.movR11Rax();
+        e.sarR11Imm(63);                                   // the high half is the sign of the value
+        e.storeR11ToFrame(stageOff + 8);
+    };
+    auto wideOperand = [&](size_t ii, int vr, size_t stageOff, bool first) {
+        if (jitHasWide(vrKind[ii][(size_t)vr])) {
+            if (first) e.loadVrToR10(vr); else e.loadVrToR11(vr);
+        } else {
+            widenToStage(ii, vr, stageOff);
+            if (first) e.leaR10FromFrame(stageOff); else e.leaR11FromFrame(stageOff);
+        }
+    };
+    // the result goes into the destination register's own pool cell, whose address lands in the slot
+    auto wideResultPtr = [&](int vr) {
+        e.leaRaxFromFrame(widePoolOff(vr));
+        e.storeRaxToVr(vr);
+        e.loadVrToRax(vr);
+    };
+    // `a` in r10, `b` in r11, the destination address in rax; the helper returns 0 or an error kind
+    auto wideBin = [&](size_t ii, int dd, int vr, int op, int wideSign) {
+        wideOperand(ii, dd - 2, wideStageBase, true);
+        wideOperand(ii, dd - 1, wideStageBase + 16, false);
+        wideResultPtr(vr);
+        int uns = wideSign == 2 ? 1 : 0;
+        e.callWide4((uint64_t)(uintptr_t)&annotaJitWideBin, op | (uns << 8));
+        e.testRaxRax();
+        size_t okc = e.jccRel8(0x74);                      // jz -> the operation succeeded
+        e.errorReturnFromRax();
+        e.patchRel8(okc, e.c.size());
+    };
 
     for (size_t i = 0; i < n; i++) {
         const JitIns& x = ins[i];
@@ -1311,10 +1624,24 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.storeRaxToVr(d);
                 break;
             case OP_GET_LOCAL:
-                e.loadLocalToRax(x.a);
-                e.storeRaxToVr(d);
+                if (wideSlot[(size_t)x.a]) {
+                    e.leaRaxFromFrame(wideLocalOff(x.a));      // a wide value is a pointer to it
+                    e.storeRaxToVr(d);
+                } else {
+                    e.loadLocalToRax(x.a);
+                    e.storeRaxToVr(d);
+                }
                 break;
             case OP_SET_LOCAL: case OP_INIT_LOCAL:
+                if (wideSlot[(size_t)x.a]) {
+                    // the source is a pointer to a pair of halves: copy both into the local's cell
+                    e.loadVrToRax(d - 1);
+                    e.loadRaxToR11();
+                    e.storeR11ToFrame(wideLocalOff(x.a));
+                    e.loadRaxDispToR11(8);
+                    e.storeR11ToFrame(wideLocalOff(x.a) + 8);
+                    break;
+                }
                 e.loadVrToRax(d - 1);
                 e.storeRaxToLocal(x.a);
                 if (tracked[(size_t)x.a]) {
@@ -1326,6 +1653,25 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             case OP_LOCAL_ADD_IMM:
             case OP_LOCAL_SUB_IMM:
+                if (wideSlot[(size_t)x.a]) {
+                    // x = x + k on a 128 bit local: widen the immediate and add in place
+                    e.movRaxImm(x.imm);
+                    e.storeRaxToFrame(wideStageBase);
+                    e.movR11Rax();
+                    e.sarR11Imm(63);
+                    e.storeR11ToFrame(wideStageBase + 8);
+                    e.leaR10FromFrame(wideLocalOff(x.a));
+                    e.leaR11FromFrame(wideStageBase);
+                    e.leaRaxFromFrame(wideLocalOff(x.a));
+                    int w1 = jitWideOf(kindAt[i][(size_t)x.a]);
+                    e.callWide4((uint64_t)(uintptr_t)&annotaJitWideBin,
+                                (x.op == OP_LOCAL_ADD_IMM ? OP_ADD : OP_SUB) | ((w1 == 2) << 8));
+                    e.testRaxRax();
+                    size_t okw = e.jccRel8(0x74);
+                    e.errorReturnFromRax();
+                    e.patchRel8(okw, e.c.size());
+                    break;
+                }
                 e.loadLocalToRax(x.a);
                 e.movR8Imm(x.imm);
                 if (x.op == OP_LOCAL_ADD_IMM) e.addRaxR8(); else e.subRaxR8();
@@ -1334,6 +1680,29 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;                                  // x = x + k preserves the kind byte
             case OP_LOCAL_ADD_LOCAL: {
                 int pkl = jitSoleKind(jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]));
+                if (wideSlot[(size_t)x.a]) {
+                    e.leaR10FromFrame(wideLocalOff(x.a));
+                    if (wideSlot[(size_t)x.b]) {
+                        e.leaR11FromFrame(wideLocalOff(x.b));
+                    } else {
+                        e.loadLocalToRax(x.b);
+                        if (jitSoleKind(kindAt[i][(size_t)x.b]) == (int)NumKind::I32)
+                            e.sextRaxFromI32();
+                        e.storeRaxToFrame(wideStageBase);
+                        e.movR11Rax();
+                        e.sarR11Imm(63);
+                        e.storeR11ToFrame(wideStageBase + 8);
+                        e.leaR11FromFrame(wideStageBase);
+                    }
+                    e.leaRaxFromFrame(wideLocalOff(x.a));
+                    int w2 = jitPromoteSet(kindAt[i][(size_t)x.a], kindAt[i][(size_t)x.b]) == kJitWideU;
+                    e.callWide4((uint64_t)(uintptr_t)&annotaJitWideBin, OP_ADD | ((int)w2 << 8));
+                    e.testRaxRax();
+                    size_t okw2 = e.jccRel8(0x74);
+                    e.errorReturnFromRax();
+                    e.patchRel8(okw2, e.c.size());
+                    break;
+                }
                 if (pkl == (int)NumKind::U32) {
                     // 32 bit form: writing eax zeroes the upper half, which is exactly the
                     // canonical uint32 form, so the narrowing fixup is unnecessary
@@ -1357,11 +1726,74 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 }
                 break;
             }
-            case OP_ADD: case OP_SUB: case OP_MUL: {
+            case OP_ADD: case OP_SUB: case OP_MUL:
+            case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
+            case OP_DIV: case OP_MOD: {
+                JitKindSet pkSet = jitPromoteSet(vrKind[i][(size_t)d - 2], vrKind[i][(size_t)d - 1]);
+                int wkW = jitWideOf(pkSet);
+                if (jitHasWide(pkSet)) {                   // a 128 bit operation: one C++ call
+                    if (wkW == 0) return jitFail(__LINE__);
+                    wideBin(i, d, d - 2, (int)x.op, wkW);
+                    break;
+                }
+                int pk = jitSoleKind(pkSet);
+                if (x.op == OP_BAND || x.op == OP_BOR || x.op == OP_BXOR ||
+                    x.op == OP_SHL || x.op == OP_SHR) {
+                    // The narrow bitwise operators are defined on plain int64s and always produce an
+                    // untyped integer (the interpreter's own path calls `Value::integer`), with the
+                    // shift count masked by the hardware exactly like the interpreter's `x << y`.
+                    if (pk < 0 && pkSet != kJitAllInts) return jitFail(__LINE__);
+                    e.loadVrToRax(d - 2);
+                    if (jitSoleKind(vrKind[i][(size_t)d - 2]) == (int)NumKind::I32) e.sextRaxFromI32();
+                    e.loadVrToR8(d - 1);
+                    if (x.op == OP_BAND) { e.u8(0x4C); e.u8(0x21); e.u8(0xC0); }
+                    else if (x.op == OP_BOR) { e.u8(0x4C); e.u8(0x09); e.u8(0xC0); }
+                    else if (x.op == OP_BXOR) { e.u8(0x4C); e.u8(0x31); e.u8(0xC0); }
+                    else {
+                        e.cmpR8Imm(64);
+                        size_t big = e.jccRel8(0x8D);              // jge -> the saturated result
+                        e.saveBaseToR10();
+                        e.movRcxR8();
+                        if (x.op == OP_SHL) e.shlRaxCl(); else e.sarRaxCl();
+                        e.restoreBaseFromR10();
+                        size_t done = e.jmpRel8();
+                        e.patchRel8(big, e.c.size());
+                        if (x.op == OP_SHL) e.movRaxImm(0);
+                        else {
+                            e.testRaxRax();
+                            size_t nonneg = e.jccRel8(0x79);       // jns -> zero
+                            e.movRaxImm(-1);                       // a negative value fills with ones
+                            e.patchRel8(nonneg, e.c.size());
+                        }
+                        e.patchRel8(done, e.c.size());
+                    }
+                    e.storeRaxToVr(d - 2);
+                    break;
+                }
+                if (x.op == OP_DIV || x.op == OP_MOD) {
+                    // The semantics live in the two C helpers (a zero divisor is a catchable error the
+                    // hardware would instead turn into a fault), so the machine code checks the
+                    // divisor itself and calls one of them.
+                    int kaD = jitSoleKind(vrKind[i][(size_t)d - 2]);
+                    int kbD = jitSoleKind(vrKind[i][(size_t)d - 1]);
+                    if (pk < 0) return jitFail(__LINE__);
+                    e.loadVrToR10(d - 2);
+                    if (kaD == (int)NumKind::I32) e.sextR10FromI32();     // a raw 32 bit slot
+                    e.loadVrToR11(d - 1);
+                    if (kbD == (int)NumKind::I32) e.sextR11FromI32();
+                    e.testR11R11();
+                    size_t noZero = e.jccRel8(0x75);                      // jnz -> the divisor is fine
+                    e.errorReturnKind((int)(x.op == OP_DIV ? kJitOutDivZero : kJitOutModZero));
+                    e.patchRel8(noZero, e.c.size());
+                    e.callC2((uint64_t)(uintptr_t)(x.op == OP_DIV ? &annotaJitDiv : &annotaJitMod));
+                    // 32 bit kinds already have their exact value in the low half (which is all their
+                    // slot uses); every other width wraps the way the interpreter's typedInt would
+                    if (pk != (int)NumKind::I32 && pk != (int)NumKind::U32) e.wrapRax(pk);
+                    e.storeRaxToVr(d - 2);
+                    break;
+                }
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
-                int pk = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
-                                                   vrKind[i][(size_t)d - 1]));
                 if (pk == (int)NumKind::U32 || pk == (int)NumKind::I32) {
                     // A write to a 32 bit register zeroes the upper half, so the low 32 bits already
                     // are the exact value and no narrowing fixup is needed.  A slot written this way
@@ -1382,32 +1814,42 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 e.storeRaxToVr(d - 2);
                 break;
             }
-                break;
-            case OP_DIV: case OP_MOD: {
-                // The semantics live in the two C helpers (a zero divisor is a catchable error the
-                // hardware would instead turn into a fault), so the machine code checks the divisor
-                // itself and calls one of them.
-                int ka = jitSoleKind(vrKind[i][(size_t)d - 2]);
-                int kb = jitSoleKind(vrKind[i][(size_t)d - 1]);
-                int pkD = jitSoleKind(jitPromoteSet(vrKind[i][(size_t)d - 2],
-                                                    vrKind[i][(size_t)d - 1]));
-                if (pkD < 0) return jitFail(__LINE__);
-                e.loadVrToR10(d - 2);
-                if (ka == (int)NumKind::I32) e.sextR10FromI32();      // a raw 32 bit slot
-                e.loadVrToR11(d - 1);
-                if (kb == (int)NumKind::I32) e.sextR11FromI32();
-                e.testR11R11();
-                size_t noZero = e.jccRel8(0x75);                      // jnz -> the divisor is fine
-                e.errorReturnKind((int)(x.op == OP_DIV ? kJitOutDivZero : kJitOutModZero));
-                e.patchRel8(noZero, e.c.size());
-                e.callC2((uint64_t)(uintptr_t)(x.op == OP_DIV ? &annotaJitDiv : &annotaJitMod));
-                // 32 bit kinds already have their exact value in the low half (which is all their
-                // slot uses); every other width wraps the way the interpreter's typedInt would
-                if (pkD != (int)NumKind::I32 && pkD != (int)NumKind::U32) e.wrapRax(pkD);
-                e.storeRaxToVr(d - 2);
+            case OP_NEG: {
+                JitKindSet nk = vrKind[i][(size_t)d - 1];
+                if (jitHasWide(nk)) {
+                    int w = jitWideOf(nk);
+                    if (w == 0) return jitFail(__LINE__);
+                    e.loadVrToR10(d - 1);
+                    wideResultPtr(d - 1);
+                    e.movR11Rax();
+                    e.callC2((uint64_t)(uintptr_t)&annotaJitWideNeg);
+                    break;
+                }
+                int soleN = jitSoleKind(nk);
+                if (soleN < 0) return jitFail(__LINE__);
+                e.loadVrToRax(d - 1);
+                e.u8(0x48); e.u8(0xF7); e.u8(0xD8);                   // neg rax
+                e.wrapRax(soleN);
+                e.storeRaxToVr(d - 1);
                 break;
             }
             case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE: {
+                JitKindSet ak = vrKind[i][(size_t)d - 2], bk = vrKind[i][(size_t)d - 1];
+                if (jitHasWide(ak) || jitHasWide(bk)) {
+                    // 128 bit comparison: the domain is unsigned when either wide side is, exactly
+                    // like the interpreter's own comparison branch
+                    int wa = jitWideOf(ak & kJitWides), wb = jitWideOf(bk & kJitWides);
+                    if ((ak & kJitWides) && wa == 0) return jitFail(__LINE__);
+                    if ((bk & kJitWides) && wb == 0) return jitFail(__LINE__);
+                    if (!jitHasWide(ak) && jitSoleKind(ak) < 0 && ak != kJitAllInts) return jitFail(__LINE__);
+                    if (!jitHasWide(bk) && jitSoleKind(bk) < 0 && bk != kJitAllInts) return jitFail(__LINE__);
+                    wideOperand(i, d - 2, wideStageBase, true);
+                    wideOperand(i, d - 1, wideStageBase + 16, false);
+                    int unsW = (wa == 2 || wb == 2) ? 1 : 0;
+                    e.callC3((uint64_t)(uintptr_t)&annotaJitWideCmp, (int)x.op | (unsW << 8));
+                    e.storeRaxToVr(d - 2);
+                    break;
+                }
                 e.loadVrToRax(d - 2);
                 e.loadVrToR8(d - 1);
                 // A 32 bit comparison is correct whether the slots hold the exact 64 bit value or only
@@ -1460,6 +1902,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
             case OP_POP:
                 break;                                               // the value is dead
             case OP_JUMP_IF_FALSE:
+                if (jitHasWide(vrKind[i][(size_t)d - 1])) {
+                    // a 128 bit value is true when any of its bits is set
+                    e.loadVrToRax(d - 1);
+                    e.loadRaxToR11();
+                    e.orR11FromRaxDisp(8);
+                    e.testR11R11();
+                    e.jccPlaceholder(0x84, (size_t)x.target);            // jz
+                    break;
+                }
                 e.loadVrToRax(d - 1);
                 e.testRaxRax();
                 e.jccPlaceholder(0x84, (size_t)x.target);            // jz
@@ -1536,6 +1987,17 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_GET_GLOBAL: {
+                if (insGlobalWide[i]) {
+                    int gi = insGlobal[i], w = insGlobalWide[i];
+                    (void)w;
+                    e.movR10Imm(gi);
+                    e.leaRaxFromFrame(widePoolOff(d));                   // the destination pair
+                    e.storeRaxToVr(d);                                   // ... which is also the pointer
+                    e.loadVrToRax(d);
+                    e.movR11Rax();
+                    e.callC2((uint64_t)(uintptr_t)&annotaJitGetGlobalWide);
+                    break;
+                }
                 // the value-pointer array comes from this call's JitOut, so a shared piece of machine
                 // code sees the globals of whatever VM is running it
                 e.loadCtxToRax();
@@ -1545,6 +2007,13 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_SET_GLOBAL: {
+                if (insGlobalWide[i]) {
+                    e.movR10Imm(insGlobal[i]);
+                    e.loadVrToR11(d - 1);
+                    e.callC3((uint64_t)(uintptr_t)&annotaJitSetGlobalWide,
+                             insGlobalWide[i] == 2 ? 1 : 0);
+                    break;
+                }
                 e.movR10Imm(insGlobal[i]);
                 e.loadVrToR11(d - 1);
                 int ksG = jitSoleKind(vrKind[i][(size_t)d - 1]);
@@ -1611,6 +2080,15 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_RETURN: {
+                if (jitHasWide(vrKind[i][(size_t)d - 1])) {
+                    int w = jitWideOf(vrKind[i][(size_t)d - 1]);
+                    if (w == 0) return jitFail(__LINE__);
+                    e.loadVrToRax(d - 1);
+                    e.storeResultWide(w == 2 ? (int)kJitOutWideU : (int)kJitOutWideS);
+                    e.epilogue();
+                    noteRetByte(w == 2 ? (int)kJitOutWideU : (int)kJitOutWideS);
+                    break;
+                }
                 e.loadVrToRax(d - 1);
                 int sole = jitSoleKind(vrKind[i][(size_t)d - 1]);
                 // a raw 32 bit slot only carries the low half: make the value exact for the VM
@@ -1642,14 +2120,36 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 break;
             }
             case OP_CONST: {
-                // a pool constant the analysis proved to be a plain 64 bit integer
+                // a pool constant the analysis proved to be a plain integer, or a 128 bit one whose
+                // payload the code can point straight at (the pool owns it for the code's lifetime)
                 const Value& c1 = ch->consts[(size_t)x.a];
+                if (c1.t == VT::Wide) {
+                    if (!c1.o) return jitFail(__LINE__);
+                    e.movRaxImm64((uint64_t)(uintptr_t)&c1.o->wide);
+                    e.storeRaxToVr(d);
+                    break;
+                }
                 if (c1.i >= -2147483648LL && c1.i <= 2147483647LL) e.movRaxImm((int32_t)c1.i);
                 else e.movRaxImm64((uint64_t)c1.i);
                 e.storeRaxToVr(d);
                 break;
             }
             case OP_CONVERT:
+                if (x.imm == (int)kConvertWideS || x.imm == (int)kConvertWideU) {
+                    JitKindSet srcK = vrKind[i][(size_t)d - 1];
+                    if (jitHasWide(srcK)) break;      // 128 bit to 128 bit only changes the declared width
+                    // an integer source is sign-extended into a pair, exactly like `Value::asWide()`
+                    int srcSole = jitSoleKind(srcK);
+                    e.loadVrToRax(d - 1);
+                    if (srcSole == (int)NumKind::I32) e.sextRaxFromI32();
+                    e.storeRaxToFrame(widePoolOff(d - 1));
+                    e.movR11Rax();
+                    e.sarR11Imm(63);
+                    e.storeR11ToFrame(widePoolOff(d - 1) + 8);
+                    e.leaRaxFromFrame(widePoolOff(d - 1));
+                    e.storeRaxToVr(d - 1);
+                    break;
+                }
                 // an integer conversion wraps into the target width and *stores* the result: the
                 // slot now holds a value of the new kind, so every later read sees the wrapped one
                 e.loadVrToRax(d - 1);
@@ -1673,9 +2173,20 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
                 const std::vector<JitKindSet>& oks = printKinds[packedPrint[i] ? (size_t)i - 1 : i];
                 for (int k = 0; k < arity; k++) {
                     int src = firstVr + k;
-                    int ks = jitSoleKind(oks[(size_t)k]);
+                    JitKindSet osk = oks[(size_t)k];
+                    int ks = jitSoleKind(osk);
                     size_t vb = printBase + (size_t)k * sizeof(Value);
                     size_t rb = printRefBase + (size_t)k * 8;
+                    if (jitHasWide(osk)) {
+                        // a 128 bit operand is boxed by the VM, which returns a Value to point at
+                        int w = jitWideOf(osk);
+                        if (w == 0) return jitFail(__LINE__);
+                        e.loadVrToR10(src);
+                        e.movR11Imm64(w == 2 ? 1 : 0);
+                        e.callC2((uint64_t)(uintptr_t)&annotaJitWideBox);
+                        e.storeRaxToFrame(rb);
+                        continue;
+                    }
                     // the producer of this virtual register: a pool constant or one of the
                     // constant opcodes is a Value the code can refer to directly
                     int ck = -1;
@@ -1775,12 +2286,14 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
         for (int r = 0; r < depth[ti]; r++) {
             JitKindSet ks = vrKind[ti][(size_t)r];
             if (!jitPlainKind(ks) && ks != kJitRange) { ok = false; break; }
+            if (jitHasWide(ks)) { ok = false; break; }   // a 128 bit register cannot be rebuilt
             desc.push_back(jitOsrDescOf(ks));
         }
         if (!ok) continue;
         size_t off = e.c.size();
         e.u8(0x48); e.u8(0x81); e.u8(0xEC); e.u32((uint32_t)e.frameBytes);   // sub rsp, frame
         e.localsPrologue((int)ch->numLocals, localsBase);                    // and the same locals
+        widePrologue();                                                      // and its 128 bit locals
         e.leaRaxFromFrame(0);                                                // the virtual registers
         e.storeRaxToFrame(osrFrameBase);
         if (hasRange) e.leaRaxFromFrame(iterBase);
@@ -1829,6 +2342,8 @@ inline std::shared_ptr<JitCode> jitCompileX64(const std::shared_ptr<Chunk>& ch,
     for (size_t s = 0; s < readSlots.size(); s++)
         if (readSlots[s]) jc->readSlots.push_back((uint8_t)s);
     jc->retByte = seenRetByte;                 // -2 when the returns disagree
+    jc->wideLocals = wideLocalsReq;
+    jc->wideGlobals = wideGlobals;
     for (size_t gi = 0; gi < usedGlobals.size(); gi++)
         if (usedGlobals[gi]) jc->globals.push_back((int)gi);
     jc->slotKind = expectKind;

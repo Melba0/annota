@@ -1156,14 +1156,11 @@ std::shared_ptr<Chunk> Compiler::compileFunction(const std::string& name, const 
     const bool eagerJit = hasAnn(anns, "jit");
     optimizeChunk(ch, eagerJit);
     if (eagerJit) {
-        ch->jit = jitCompileX64(ch);          // eager whole-function machine code
-        // Silence here is what makes `[[jit]]` look like it simply had no effect, so an opt-in notice
-        // says why the whole function stays interpreted (ANNOTA_JIT_VERBOSE=1; off by default because
-        // the examples deliberately include a function the backend cannot compile).
-        if (!ch->jit && std::getenv("ANNOTA_JIT_VERBOSE"))
-            warn("[[jit]] 函数 '" + ch->fnName + "' 未能编译为机器码，继续解释执行：后端只支持局部变量"
-                 "（顶层全局量不行）、64 位以内整数（128 位与浮点不行）、while 循环（for 区间迭代不行）"
-                 "以及一组有限的操作（/ 与 % 不行）；详见 docs/jit.md 的支持范围");
+        // `[[jit]]` asks for machine code, but the translation happens on the *first call*: a global
+        // the function reads has to be looked at to decide whether it is a 128 bit value, and at load
+        // time the program has not run yet, so no global exists.  The marker still means "always
+        // compile this one, never wait for it to get hot".
+        ch->jitWanted = true;
     }
     return ch;
 }

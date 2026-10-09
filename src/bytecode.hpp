@@ -1,4 +1,4 @@
-﻿// Annota - bytecode.hpp : opcodes and code chunks.
+// Annota - bytecode.hpp : opcodes and code chunks.
 #pragma once
 #include "value.hpp"
 #include <functional>
@@ -104,6 +104,7 @@ struct Chunk {
     uint32_t hotTicks = 0;              // backward jumps seen in the interpreter (hot-loop meter)
     uint32_t callTicks = 0;             // calls seen in the interpreter (hot-function meter)
     bool jitTried = false;              // do not retry a function the backend rejected
+    bool jitWanted = false;             // `[[jit]]`: compile this one on its first call
     bool jitBusy = false;               // set while the backend compiles it (breaks resolver cycles)
     std::string file;
     std::string fnName;

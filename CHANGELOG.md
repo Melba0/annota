@@ -43,6 +43,29 @@ major change, and a new check is a minor one.
   working directory.  See `docs/ffi.md` and `plugins/hello.cpp`.
 * `examples/plugin.ant` (a script that `use`s a plugin module) and an automatic-JIT suite in
   `examples/jit.ant`.
+* **128 bit arithmetic in machine code (`longlong` / `ulonglong`).**  A wide local, global or constant
+  used to send the whole function back to the interpreter, and the interpreter's own 128 bit path
+  boxes every value in a heap `Obj` (one allocation per operation).  The backend now keeps a wide
+  value as a **pair of 64 bit halves** in the native frame - as a pointer in a virtual register, in a
+  16 byte cell inside the local frame, or straight at the pool constant - and every operation is one
+  call into C++ that mirrors the interpreter's wide branch exactly (`annotaJitWideBin` /
+  `annotaJitWideCmp` / `annotaJitWideNeg`), so there is no second copy of the semantics and no
+  allocation per operation.  Supported: unary `-`; `+ - * / %`; `& | ^ << >>` (with the interpreter's
+  saturation and negative-shift rules); all six comparisons (unsigned when either side is, exactly as
+  the interpreter decides); truthiness; conversions into and between the two widths; `print` (through
+  the VM's own formatter, boxed on demand); wide return values; and reads and writes of wide globals.
+  A zero divisor stays a catchable error: the helper returns the error kind and the machine code hands
+  it back through `JitOut`.  `INT128_MIN / -1` and `INT128_MIN % -1` are defined the way the `int64`
+  ones are (the interpreter used to fault on the first, the same trap `INT64_MIN % -1` had).
+  Verified by a generated matrix of **1152 checks** - 16 operations × both widths × 12 values × (value
+  and `typeof`) - every one comparing a compiled function against an interpreted twin, all 32 functions
+  running natively, and the whole matrix byte-identical with the backend switched off.  A compact
+  version (22 checks) is part of `examples/jit.ant`.
+* **`[[jit]]` now compiles on the first call instead of at load time.**  Choosing the representation
+  of a global means looking at what that global holds, and at load time the program has not run yet,
+  so no global exists.  The marker still means "always compile this one, never wait for it to get
+  hot"; the translation simply happens at the first call (where the automatic path already was), so
+  startup does less work and the decision sees the real program state.
 * **Globals in compiled code.**  Reading or writing a top-level variable used to make the whole
   function fall back to the interpreter, which is exactly what a real program is made of.  Every
   global name now has a process-wide index, the VM keeps the value pointers in an array it checks
@@ -138,6 +161,12 @@ major change, and a new check is a minor one.
 
 ### Fixed
 
+* **A local assigned a comparison result was still required at entry.**  The entry check's "read
+  slots" test only recognised *integer* value kinds, so a local holding a `bool` (or a 128 bit pair)
+  was treated as if the caller had to supply it: `new b = x < y` followed by `=b` compiled and then
+  never ran natively, because that local was empty at entry.  A slot this function assigned is now
+  trusted whatever value kind it holds.  Found by the wide matrix, whose comparison functions were
+  the only ones that stayed interpreted.
 * **The fused compare-and-branch compared unsigned values as signed.**  The compiler emits
   `jump_if_not_lt_local_local` (and the immediate form) only in `[[jit]]` functions, so the marker
   really did change meaning: `uint64 a = 0; uint64 b = 2^64-1; a < b` was **true** through

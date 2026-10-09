@@ -61,6 +61,7 @@ int64_t annotaJitMod(int64_t a, int64_t b) {
 // write - with the VM the native call belongs to.
 thread_local const Value* gJitStackBase = nullptr;    // the operand stack, for on-stack replacement
 thread_local Value* const* gJitGlobalSlots = nullptr; // the global value pointers, by index
+thread_local const Value* const* gJitWideLocals = nullptr;   // the boxed wide local per slot
 
 void annotaJitPrint(const Value* const* refs, int64_t count, int64_t packed) {
     if (!gJitVm) return;
@@ -106,6 +107,16 @@ int annotaJitGlobalIndex(const std::string& name) {
     return idx;
 }
 
+// 0 = not a 128 bit value (or not defined), 1 = longlong, 2 = ulonglong.  Only used to decide how
+// compiled code addresses the global; `VM::jitGlobalsOk` checks the real value at every call.
+int annotaJitGlobalWideSign(const std::string& name) {
+    if (!gJitVm) return 0;
+    auto it = gJitVm->globals.find(name);
+    if (it == gJitVm->globals.end() || !it->second) return 0;
+    if (it->second->t != VT::Wide) return 0;
+    return it->second->wideUnsigned() ? 2 : 1;
+}
+
 static inline Value* jitGlobalCell(int64_t idx) {
     if (idx < 0 || !gJitGlobalSlots) return nullptr;
     if ((size_t)idx >= jitGlobalNames().size()) return nullptr;
@@ -134,6 +145,121 @@ void annotaJitSetGlobal(int64_t idx, int64_t value, int64_t kindCode) {
     if (gJitVm && !gJitVm->stateNames.empty() &&
         gJitVm->stateNames.count(jitGlobalNames()[(size_t)idx]) && gJitVm->onStateChange)
         gJitVm->onStateChange(*gJitVm);
+}
+
+// ---- 128 bit kernel
+// `longlong` / `ulonglong` live in machine code as a pair of 64 bit halves (low, high) somewhere in
+// the native frame - never as a boxed Obj.  Every wide operation is one call into C++ that mirrors
+// the interpreter's own wide path exactly (`binaryResult`), so there is no second implementation of
+// the semantics and no allocation per operation.  Failures that the interpreter raises as catchable
+// errors come back as a status code instead: the machine code stores it in `JitOut::kind` and returns.
+namespace {
+inline __int128 wideLoad(const void* p) {
+    int64_t halves[2];
+    std::memcpy(halves, p, sizeof(halves));
+    return ((__int128)halves[1] << 64) | (__int128)(unsigned __int128)(uint64_t)halves[0];
+}
+inline void wideStore(void* p, __int128 v) {
+    int64_t halves[2];
+    halves[0] = (int64_t)(uint64_t)(unsigned __int128)v;
+    halves[1] = (int64_t)(uint64_t)((unsigned __int128)v >> 64);
+    std::memcpy(p, halves, sizeof(halves));
+}
+} // namespace
+
+// The op and the "either side is unsigned" flag travel in one immediate: the low byte is the
+// bytecode op, the next byte is the flag the interpreter computes as
+// `a.wideUnsigned() || b.wideUnsigned()`.  The return value is 0, or the error kind the machine code
+// has to hand back to the VM through `JitOut` (division by zero, modulo by zero, negative shift).
+// The first argument is the packed op so that the three pointers land in registers the emitter can
+// fill without spilling (see `JitEmitter::callWide4`).
+int64_t annotaJitWideBin(int64_t opUns, const void* pa, const void* pb, void* out) {
+    const int op = (int)(opUns & 0xff);
+    // (`opUns` also carries the interpreter's "unsigned" flag, which only tags the *result* Value;
+    // the bits this computes are the same either way, and the machine code knows the tag statically.)
+    __int128 x = wideLoad(pa), y = wideLoad(pb), r = 0;
+    switch (op) {
+        case OP_ADD: r = x + y; break;
+        case OP_SUB: r = x - y; break;
+        case OP_MUL: r = x * y; break;
+        case OP_DIV:
+            if (y == 0) return kJitOutDivZero;
+            if (y == -1) r = (__int128)(0 - (unsigned __int128)x);    // INT128_MIN / -1 stays defined
+            else r = x / y;
+            break;
+        case OP_MOD:
+            if (y == 0) return kJitOutModZero;
+            r = (y == -1) ? 0 : x % y;                               // INT128_MIN % -1 overflows
+            break;
+        case OP_BAND: r = x & y; break;
+        case OP_BOR:  r = x | y; break;
+        case OP_BXOR: r = x ^ y; break;
+        case OP_SHL:  r = (y < 0 || y >= 128) ? 0 : (x << (int)y); break;
+        case OP_SHR:
+            if (y < 0) return kJitOutShift;
+            r = (y >= 128) ? (x < 0 ? (__int128)-1 : (__int128)0) : (x >> (int)y);
+            break;
+        default: return 0;
+    }
+    wideStore(out, r);
+    return 0;
+}
+
+// 1 or 0; the domain is unsigned when either side is unsigned, exactly like the interpreter's
+// comparison branch.
+int64_t annotaJitWideCmp(const void* pa, const void* pb, int64_t opUns) {
+    const int op = (int)(opUns & 0xff);
+    const bool uns = (opUns >> 8) != 0;
+    __int128 x = wideLoad(pa), y = wideLoad(pb);
+    bool r;
+    if (uns) {
+        unsigned __int128 ux = (unsigned __int128)x, uy = (unsigned __int128)y;
+        r = op == OP_EQ ? ux == uy : op == OP_NE ? ux != uy
+          : op == OP_LT ? ux < uy : op == OP_GT ? ux > uy : op == OP_LE ? ux <= uy : ux >= uy;
+    } else {
+        r = op == OP_EQ ? x == y : op == OP_NE ? x != y
+          : op == OP_LT ? x < y : op == OP_GT ? x > y : op == OP_LE ? x <= y : x >= y;
+    }
+    return r ? 1 : 0;
+}
+
+void annotaJitWideNeg(const void* pa, void* out) { wideStore(out, -wideLoad(pa)); }
+
+// `print` needs a real Value, so this boxes a raw 128 bit payload (one small allocation per printed
+// wide value; print is not the hot path).
+const Value* annotaJitWideBox(const void* raw, int64_t uns) {
+    if (!gJitVm) return nullptr;
+    gJitVm->jitWideBoxes.push_back(std::make_unique<Value>(Value::wide(wideLoad(raw), uns != 0)));
+    return gJitVm->jitWideBoxes.back().get();
+}
+
+// ---- wide globals: the value is boxed in the VM, so these go through it
+void annotaJitGetGlobalWide(int64_t idx, void* out) {
+    Value* c = jitGlobalCell(idx);
+    if (!c || c->t != VT::Wide) { wideStore(out, 0); return; }
+    wideStore(out, c->o ? c->o->wide : 0);
+}
+
+void annotaJitSetGlobalWide(int64_t idx, const void* src, int64_t uns) {
+    Value* c = jitGlobalCell(idx);
+    if (!c) return;
+    *c = Value::wide(wideLoad(src), uns != 0);
+    if (gJitVm && !gJitVm->stateNames.empty() &&
+        gJitVm->stateNames.count(jitGlobalNames()[(size_t)idx]) && gJitVm->onStateChange)
+        gJitVm->onStateChange(*gJitVm);
+}
+
+// The wide half of a chunk's locals, unpacked into the native frame by its prologue.  A normal call
+// starts with every non-parameter local empty, but an on-stack-replacement entry can land in the
+// middle of a function whose wide locals already hold values.
+void annotaJitUnpackWideLocals(void* base, int64_t numLocals) {
+    if (!gJitWideLocals) return;
+    char* dst = (char*)base;
+    for (int64_t i = 0; i < numLocals; i++) {
+        const Value* v = gJitWideLocals[i];
+        if (!v || v->t != VT::Wide) continue;
+        wideStore(dst + i * 16, v->o ? v->o->wide : 0);
+    }
 }
 
 // Rebuild the live virtual registers a loop header expects.  The VM has already checked each one
@@ -703,11 +829,12 @@ static bool jitLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
 }
 
 // The globals a chunk (and every chunk it calls directly) touches, by index.  Machine code reads
-// them as plain 64 bit ints, so each one has to be one *right now*: the interpreter may have changed
-// a global's type since the code was compiled, and the answer is then to keep interpreting.  The
-// resolved pointers are cached and only rebuilt when the globals map changed shape.
+// them as plain 64 bit ints (or as a 128 bit pair), so each one has to be such a value *right now*:
+// the interpreter may have changed a global's type since the code was compiled, and the answer is
+// then to keep interpreting.  The resolved pointers are cached and only rebuilt when the globals map
+// changed shape.
 bool VM::jitGlobalsOk(const std::shared_ptr<JitCode>& jc) {
-    if (jc->globals.empty()) return true;
+    if (jc->globals.empty() && jc->wideGlobals.empty()) return true;
     if (jitGlobalCacheGen != globalsGen ||
         jitGlobalCache.size() < jitGlobalNames().size()) {
         jitGlobalCache.assign(jitGlobalNames().size(), nullptr);
@@ -724,6 +851,32 @@ bool VM::jitGlobalsOk(const std::shared_ptr<JitCode>& jc) {
         if (!c || c->t != VT::Int) return false;
         if (c->k != NumKind::None && c->k != NumKind::I64) return false;
     }
+    for (auto& kv : jc->wideGlobals) {
+        int idx = kv.first;
+        if (idx < 0 || (size_t)idx >= jitGlobalCache.size()) return false;
+        const Value* c = jitGlobalCache[(size_t)idx];
+        if (!c || c->t != VT::Wide) return false;
+        if ((kv.second == 2) != c->wideUnsigned()) return false;
+    }
+    return true;
+}
+
+// Every wide local a chunk reads has to be an actual `longlong` / `ulonglong` when the native code
+// starts (an integer there is a program that never assigned the declared type, and stays interpreted).
+// `jitWideLocals` is what the prologue - and an on-stack-replacement trampoline - unpacks from.
+bool VM::jitWideLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr) {
+    if (jc->wideLocals.empty()) return true;
+    jitWideLocalView.assign(fr.locals.size(), nullptr);
+    for (size_t i = 0; i < jc->wideLocals.size(); i++) {
+        int slot = jc->wideLocals[i].first;
+        int want = jc->wideLocals[i].second;               // 1 = longlong, 2 = ulonglong
+        if (slot < 0 || (size_t)slot >= fr.locals.size()) return false;
+        const Cell& c = fr.locals[(size_t)slot];
+        if (!c || c->t != VT::Wide) return false;
+        if ((want == 2) != c->wideUnsigned()) return false;
+        jitWideLocalView[(size_t)slot] = c.get();
+    }
+    gJitWideLocals = jitWideLocalView.data();
     return true;
 }
 
@@ -942,9 +1095,14 @@ static inline void jitThrowIfError(const JitOut& out) {
     if (out.kind == kJitOutError) throw VMError("数组下标越界（由 JIT 编译的代码检测到）");
     if (out.kind == kJitOutDivZero) throw VMError("division by zero");
     if (out.kind == kJitOutModZero) throw VMError("modulo by zero");
+    if (out.kind == kJitOutShift) throw VMError("negative shift count");
 }
 
 static inline Value jitValueOfOut(const JitOut& out) {
+    if (out.kind == kJitOutWideS || out.kind == kJitOutWideU)
+        return Value::wide(((__int128)out.value2 << 64) |
+                               (__int128)(unsigned __int128)(uint64_t)out.value,
+                           out.kind == kJitOutWideU);
     if (out.kind == 3) return Value::null();
     if (out.kind == 2) return Value::boolean(out.value != 0);
     NumKind k = NumKind::None;
@@ -957,6 +1115,18 @@ static inline Value jitValueOfOut(const JitOut& out) {
 bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     if (fn.t != VT::Function || !fn.o->chunk) return false;
     Chunk* ch = fn.o->chunk.get();
+    gJitVm = this;                        // a compile asks this VM about its globals
+    // `[[jit]]`: compile it here, on the first call, so the whole call - arguments in, result out -
+    // is native, and so the translation can see what the globals actually hold
+    if (ch->jitWanted && !ch->jit && !ch->jitTried && !ch->jitBusy) {
+        ch->jitTried = true;
+        ch->jit = jitCompileX64(fn.o->chunk, jitResolver());
+        if (!ch->jit && std::getenv("ANNOTA_JIT_VERBOSE"))
+            std::fprintf(stderr,
+                         "[jit] [[jit]] %s 未能编译为机器码，继续解释执行（支持范围见 docs/jit.md，"
+                         "用 ANNOTA_JIT_DEBUG=1 看原因）\n",
+                         ch->fnName.c_str());
+    }
     // A function that is called often but has no hot loop of its own still deserves machine code:
     // compile it here, before the body runs, so the whole call - arguments in, result out - is
     // native (no on-stack replacement involved).
@@ -976,6 +1146,7 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     if (!jc) return false;
     if (!jitLocalsOk(jc, fr)) return false;
     if (!jitGlobalsOk(jc)) return false;
+    if (!jitWideLocalsOk(jc, fr)) return false;
     static const bool dbgNative = std::getenv("ANNOTA_JIT_DEBUG") != nullptr;
     if (dbgNative) {
         static std::set<std::string> logged;
@@ -989,6 +1160,7 @@ bool VM::runNativeIfReady(const Value& fn, Frame& fr) {
     JitOut out;
     out.ctx = jitGlobalCache.data();
     gJitVm = this;
+    jitWideBoxes.clear();
     jc->fn(L, &out);
     jitArenaReset();
     jitThrowIfError(out);
@@ -1252,6 +1424,9 @@ Value VM::run() {
 
 Value VM::execute(size_t stopDepth) {
     Value result;
+    // machine code compiled while this VM runs asks back through `gJitVm` (see
+    // annotaJitGlobalWideSign), so it has to be set for the whole execution, not just across calls
+    gJitVm = this;
     for (;;) {
         try {
             for (;;) {
@@ -1693,7 +1868,7 @@ Value VM::execute(size_t stopDepth) {
                         if (f.chunk->jit) {
                             auto entry = f.chunk->jit->osrEntries.find(back);
                             if (entry != f.chunk->jit->osrEntries.end() && jitLocalsOk(f.chunk->jit, f) &&
-                                jitGlobalsOk(f.chunk->jit) &&
+                                jitGlobalsOk(f.chunk->jit) && jitWideLocalsOk(f.chunk->jit, f) &&
                                 jitOsrOk(f.chunk->jit, back, f, stack) &&
                                 !(f.buildOnReturn && f.klass)) {
                                 int64_t L[64];
@@ -1706,6 +1881,7 @@ Value VM::execute(size_t stopDepth) {
                                 JitOut out;
                                 out.ctx = jitGlobalCache.data();
                                 gJitVm = this;
+                                jitWideBoxes.clear();
                                 gJitStackBase = stack.data() + base;
                                 entry->second(L, &out);
                                 gJitStackBase = nullptr;
@@ -2313,9 +2489,13 @@ Value VM::binaryResult(Op op, const Value& a0, const Value& b0, const char* name
                         case OP_MUL: return Value::wide(x * y, uns);
                         case OP_DIV:
                             if (y == 0) throwError("division by zero");
+                            // INT128_MIN / -1 overflows a hardware division; the interpreter used to
+                            // fault on it (the same trap `INT64_MIN % -1` had)
+                            if (y == -1) return Value::wide((__int128)(0 - (unsigned __int128)x), uns);
                             return Value::wide(x / y, uns);
                         case OP_MOD:
                             if (y == 0) throwError("modulo by zero");
+                            if (y == -1) return Value::wide(0, uns);
                             return Value::wide(x % y, uns);
                         case OP_POW: {
                             if (y < 0) return Value::longDouble(::powl(x, (long double)y));

@@ -54,6 +54,10 @@ public:
     uint64_t jitGlobalCacheGen = ~0ull;
     // arrays built by compiled code during the current native invocation (freed when it returns)
     std::vector<void*> jitArena;
+    // the boxed value behind every wide local the current chunk reads (indexed by slot)
+    std::vector<const Value*> jitWideLocalView;
+    // `print` boxes a raw 128 bit value into one of these for the duration of the call
+    std::vector<std::unique_ptr<Value>> jitWideBoxes;
     // How `input` (and `_stdin_line`) obtains a line. Left empty in console programs, where a
     // line is read from stdin; a GUI host installs a provider that asks the user instead.
     std::function<std::string(const std::string& hint)> inputProvider;
@@ -69,6 +73,7 @@ public:
     Value run();
     // machine code entry checks: the locals and the globals a chunk reads have to be plain ints
     bool jitGlobalsOk(const std::shared_ptr<JitCode>& jc);
+    bool jitWideLocalsOk(const std::shared_ptr<JitCode>& jc, const Frame& fr);
     Value execute(size_t stopDepth);
     Value callSync(const Value& callee, std::vector<Value> args);
     Value callFunction(const Value& callee, const Value& pos, const Value& named,

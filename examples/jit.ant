@@ -431,4 +431,176 @@ for v in [0, -1, 300, 2147483647, 4294967295, -1000000007](
     Test.eq(n_Uint64(v, v), p_Uint64(v, v), "uint64 a=b v=" + str(v))
 )
 
+
+Test.suite("JIT: 128 bit (longlong) arithmetic in machine code")
+
+new wx: longlong = 9223372036854775808
+new wy: longlong = 9223372036854775811
+
+[[jit]]
+wa_add()(
+    new x = wx
+    new y = wy
+    new r = x + y
+    =r
+)
+wv_add()(
+    new x = wx
+    new y = wy
+    new r = x + y
+    =r
+)
+Test.eq(wa_add(), wv_add(), "add on longlong matches the interpreter")
+Test.eq(typeof(wa_add()), typeof(wv_add()), "add longlong typeof")
+[[jit]]
+wa_sub()(
+    new x = wx
+    new y = wy
+    new r = x - y
+    =r
+)
+wv_sub()(
+    new x = wx
+    new y = wy
+    new r = x - y
+    =r
+)
+Test.eq(wa_sub(), wv_sub(), "sub on longlong matches the interpreter")
+Test.eq(typeof(wa_sub()), typeof(wv_sub()), "sub longlong typeof")
+[[jit]]
+wa_mul()(
+    new x = wx
+    new y = wy
+    new r = x * y
+    =r
+)
+wv_mul()(
+    new x = wx
+    new y = wy
+    new r = x * y
+    =r
+)
+Test.eq(wa_mul(), wv_mul(), "mul on longlong matches the interpreter")
+Test.eq(typeof(wa_mul()), typeof(wv_mul()), "mul longlong typeof")
+[[jit]]
+wa_div()(
+    new x = wx
+    new y = wy
+    new r = x / y
+    =r
+)
+wv_div()(
+    new x = wx
+    new y = wy
+    new r = x / y
+    =r
+)
+Test.eq(wa_div(), wv_div(), "div on longlong matches the interpreter")
+Test.eq(typeof(wa_div()), typeof(wv_div()), "div longlong typeof")
+[[jit]]
+wa_mod()(
+    new x = wx
+    new y = wy
+    new r = x % y
+    =r
+)
+wv_mod()(
+    new x = wx
+    new y = wy
+    new r = x % y
+    =r
+)
+Test.eq(wa_mod(), wv_mod(), "mod on longlong matches the interpreter")
+Test.eq(typeof(wa_mod()), typeof(wv_mod()), "mod longlong typeof")
+[[jit]]
+wa_lt()(
+    new x = wx
+    new y = wy
+    new r = x < y
+    =r
+)
+wv_lt()(
+    new x = wx
+    new y = wy
+    new r = x < y
+    =r
+)
+Test.eq(wa_lt(), wv_lt(), "lt on longlong matches the interpreter")
+Test.eq(typeof(wa_lt()), typeof(wv_lt()), "lt longlong typeof")
+[[jit]]
+wa_le()(
+    new x = wx
+    new y = wy
+    new r = x <= y
+    =r
+)
+wv_le()(
+    new x = wx
+    new y = wy
+    new r = x <= y
+    =r
+)
+Test.eq(wa_le(), wv_le(), "le on longlong matches the interpreter")
+Test.eq(typeof(wa_le()), typeof(wv_le()), "le longlong typeof")
+[[jit]]
+wa_gt()(
+    new x = wx
+    new y = wy
+    new r = x > y
+    =r
+)
+wv_gt()(
+    new x = wx
+    new y = wy
+    new r = x > y
+    =r
+)
+Test.eq(wa_gt(), wv_gt(), "gt on longlong matches the interpreter")
+Test.eq(typeof(wa_gt()), typeof(wv_gt()), "gt longlong typeof")
+[[jit]]
+wa_eq()(
+    new x = wx
+    new y = wy
+    new r = x == y
+    =r
+)
+wv_eq()(
+    new x = wx
+    new y = wy
+    new r = x == y
+    =r
+)
+Test.eq(wa_eq(), wv_eq(), "eq on longlong matches the interpreter")
+Test.eq(typeof(wa_eq()), typeof(wv_eq()), "eq longlong typeof")
+[[jit]]
+wa_ne()(
+    new x = wx
+    new y = wy
+    new r = x != y
+    =r
+)
+wv_ne()(
+    new x = wx
+    new y = wy
+    new r = x != y
+    =r
+)
+Test.eq(wa_ne(), wv_ne(), "ne on longlong matches the interpreter")
+Test.eq(typeof(wa_ne()), typeof(wv_ne()), "ne longlong typeof")
+
+-- the motivating shape: a wide global accumulating in a loop, with print inside the function
+new wg: longlong = 9223372036854775808
+new wm: longlong = 9223372037854775815
+[[jit]]
+w_grow(n:int64)(
+    for i in 1 to n(
+        wg = wg * 3
+        if wg >= wm( wg = wg - wm )
+    )
+    print("wg", wg)
+    =wg
+)
+Test.eq(w_grow(50), 112964362914285000563608145710095104708, "wide global: multiply, compare, subtract")
+Test.eq(wg, 112964362914285000563608145710095104708, "the value machine code wrote is visible to the interpreter")
+
 Test.check()
